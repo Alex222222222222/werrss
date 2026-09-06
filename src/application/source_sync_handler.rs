@@ -1069,6 +1069,7 @@ fn should_queue_article_backfill(error: &SyncAcquisitionError) -> bool {
             crate::acquisition::weread::WeReadAdapterError::LeaseLost { .. }
                 | crate::acquisition::weread::WeReadAdapterError::LeaseBackend(_)
                 | crate::acquisition::weread::WeReadAdapterError::Protocol(_)
+                | crate::acquisition::weread::WeReadAdapterError::UnexpectedResponse(_)
                 | crate::acquisition::weread::WeReadAdapterError::Browser(_)
         )
     )
@@ -1243,6 +1244,17 @@ mod tests {
             &SyncAcquisitionError::WeRead(WeReadAdapterError::Protocol(
                 "temporary response".to_owned()
             ),)
+        ));
+    }
+
+    #[test]
+    fn unexpected_weread_responses_are_backfill_candidates() {
+        assert!(should_queue_article_backfill(
+            &SyncAcquisitionError::WeRead(
+                crate::acquisition::weread::WeReadAdapterError::UnexpectedResponse(
+                    "data must be an array".to_owned()
+                )
+            )
         ));
     }
 

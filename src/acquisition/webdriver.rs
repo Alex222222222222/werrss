@@ -212,6 +212,13 @@ pub enum WebDriverHealthCheck {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WebDriverSidecarStatus {
+    Ready,
+    Busy,
+    NotReady,
+}
+
 impl WebDriverFactory {
     /// Creates a factory for the configured browser sidecar.
     pub fn new(endpoint: Url, engine: BrowserEngine) -> Self {
@@ -242,9 +249,10 @@ impl WebDriverFactory {
         &self,
         pool: &BrowserPool,
     ) -> Result<WebDriverHealthCheck, WebDriverError> {
-        let ready = self.sidecar_ready().await?;
-        if !ready {
-            return Ok(WebDriverHealthCheck::NotReady);
+        match self.sidecar_status().await? {
+            WebDriverSidecarStatus::NotReady => return Ok(WebDriverHealthCheck::NotReady),
+            WebDriverSidecarStatus::Busy => return Ok(WebDriverHealthCheck::Busy),
+            WebDriverSidecarStatus::Ready => {}
         }
 
         let Some(session) = self
@@ -402,7 +410,7 @@ impl WebDriverFactory {
         validate_expected_environment(&canonical_expected_timezone, &environment)
     }
 
-    async fn sidecar_ready(&self) -> Result<bool, WebDriverError> {
+    async fn sidecar_status(&self) -> Result<WebDriverSidecarStatus, WebDriverError> {
         let status_url = webdriver_status_url(&self.endpoint)?;
         let client = reqwest::Client::builder()
             .timeout(WEBDRIVER_HEALTH_TIMEOUT)
@@ -433,12 +441,43 @@ fn webdriver_status_url(endpoint: &Url) -> Result<Url, WebDriverError> {
         .map_err(|_| WebDriverError::Connect("WebDriver health probe failed".to_owned()))
 }
 
-fn parse_webdriver_status(payload: &serde_json::Value) -> Result<bool, WebDriverError> {
+fn parse_webdriver_status(
+    payload: &serde_json::Value,
+) -> Result<WebDriverSidecarStatus, WebDriverError> {
     let value = payload.get("value").unwrap_or(payload);
-    value
+    let ready = value
         .get("ready")
         .and_then(serde_json::Value::as_bool)
-        .ok_or_else(|| WebDriverError::Connect("invalid WebDriver health response".to_owned()))
+        .ok_or_else(|| WebDriverError::Connect("invalid WebDriver health response".to_owned()))?;
+    if ready {
+        return Ok(WebDriverSidecarStatus::Ready);
+    }
+
+    if value
+        .get("nodes")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|nodes| {
+            let is_up = |node: &serde_json::Value| {
+                node.get("availability").and_then(serde_json::Value::as_str) == Some("UP")
+            };
+            nodes.iter().any(is_up)
+                && nodes.iter().filter(|node| is_up(node)).all(|node| {
+                    node.get("slots")
+                        .and_then(serde_json::Value::as_array)
+                        .is_some_and(|slots| {
+                            !slots.is_empty()
+                                && slots.iter().all(|slot| {
+                                    slot.get("session")
+                                        .is_some_and(|session| !session.is_null())
+                                })
+                        })
+                })
+        })
+    {
+        return Ok(WebDriverSidecarStatus::Busy);
+    }
+
+    Ok(WebDriverSidecarStatus::NotReady)
 }
 
 fn validate_expected_environment(
@@ -1515,15 +1554,61 @@ mod tests {
 
     #[test]
     fn webdriver_health_parser_accepts_selenium_envelopes_and_legacy_payloads() {
-        assert!(parse_webdriver_status(&json!({
-            "value": {"ready": true, "message": "ready", "build": {}}
-        }))
-        .unwrap());
-        assert!(!parse_webdriver_status(&json!({
-            "ready": false,
-            "message": "starting"
-        }))
-        .unwrap());
+        assert_eq!(
+            parse_webdriver_status(&json!({
+                "value": {"ready": true, "message": "ready", "build": {}}
+            }))
+            .unwrap(),
+            WebDriverSidecarStatus::Ready
+        );
+        assert_eq!(
+            parse_webdriver_status(&json!({
+                "ready": false,
+                "message": "starting"
+            }))
+            .unwrap(),
+            WebDriverSidecarStatus::NotReady
+        );
+    }
+
+    #[test]
+    fn webdriver_health_parser_treats_an_up_node_with_all_slots_reserved_as_busy() {
+        assert_eq!(
+            parse_webdriver_status(&json!({
+                "value": {
+                    "ready": false,
+                    "nodes": [{
+                        "availability": "UP",
+                        "slots": [{"session": {"sessionId": "reserved"}}]
+                    }, {
+                        "availability": "DOWN",
+                        "slots": [{"session": null}]
+                    }]
+                }
+            }))
+            .unwrap(),
+            WebDriverSidecarStatus::Busy
+        );
+    }
+
+    #[test]
+    fn webdriver_health_parser_keeps_an_up_node_with_a_free_slot_not_ready() {
+        assert_eq!(
+            parse_webdriver_status(&json!({
+                "value": {
+                    "ready": false,
+                    "nodes": [{
+                        "availability": "UP",
+                        "slots": [{"session": null}]
+                    }, {
+                        "availability": "UP",
+                        "slots": [{"session": {"sessionId": "reserved"}}]
+                    }]
+                }
+            }))
+            .unwrap(),
+            WebDriverSidecarStatus::NotReady
+        );
     }
 
     #[test]

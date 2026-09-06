@@ -75,7 +75,7 @@ fn public_parser_returns_typed_risk_control_and_rejects_malformed_json() {
     );
     assert_eq!(
         parse_article_list_payload(&json!({"data": "not-an-array"})),
-        Err(WeReadAdapterError::Protocol(
+        Err(WeReadAdapterError::UnexpectedResponse(
             "data must be an array".to_owned()
         ))
     );

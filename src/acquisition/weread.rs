@@ -120,9 +120,13 @@ pub enum WeReadAdapterError {
     /// The authenticated content page requires environment verification.
     #[error("WeRead article content requires environment verification")]
     VerificationRequired,
-    /// The upstream response did not match a supported shape.
+    /// The adapter's local request or identity protocol was invalid.
     #[error("WeRead protocol error: {0}")]
     Protocol(String),
+    /// WeRead returned a response that was valid JSON but did not match a
+    /// supported response shape or business-error classification.
+    #[error("WeRead returned an unexpected response: {0}")]
+    UnexpectedResponse(String),
     /// The authenticated browser transport failed before a valid response
     /// could be parsed.
     #[error("WeRead browser operation failed: {0}")]
@@ -191,9 +195,9 @@ impl From<AccountLeaseError> for WeReadAdapterError {
 pub fn parse_article_list_payload(
     payload: &Value,
 ) -> Result<Vec<WeReadArticleReference>, WeReadAdapterError> {
-    let object = payload
-        .as_object()
-        .ok_or_else(|| WeReadAdapterError::Protocol("response must be a JSON object".to_owned()))?;
+    let object = payload.as_object().ok_or_else(|| {
+        WeReadAdapterError::UnexpectedResponse("response must be a JSON object".to_owned())
+    })?;
     if let Some(error) = response_error(object)? {
         return Err(error);
     }
@@ -203,20 +207,20 @@ pub fn parse_article_list_payload(
     }
 
     if let Some(data) = object.get("data") {
-        let entries = data
-            .as_array()
-            .ok_or_else(|| WeReadAdapterError::Protocol("data must be an array".to_owned()))?;
+        let entries = data.as_array().ok_or_else(|| {
+            WeReadAdapterError::UnexpectedResponse("data must be an array".to_owned())
+        })?;
         return parse_entries(entries, None);
     }
 
     let Some(reviews) = object.get("reviews") else {
-        return Err(WeReadAdapterError::Protocol(
+        return Err(WeReadAdapterError::UnexpectedResponse(
             "response has no supported article-list envelope".to_owned(),
         ));
     };
-    let reviews = reviews
-        .as_array()
-        .ok_or_else(|| WeReadAdapterError::Protocol("reviews must be an array".to_owned()))?;
+    let reviews = reviews.as_array().ok_or_else(|| {
+        WeReadAdapterError::UnexpectedResponse("reviews must be an array".to_owned())
+    })?;
     let mut result = Vec::new();
     for group in reviews.iter().filter_map(Value::as_object) {
         let group_time = group.get("createTime").and_then(unix_timestamp);
@@ -224,7 +228,7 @@ pub fn parse_article_list_payload(
             continue;
         };
         let sub_reviews = sub_reviews.as_array().ok_or_else(|| {
-            WeReadAdapterError::Protocol("subReviews must be an array".to_owned())
+            WeReadAdapterError::UnexpectedResponse("subReviews must be an array".to_owned())
         })?;
         result.extend(parse_entries(sub_reviews, group_time)?);
     }
@@ -314,7 +318,7 @@ fn response_error(
         return Ok(None);
     };
     let Some(code) = integer_value(value) else {
-        return Err(WeReadAdapterError::Protocol(
+        return Err(WeReadAdapterError::UnexpectedResponse(
             "error code must be an integer".to_owned(),
         ));
     };
@@ -324,7 +328,7 @@ fn response_error(
     Ok(Some(match code {
         -2012 => WeReadAdapterError::AuthenticationExpired { code },
         -2041 | -2010 => WeReadAdapterError::RiskControlled { code },
-        _ => WeReadAdapterError::Protocol(format!("upstream error code {code}")),
+        _ => WeReadAdapterError::UnexpectedResponse(format!("upstream error code {code}")),
     }))
 }
 
@@ -576,6 +580,7 @@ where
             ),
             Err(error) => tracing::warn!(
                 account_id = %request.account_id(),
+                response_bytes = body.len(),
                 error = %error,
                 "unable to parse WeRead article list"
             ),
@@ -734,8 +739,9 @@ fn article_content_endpoint(review_id: &str) -> Result<Url, WeReadAdapterError> 
 }
 
 fn parse_article_list_body(body: &str) -> Result<Vec<WeReadArticleReference>, WeReadAdapterError> {
-    let payload = serde_json::from_str::<Value>(body)
-        .map_err(|error| WeReadAdapterError::Protocol(format!("response was not JSON: {error}")))?;
+    let payload = serde_json::from_str::<Value>(body).map_err(|error| {
+        WeReadAdapterError::UnexpectedResponse(format!("response was not JSON: {error}"))
+    })?;
     parse_article_list_payload(&payload)
 }
 
@@ -1015,7 +1021,7 @@ mod tests {
         );
         assert_eq!(
             parse_article_list_payload(&json!({"errcode": 1234})),
-            Err(WeReadAdapterError::Protocol(
+            Err(WeReadAdapterError::UnexpectedResponse(
                 "upstream error code 1234".to_owned()
             ))
         );
@@ -1025,29 +1031,29 @@ mod tests {
     fn rejects_malformed_envelopes_instead_of_returning_an_empty_success() {
         assert_eq!(
             parse_article_list_payload(&json!([])),
-            Err(WeReadAdapterError::Protocol(
+            Err(WeReadAdapterError::UnexpectedResponse(
                 "response must be a JSON object".to_owned()
             ))
         );
         assert_eq!(
             parse_article_list_payload(&json!({"data": {}})),
-            Err(WeReadAdapterError::Protocol(
+            Err(WeReadAdapterError::UnexpectedResponse(
                 "data must be an array".to_owned()
             ))
         );
         assert_eq!(
             parse_article_list_payload(&json!({"reviews": [{"subReviews": {}}]})),
-            Err(WeReadAdapterError::Protocol(
+            Err(WeReadAdapterError::UnexpectedResponse(
                 "subReviews must be an array".to_owned()
             ))
         );
     }
 
     #[test]
-    fn maps_non_json_browser_bodies_to_protocol_errors() {
+    fn maps_non_json_browser_bodies_to_unexpected_response_errors() {
         assert!(matches!(
             parse_article_list_body("<html>login required</html>"),
-            Err(WeReadAdapterError::Protocol(message)) if message.starts_with("response was not JSON:")
+            Err(WeReadAdapterError::UnexpectedResponse(message)) if message.starts_with("response was not JSON:")
         ));
     }
 

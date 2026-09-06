@@ -175,6 +175,11 @@ pub fn classify_acquisition_error(error: &SyncAcquisitionError) -> ClassifiedSyn
             SyncFailureClass::Retryable,
             "upstream acquisition failed temporarily",
         ),
+        SyncAcquisitionError::WeRead(WeReadAdapterError::UnexpectedResponse(_)) => (
+            SyncOutcome::RetryableFailure,
+            SyncFailureClass::Retryable,
+            "WeRead returned an unexpected response",
+        ),
         SyncAcquisitionError::ArticlePage(ArticlePageError::InvalidExtraction(_)) => (
             SyncOutcome::Failed,
             SyncFailureClass::Permanent,

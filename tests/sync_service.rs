@@ -164,3 +164,19 @@ fn integration_classification_is_stable_and_does_not_leak_error_text() {
         "WeRead article identity was invalid"
     );
 }
+
+#[test]
+fn integration_classification_labels_unexpected_weread_responses_as_retryable() {
+    let error = SyncAcquisitionError::WeRead(WeReadAdapterError::UnexpectedResponse(
+        "data must be an array".to_owned(),
+    ));
+
+    let classified = classify_acquisition_error(&error);
+
+    assert_eq!(classified.outcome(), SyncOutcome::RetryableFailure);
+    assert_eq!(classified.failure().class(), SyncFailureClass::Retryable);
+    assert_eq!(
+        classified.failure().message(),
+        "WeRead returned an unexpected response"
+    );
+}
