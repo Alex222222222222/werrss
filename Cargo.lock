@@ -3238,7 +3238,7 @@ dependencies = [
 
 [[package]]
 name = "werrss"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "anyhow",
  "askama",
