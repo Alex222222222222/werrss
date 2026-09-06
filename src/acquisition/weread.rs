@@ -352,7 +352,9 @@ fn cover_article_url(
     if article_id.trim().is_empty() {
         return Ok(None);
     }
-    verify_article_url(article_id)
+    // WeRead uses `~` in review IDs where the public WeChat article URL uses `_`.
+    let article_id = article_id.replace('~', "_");
+    verify_article_url(&article_id)
 }
 
 fn verify_article_url(value: &str) -> Result<Option<VerifiedWechatArticleUrl>, WeReadAdapterError> {
@@ -927,6 +929,21 @@ mod tests {
                 .as_ref()
                 .map(VerifiedWechatArticleUrl::as_str),
             Some("https://mp.weixin.qq.com/s/1V0fvyRTje-N7TWQunyLJA")
+        );
+    }
+
+    #[test]
+    fn converts_we_read_tilde_separator_to_wechat_article_underscore() {
+        let payload = json!({
+            "reviewId": "MP_WXS_2103095721_8X5pfeUgOhJVK~8cFnjx0A",
+            "title": "Article title"
+        });
+
+        let articles = parse_article_list_payload(&payload).expect("cover payload should parse");
+
+        assert_eq!(
+            articles[0].article_url.as_ref().unwrap().as_str(),
+            "https://mp.weixin.qq.com/s/8X5pfeUgOhJVK_8cFnjx0A"
         );
     }
 
