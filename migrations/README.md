@@ -14,7 +14,11 @@ domain before persistence.
 The forward `0004_asset_cache.sql` migration adds PostgreSQL-backed asset
 metadata, deduplicated binary blobs, and article-to-asset relationships. Binary
 eviction clears only blob data and retains referenced URL/version metadata for
-future repair; orphan cleanup removes rows that no longer belong to an article.
+repair workers; orphan cleanup removes rows that no longer belong to an article.
+
+The forward `0005_asset_repair.sql` migration adds the `asset_repair` job kind,
+durable per-asset admission/backoff state, and job-to-asset links used to
+deduplicate public cache-miss repair work and enforce cluster-wide limits.
 
 The initial schema provides:
 

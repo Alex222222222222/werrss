@@ -72,6 +72,8 @@ pub enum JobType {
     ArticleBackfill,
     /// Refresh an account credential or complete an interactive login flow.
     CredentialRefresh,
+    /// Re-fetch one missing binary asset while retaining its stable record.
+    AssetRepair,
 }
 
 impl JobType {
@@ -81,6 +83,7 @@ impl JobType {
         Self::FeedRebuild,
         Self::ArticleBackfill,
         Self::CredentialRefresh,
+        Self::AssetRepair,
     ];
 
     /// Returns whether the job needs the browser sidecar at execution time.

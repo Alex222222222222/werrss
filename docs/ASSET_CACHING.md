@@ -3,14 +3,16 @@
 Status: the disabled/database first slice is implemented. The current runtime
 accepts the database policy, fetches approved public image assets before the
 article persistence transaction, stores them in PostgreSQL, rewrites successful
-references to `/assets/{asset_record_id}`, serves stable asset responses, and
-runs hourly best-effort maintenance. The default `disabled` mode performs no
-asset network or database writes and keeps approved external image URLs.
+references to `/assets/{asset_record_id}`, serves stable asset responses,
+admits durable missing-asset repair jobs, and runs hourly best-effort
+maintenance. The default `disabled` mode performs no asset network or database
+writes and keeps approved external image URLs.
 
-Automatic missing-asset repair jobs, local-directory storage, and S3 storage
-remain future work. The sections describing repair admission, refresh
-lineages, and public cache-miss repair are target behavior for that follow-up;
-they are not silently enabled by the current implementation.
+Automatic repair of a missing database-backed asset is implemented. Local
+directory storage, S3 storage, and signed-URL refresh lineages remain future
+work. The repair implementation covers only the public, anonymous re-fetch
+path and does not infer that an HTTP error means a signed URL should be
+refreshed.
 
 ## Goals
 
@@ -53,8 +55,13 @@ storage implementations exist.
 | `ASSET_MAX_FETCH_TIME_PER_ARTICLE_SECONDS` | `120` | Maximum wall-clock time spent fetching assets for one article. Excess assets remain external. |
 | `ASSET_FETCH_TIMEOUT_SECONDS` | `30` | Maximum time for one asset request, including redirects and body transfer. |
 | `ASSET_MAX_REDIRECTS` | `5` | Maximum number of redirects followed for one asset request. |
-The future `ASSET_REPAIR_*` and `ASSET_REFRESH_*` settings are not accepted
-by the current environment parser.
+| `ASSET_REPAIR_MAX_PENDING` | `100` | PostgreSQL-wide maximum number of active asset-repair jobs. |
+| `ASSET_REPAIR_PUBLIC_MAX_PENDING` | `50` | PostgreSQL-wide maximum number of active repairs admitted by public asset requests. `0` disables public repair admission. |
+| `ASSET_REPAIR_REQUEUE_SECONDS` | `60` | Backoff after a failed repair before another public admission is allowed. |
+| `ASSET_REPAIR_MAX_ATTEMPTS` | `3` | Maximum number of public repair admissions for one stable asset record before it becomes terminal. |
+
+`ASSET_REFRESH_*` settings are reserved for the future signed-URL refresh
+feature and are not accepted by the current environment parser.
 
 The aggregate cache limit counts only the raw binary response bytes for rows
 whose data is present. It does not count PostgreSQL TOAST overhead, indexes,
@@ -164,8 +171,8 @@ metadata to retry it after the data has been evicted.
 - `blob_id`: nullable when fetching has not produced bytes; it remains set
   when only the blob data has been evicted;
 - fetch status and a bounded error classification. The current schema uses
-  `available` and `missing`; durable attempt/repair lineage fields are future
-  additions;
+  `available` and `missing`; `asset_repair_states` stores bounded admission,
+  backoff, and terminal-attempt state for public repair;
 - a safe non-secret fetch-context reference when one is needed for recovery.
 
 Do not store an unbounded list of original URLs on a blob. Multiple
@@ -241,12 +248,13 @@ a WeRead account lease for an asset request. The account selected for the
 authenticated WeRead list/content operation is not implicitly reused here.
 
 If a future asset host genuinely requires authentication, it must be an
-explicit opt-in mode outside the first implementation. It may send only
+explicit opt-in mode outside the first implementation. An authenticated
+asset-fetch/repair mode may send only
 cookies whose domain, path, Secure flag, and expiry match the exact target URL;
 it must never forward the complete browser cookie jar to an arbitrary asset
-host. Such a future repair job would acquire its account lease at execution
-time, not from a public HTTP request, and its job payload would still contain
-no secrets.
+host. Such a future mode would acquire its account lease at execution time,
+not from a public HTTP request, and its job payload would still contain no
+secrets.
 
 Each response is streamed with the configured byte limit. The client validates
 the status, redirect chain, media type, and file signature before handing the
@@ -300,8 +308,8 @@ capacity decisions with PostgreSQL transaction advisory locks. Two URLs with
 equal bytes share one blob but retain two source records. Two requests for the
 same URL and same bytes share one URL/version record. A same-URL byte change
 creates a new version. A failed initial fetch leaves the article external; a
-future repair flow may add a URL record with no blob so a later attempt knows
-what to retry.
+successful initial fetch always creates the referenced record used by a later
+repair if its bytes are subsequently evicted.
 
 If the process stops after writing a blob but before attaching it to an
 article, the unreferenced blob is removed by orphan cleanup. If it stops after
@@ -322,15 +330,16 @@ The public asset route:
    `X-Content-Type-Options: nosniff`, and an appropriate cache policy;
 4. updates `last_accessed_at` for successful `200` and `304` responses; and
 5. when data is missing, does not perform network or browser work in the
-   public request. The current route returns `503 Service Unavailable` with
-   `Retry-After: 60`; it does not yet enqueue a repair job.
+   public request. The route admits one deduplicated `asset_repair` job and
+   returns `503 Service Unavailable` with `Retry-After` set to
+   `ASSET_REPAIR_REQUEUE_SECONDS`; an unknown, unreferenced, or exhausted
+   record returns `404`.
 
 The public asset route never acquires an account lease, sends cookies, starts
 an authenticated browser session, or follows an upstream URL synchronously.
-The initial article worker performs one bounded anonymous HTTP fetch using the
-article URL as `Referer`, its origin as `Origin`, and the configured
-User-Agent. A future asset-repair worker must use the same validation policy
-and durable job controls.
+Both the initial article worker and the `asset_repair` worker perform the same
+bounded anonymous HTTP fetch using the article URL as `Referer`, its origin as
+`Origin`, and the configured User-Agent.
 
 When the stored URL is classified as expired because its signed URL is stale,
 the repair worker does not retry that URL indefinitely. Refresh eligibility is
@@ -383,10 +392,11 @@ A successful repair that restores the same stable asset record does not require
 a feed rebuild. A new URL/version or the first successful rewrite does
 invalidate the source feed revision and queues a feed rebuild.
 
-`asset_repair` and `asset_refresh` are separate job kinds. Both are deduplicated
-by the asset/article identity, use the normal durable lease and crash-recovery
-rules, and share the cluster-wide pending limit and per-process concurrency
-limit. Repair jobs use `ASSET_REPAIR_REQUEUE_SECONDS`; refresh admission uses
+`asset_repair` and the future `asset_refresh` are separate job kinds. Repair
+jobs are deduplicated by stable asset identity, use the normal durable lease
+and crash-recovery rules, and share the cluster-wide pending limit and
+per-process concurrency limit. Repair jobs use `ASSET_REPAIR_REQUEUE_SECONDS`;
+future refresh admission uses
 the refresh-lineage cooldown and attempt limit. A repair may enqueue at most one
 refresh for the current lineage at a time; a refresh must not recursively
 enqueue another refresh without first completing a new article acquisition.

@@ -46,7 +46,8 @@ use crate::{
     },
     domain::feed::FeedCache,
     persistence::repositories::{
-        asset_repository::PostgresAssetStore, feed_cache_repository::FeedCacheRepository,
+        asset_repository::{AssetRepairEnqueueResult, PostgresAssetStore},
+        feed_cache_repository::FeedCacheRepository,
         feed_token_repository::FeedTokenRepository,
     },
 };
@@ -328,18 +329,66 @@ where
             return empty_response(StatusCode::SERVICE_UNAVAILABLE);
         }
     };
+    let asset = if matches!(
+        asset,
+        crate::archive::asset_store::AssetRead::Missing { .. }
+    ) {
+        tracing::debug!(asset_id = %asset_id, "asset bytes are missing");
+        let reread = match store.enqueue_repair(asset_id).await {
+            Ok(AssetRepairEnqueueResult::NotFound | AssetRepairEnqueueResult::Exhausted) => {
+                return empty_response(StatusCode::NOT_FOUND)
+            }
+            Ok(AssetRepairEnqueueResult::Enqueued { job_id }) => {
+                tracing::info!(asset_id = %asset_id, job_id = %job_id, "asset repair admitted");
+                None
+            }
+            Ok(AssetRepairEnqueueResult::AlreadyActive { job_id }) => {
+                tracing::debug!(asset_id = %asset_id, job_id = %job_id, "asset repair already active");
+                None
+            }
+            Ok(AssetRepairEnqueueResult::AlreadyAvailable) => {
+                tracing::debug!(asset_id = %asset_id, "asset was restored while serving cache miss");
+                Some(store.read_and_touch(asset_id).await)
+            }
+            Ok(AssetRepairEnqueueResult::CapacityFull) => {
+                tracing::warn!(asset_id = %asset_id, "asset repair capacity is full");
+                None
+            }
+            Ok(AssetRepairEnqueueResult::Backoff) => {
+                tracing::debug!(asset_id = %asset_id, "asset repair is in backoff");
+                None
+            }
+            Err(error) => {
+                tracing::warn!(asset_id = %asset_id, error = %error, "asset repair admission failed");
+                None
+            }
+        };
+        let Some(reread) = reread else {
+            return asset_retry_response(store);
+        };
+        match reread {
+            Ok(Some(asset @ crate::archive::asset_store::AssetRead::Available { .. })) => asset,
+            Ok(Some(crate::archive::asset_store::AssetRead::Missing { .. })) => {
+                tracing::warn!(asset_id = %asset_id, "asset remained unavailable after restoration race");
+                return asset_retry_response(store);
+            }
+            Ok(None) => return empty_response(StatusCode::NOT_FOUND),
+            Err(error) => {
+                tracing::warn!(asset_id = %asset_id, error = %error, "asset reread failed after restoration race");
+                return empty_response(StatusCode::SERVICE_UNAVAILABLE);
+            }
+        }
+    } else {
+        asset
+    };
+
     let crate::archive::asset_store::AssetRead::Available {
         media_type,
         checksum,
         bytes,
     } = asset
     else {
-        tracing::debug!(asset_id = %asset_id, "asset bytes are missing");
-        let mut response = empty_response(StatusCode::SERVICE_UNAVAILABLE);
-        response
-            .headers_mut()
-            .insert(header::RETRY_AFTER, HeaderValue::from_static("60"));
-        return response;
+        return asset_retry_response(store);
     };
 
     let etag_value = format!("\"sha256:{checksum}\"");
@@ -379,6 +428,16 @@ where
         // 200 representation rather than the empty response body.
         response_headers.insert(header::CONTENT_LENGTH, value);
     }
+    response
+}
+
+fn asset_retry_response(store: &PostgresAssetStore) -> Response {
+    let mut response = empty_response(StatusCode::SERVICE_UNAVAILABLE);
+    let retry_after = store.repair_policy().requeue_after().as_secs().to_string();
+    response.headers_mut().insert(
+        header::RETRY_AFTER,
+        HeaderValue::try_from(retry_after).expect("numeric Retry-After values are valid"),
+    );
     response
 }
 

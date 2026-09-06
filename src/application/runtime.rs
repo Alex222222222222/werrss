@@ -223,7 +223,10 @@ impl RuntimePlan {
                     WorkerConfigError::HeartbeatNotShorterThanLease,
                 ));
             }
-            let allowed_job_types = EXECUTABLE_WORKER_JOB_TYPES.to_vec();
+            let mut allowed_job_types = EXECUTABLE_WORKER_JOB_TYPES.to_vec();
+            if config.asset_archive.database_policy().is_some() {
+                allowed_job_types.push(JobType::AssetRepair);
+            }
             let source_sync_enabled = true;
             let dispatch = WorkerConfig::new(allowed_job_types, heartbeat)
                 .map_err(RuntimePlanError::WorkerConfig)?;
@@ -320,7 +323,10 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::config::AppConfig;
+    use crate::{
+        archive::asset_store::{AssetCachePolicy, AssetRepairPolicy},
+        config::{AppConfig, AssetArchiveConfig},
+    };
 
     fn config(roles: &str) -> AppConfig {
         AppConfig::from_env_iter([
@@ -403,6 +409,24 @@ mod tests {
                 JobType::ArticleBackfill,
             ]
         );
+    }
+
+    #[test]
+    fn database_asset_mode_adds_the_database_only_repair_job() {
+        let mut config = config("worker");
+        config.asset_archive = AssetArchiveConfig::Database {
+            policy: AssetCachePolicy::default(),
+            repair_policy: AssetRepairPolicy::default(),
+        };
+        let plan = RuntimePlan::from_config(&config).unwrap();
+        let RuntimeComponent::Worker(worker) = plan.component(AppRole::Worker).unwrap() else {
+            panic!("worker role should produce a worker component")
+        };
+
+        assert!(worker
+            .worker_config()
+            .allowed_job_types()
+            .contains(&JobType::AssetRepair));
     }
 
     #[test]

@@ -70,6 +70,7 @@ use super::{
         ArticleBackfillJobHandlerConfigError, ArticleBackfillJobHandlerDependencies,
     },
     asset_archive_service::{AssetArchiveService, AssetArchiveServiceError},
+    asset_repair_handler::AssetRepairJobHandler,
     browser_health::{BrowserHealth, BrowserHealthMonitor},
     feed_rebuild_handler::{
         FeedRebuildJobHandler, FeedRebuildJobHandlerConfig, FeedRebuildJobHandlerConfigError,
@@ -190,6 +191,7 @@ pub struct RuntimeJobHandler<F, S> {
     feed_rebuild: F,
     source_sync: Option<S>,
     article_backfill: Option<Box<dyn JobHandler>>,
+    asset_repair: Option<Box<dyn JobHandler>>,
     credential_refresh: Option<Box<dyn OptionalJobHandler>>,
 }
 
@@ -200,6 +202,7 @@ impl<F, S> RuntimeJobHandler<F, S> {
             feed_rebuild,
             source_sync,
             article_backfill: None,
+            asset_repair: None,
             credential_refresh: None,
         }
     }
@@ -219,6 +222,15 @@ impl<F, S> RuntimeJobHandler<F, S> {
         H: OptionalJobHandler + 'static,
     {
         self.credential_refresh = Some(Box::new(handler));
+        self
+    }
+
+    /// Adds the database-backed missing-asset repair handler.
+    pub fn with_asset_repair<H>(mut self, handler: H) -> Self
+    where
+        H: JobHandler + 'static,
+    {
+        self.asset_repair = Some(Box::new(handler));
         self
     }
 }
@@ -246,6 +258,12 @@ where
                 Some(handler) => handler.execute(lease, now).await,
                 None => crate::application::worker::JobExecution::Failed {
                     error: "article-backfill handler is not configured".to_owned(),
+                },
+            },
+            JobType::AssetRepair => match &self.asset_repair {
+                Some(handler) => handler.execute(lease, now).await,
+                None => crate::application::worker::JobExecution::Failed {
+                    error: "asset-repair handler is not configured".to_owned(),
                 },
             },
             JobType::CredentialRefresh => match &self.credential_refresh {
@@ -413,7 +431,12 @@ impl RuntimeSupervisor {
         let mut tasks = JoinSet::new();
 
         if let Some(policy) = self.config.asset_archive.database_policy() {
-            let store = PostgresAssetStore::new(self.pool.clone(), policy);
+            let store = PostgresAssetStore::new(self.pool.clone(), policy).with_repair_policy(
+                self.config
+                    .asset_archive
+                    .database_repair_policy()
+                    .expect("database asset policy has repair policy"),
+            );
             let role_shutdown = role_shutdown_rx.clone();
             tracing::info!("database asset-cache maintenance started");
             tasks.spawn(async move {
@@ -573,11 +596,14 @@ impl RuntimeSupervisor {
             rebuild_service,
             feed_config,
         );
-        let asset_store = self
-            .config
-            .asset_archive
-            .database_policy()
-            .map(|policy| PostgresAssetStore::new(self.pool.clone(), policy));
+        let asset_store = self.config.asset_archive.database_policy().map(|policy| {
+            PostgresAssetStore::new(self.pool.clone(), policy).with_repair_policy(
+                self.config
+                    .asset_archive
+                    .database_repair_policy()
+                    .expect("database asset policy has repair policy"),
+            )
+        });
         let mut router = feed_router_with_browser_health_and_assets(
             FeedTokenService::new(PostgresFeedTokenRepository::new(self.pool.clone())),
             feed_service,
@@ -651,8 +677,40 @@ impl RuntimeSupervisor {
         let handler_config = FeedRebuildJobHandlerConfig::new(retry_after)
             .map_err(RuntimeSupervisorError::FeedRebuildHandlerConfig)?;
         let feed_handler = FeedRebuildJobHandler::new(rebuild_service, handler_config);
-        let asset_archiver = if plan.source_sync_enabled() {
+        let asset_archiver = if plan.source_sync_enabled()
+            || plan
+                .worker_config()
+                .allowed_job_types()
+                .contains(&JobType::AssetRepair)
+        {
             self.build_asset_archiver()?
+        } else {
+            None
+        };
+        let asset_repair = if plan
+            .worker_config()
+            .allowed_job_types()
+            .contains(&JobType::AssetRepair)
+        {
+            let policy = self
+                .config
+                .asset_archive
+                .database_policy()
+                .ok_or(RuntimeSupervisorError::AssetArchiveNotConfigured)?;
+            let repair_policy = self
+                .config
+                .asset_archive
+                .database_repair_policy()
+                .ok_or(RuntimeSupervisorError::AssetArchiveNotConfigured)?;
+            let archiver = asset_archiver
+                .clone()
+                .ok_or(RuntimeSupervisorError::AssetArchiveNotConfigured)?;
+            Some(AssetRepairJobHandler::new(
+                PostgresAssetStore::new(self.pool.clone(), policy)
+                    .with_repair_policy(repair_policy),
+                archiver,
+                retry_after,
+            ))
         } else {
             None
         };
@@ -662,11 +720,15 @@ impl RuntimeSupervisor {
             .transpose()?;
         let article_backfill = plan
             .source_sync_enabled()
-            .then(|| self.build_article_backfill_handler(worker_index, asset_archiver))
+            .then(|| self.build_article_backfill_handler(worker_index, asset_archiver.clone()))
             .transpose()?;
         let handler = RuntimeJobHandler::new(feed_handler, source_sync);
         let handler = match article_backfill {
             Some(article_backfill) => handler.with_article_backfill(article_backfill),
+            None => handler,
+        };
+        let handler = match asset_repair {
+            Some(asset_repair) => handler.with_asset_repair(asset_repair),
             None => handler,
         };
         let handler = match self.credential_refresher.clone() {
@@ -1091,6 +1153,9 @@ pub enum RuntimeSupervisorError {
     /// The optional database asset HTTP client could not be constructed.
     #[error(transparent)]
     AssetArchive(#[from] AssetArchiveServiceError),
+    /// An asset-repair worker was planned without database asset settings.
+    #[error("database asset archive configuration is required for asset repair")]
+    AssetArchiveNotConfigured,
     /// Worker construction failed.
     #[error(transparent)]
     WorkerConfig(#[from] super::worker::WorkerConfigError),

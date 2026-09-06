@@ -633,7 +633,7 @@ impl<'a> PostgresJobTransaction<'a> {
 
     // TODO(design): move this operation into the eventual queue port so
     // immediate scheduling does not depend on the interim repository type.
-    async fn enqueue_internal(
+    pub(crate) async fn enqueue_internal(
         &mut self,
         spec: NewJob,
         use_database_time: bool,
@@ -1344,6 +1344,7 @@ fn parse_job_type(value: String) -> Result<JobType, JobRepositoryError> {
         "feed_rebuild" => Ok(JobType::FeedRebuild),
         "article_backfill" => Ok(JobType::ArticleBackfill),
         "credential_refresh" => Ok(JobType::CredentialRefresh),
+        "asset_repair" => Ok(JobType::AssetRepair),
         _ => Err(JobRepositoryError::Storage(format!(
             "unknown persisted job_type: {value}"
         ))),
@@ -1370,6 +1371,7 @@ fn job_type_name(job_type: JobType) -> &'static str {
         JobType::FeedRebuild => "feed_rebuild",
         JobType::ArticleBackfill => "article_backfill",
         JobType::CredentialRefresh => "credential_refresh",
+        JobType::AssetRepair => "asset_repair",
     }
 }
 

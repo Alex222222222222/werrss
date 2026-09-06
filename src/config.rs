@@ -33,7 +33,9 @@
 //! ASSET_CACHE_MAX_AGE_DAYS / ASSET_MAX_SIZE_MB /
 //! ASSET_MAX_COUNT_PER_ARTICLE / ASSET_MAX_FETCH_BYTES_PER_ARTICLE_MB /
 //! ASSET_MAX_FETCH_TIME_PER_ARTICLE_SECONDS / ASSET_FETCH_TIMEOUT_SECONDS /
-//! ASSET_MAX_REDIRECTS
+//! ASSET_MAX_REDIRECTS / ASSET_REPAIR_MAX_PENDING /
+//! ASSET_REPAIR_PUBLIC_MAX_PENDING / ASSET_REPAIR_REQUEUE_SECONDS /
+//! ASSET_REPAIR_MAX_ATTEMPTS
 //! ADMIN_ENABLED / ADMIN_USERNAME / ADMIN_PASSWORD / SESSION_SIGNING_KEY /
 //! CREDENTIAL_ENCRYPTION_KEY
 //! ```
@@ -74,7 +76,9 @@ use crate::domain::pacing::{
     DelayDistribution, PacingError, PacingPolicy, QuietHours, MAX_SCROLL_PIXELS, MAX_SCROLL_STEPS,
 };
 use crate::{
-    archive::asset_store::{AssetCachePolicy, AssetCachePolicyError},
+    archive::asset_store::{
+        AssetCachePolicy, AssetCachePolicyError, AssetRepairPolicy, AssetRepairPolicyError,
+    },
     domain::credentials::WeReadAccountId,
 };
 
@@ -154,6 +158,10 @@ const KNOWN_ENVIRONMENT_VARIABLES: &[&str] = &[
     "ASSET_MAX_FETCH_TIME_PER_ARTICLE_SECONDS",
     "ASSET_FETCH_TIMEOUT_SECONDS",
     "ASSET_MAX_REDIRECTS",
+    "ASSET_REPAIR_MAX_PENDING",
+    "ASSET_REPAIR_PUBLIC_MAX_PENDING",
+    "ASSET_REPAIR_REQUEUE_SECONDS",
+    "ASSET_REPAIR_MAX_ATTEMPTS",
     "ADMIN_ENABLED",
     "ADMIN_USERNAME",
     "ADMIN_PASSWORD",
@@ -276,6 +284,8 @@ pub enum AssetArchiveConfig {
     Database {
         /// Limits applied to acquisition, storage, and maintenance.
         policy: AssetCachePolicy,
+        /// Cluster-wide admission and retry limits for public cache misses.
+        repair_policy: AssetRepairPolicy,
     },
 }
 
@@ -284,7 +294,15 @@ impl AssetArchiveConfig {
     pub const fn database_policy(&self) -> Option<AssetCachePolicy> {
         match self {
             Self::Disabled => None,
-            Self::Database { policy } => Some(*policy),
+            Self::Database { policy, .. } => Some(*policy),
+        }
+    }
+
+    /// Returns the repair admission policy when binary caching is enabled.
+    pub const fn database_repair_policy(&self) -> Option<AssetRepairPolicy> {
+        match self {
+            Self::Disabled => None,
+            Self::Database { repair_policy, .. } => Some(*repair_policy),
         }
     }
 }
@@ -848,6 +866,10 @@ struct RawConfig {
     asset_max_fetch_time_per_article_seconds: Option<u64>,
     asset_fetch_timeout_seconds: Option<u64>,
     asset_max_redirects: Option<u32>,
+    asset_repair_max_pending: Option<u32>,
+    asset_repair_public_max_pending: Option<u32>,
+    asset_repair_requeue_seconds: Option<u64>,
+    asset_repair_max_attempts: Option<u32>,
     admin_enabled: Option<String>,
     admin_username: Option<String>,
     admin_password: Option<String>,
@@ -1059,12 +1081,64 @@ fn asset_archive_config(raw: &RawConfig) -> Result<AssetArchiveConfig, ConfigErr
     let policy = asset_cache_policy(raw)?;
     match backend.as_str() {
         "disabled" => Ok(AssetArchiveConfig::Disabled),
-        "database" | "postgres" => Ok(AssetArchiveConfig::Database { policy }),
+        "database" | "postgres" => Ok(AssetArchiveConfig::Database {
+            policy,
+            repair_policy: asset_repair_policy(raw)?,
+        }),
         _ => Err(ConfigError::InvalidValue {
             variable: "ASSET_ARCHIVE_BACKEND",
             reason: "expected disabled or database (postgres is an alias)",
         }),
     }
+}
+
+fn asset_repair_policy(raw: &RawConfig) -> Result<AssetRepairPolicy, ConfigError> {
+    let max_pending = bounded_positive_u32(
+        raw.asset_repair_max_pending.unwrap_or(100),
+        "ASSET_REPAIR_MAX_PENDING",
+        100_000,
+    )?;
+    let public_max_pending = raw.asset_repair_public_max_pending.unwrap_or(50);
+    if public_max_pending > max_pending {
+        return Err(ConfigError::InvalidValue {
+            variable: "ASSET_REPAIR_PUBLIC_MAX_PENDING",
+            reason: "must not exceed ASSET_REPAIR_MAX_PENDING",
+        });
+    }
+    let requeue_after = bounded_positive_u64(
+        raw.asset_repair_requeue_seconds.unwrap_or(60),
+        "ASSET_REPAIR_REQUEUE_SECONDS",
+        24 * 60 * 60,
+    )?;
+    let max_attempts = bounded_positive_u32(
+        raw.asset_repair_max_attempts.unwrap_or(3),
+        "ASSET_REPAIR_MAX_ATTEMPTS",
+        100,
+    )?;
+    AssetRepairPolicy::new(
+        max_pending,
+        public_max_pending,
+        Duration::from_secs(requeue_after),
+        max_attempts,
+    )
+    .map_err(|error| match error {
+        AssetRepairPolicyError::ZeroLimit { field } => ConfigError::InvalidValue {
+            variable: match field {
+                "max_pending" => "ASSET_REPAIR_MAX_PENDING",
+                "max_attempts" => "ASSET_REPAIR_MAX_ATTEMPTS",
+                _ => "ASSET_REPAIR_MAX_PENDING",
+            },
+            reason: "must be greater than zero",
+        },
+        AssetRepairPolicyError::PublicLimitExceedsGlobal => ConfigError::InvalidValue {
+            variable: "ASSET_REPAIR_PUBLIC_MAX_PENDING",
+            reason: "must not exceed ASSET_REPAIR_MAX_PENDING",
+        },
+        AssetRepairPolicyError::ZeroDuration => ConfigError::InvalidValue {
+            variable: "ASSET_REPAIR_REQUEUE_SECONDS",
+            reason: "must be greater than zero",
+        },
+    })
 }
 
 fn asset_cache_policy(raw: &RawConfig) -> Result<AssetCachePolicy, ConfigError> {
@@ -1821,7 +1895,11 @@ mod tests {
         ]);
 
         let config = AppConfig::from_env_iter(environment).unwrap();
-        let AssetArchiveConfig::Database { policy } = config.asset_archive else {
+        let AssetArchiveConfig::Database {
+            policy,
+            repair_policy,
+        } = config.asset_archive
+        else {
             panic!("database backend should be selected");
         };
         assert_eq!(policy.max_cache_size_bytes(), 12_000_000);
@@ -1832,6 +1910,10 @@ mod tests {
         assert_eq!(policy.max_fetch_time_per_article(), Duration::from_secs(40));
         assert_eq!(policy.fetch_timeout(), Duration::from_secs(10));
         assert_eq!(policy.max_redirects(), 2);
+        assert_eq!(repair_policy.max_pending(), 100);
+        assert_eq!(repair_policy.public_max_pending(), 50);
+        assert_eq!(repair_policy.requeue_after(), Duration::from_secs(60));
+        assert_eq!(repair_policy.max_attempts(), 3);
     }
 
     #[test]
@@ -1843,6 +1925,28 @@ mod tests {
             AppConfig::from_env_iter(environment).unwrap().asset_archive,
             AssetArchiveConfig::Database { .. }
         ));
+    }
+
+    #[test]
+    fn parses_asset_repair_admission_limits() {
+        let mut environment =
+            replace_environment(valid_environment(), "ASSET_ARCHIVE_BACKEND", "database");
+        environment.extend([
+            ("ASSET_REPAIR_MAX_PENDING".to_owned(), "12".to_owned()),
+            ("ASSET_REPAIR_PUBLIC_MAX_PENDING".to_owned(), "7".to_owned()),
+            ("ASSET_REPAIR_REQUEUE_SECONDS".to_owned(), "45".to_owned()),
+            ("ASSET_REPAIR_MAX_ATTEMPTS".to_owned(), "4".to_owned()),
+        ]);
+        let AssetArchiveConfig::Database { repair_policy, .. } =
+            AppConfig::from_env_iter(environment).unwrap().asset_archive
+        else {
+            panic!("database backend should be selected");
+        };
+
+        assert_eq!(repair_policy.max_pending(), 12);
+        assert_eq!(repair_policy.public_max_pending(), 7);
+        assert_eq!(repair_policy.requeue_after(), Duration::from_secs(45));
+        assert_eq!(repair_policy.max_attempts(), 4);
     }
 
     #[test]

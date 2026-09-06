@@ -32,7 +32,7 @@ use werrss::{
         },
         source_service::SourceService,
     },
-    archive::asset_store::AssetCachePolicy,
+    archive::asset_store::{AssetCachePolicy, AssetRepairPolicy},
     domain::source::{FeedRevision, SourceId},
     persistence::{
         repositories::{
@@ -1978,10 +1978,11 @@ async fn asset_route_reports_a_repairable_cache_miss_and_retains_metadata(pool: 
         .expect("asset data should be evictable");
     let app = router_with_assets(
         &pool,
-        Some(PostgresAssetStore::new(
-            pool.clone(),
-            AssetCachePolicy::default(),
-        )),
+        Some(
+            PostgresAssetStore::new(pool.clone(), AssetCachePolicy::default()).with_repair_policy(
+                AssetRepairPolicy::new(10, 10, std::time::Duration::from_secs(37), 3).unwrap(),
+            ),
+        ),
     );
 
     let response = app
@@ -1989,7 +1990,7 @@ async fn asset_route_reports_a_repairable_cache_miss_and_retains_metadata(pool: 
         .await
         .expect("missing asset request should complete");
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(response.headers()[header::RETRY_AFTER], "60");
+    assert_eq!(response.headers()[header::RETRY_AFTER], "37");
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT count(*) FROM asset_records WHERE id = $1")
             .bind(asset_id)
@@ -1997,6 +1998,112 @@ async fn asset_route_reports_a_repairable_cache_miss_and_retains_metadata(pool: 
             .await
             .expect("asset metadata should remain queryable"),
         1
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM asset_repair_jobs AS arj
+             JOIN jobs AS j ON j.id = arj.job_id
+             WHERE arj.asset_record_id = $1 AND j.status IN ('queued', 'running', 'retry_wait', 'deferred')",
+        )
+        .bind(asset_id)
+        .fetch_one(&pool)
+        .await
+        .expect("repair job should be queryable"),
+        1
+    );
+
+    let second = router_with_assets(
+        &pool,
+        Some(PostgresAssetStore::new(
+            pool.clone(),
+            AssetCachePolicy::default(),
+        )),
+    )
+    .oneshot(get_request(&format!("/assets/{asset_id}"), None))
+    .await
+    .expect("repeated missing asset request should complete");
+    assert_eq!(second.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM asset_repair_jobs AS arj
+             JOIN jobs AS j ON j.id = arj.job_id
+             WHERE arj.asset_record_id = $1 AND j.status IN ('queued', 'running', 'retry_wait', 'deferred')",
+        )
+        .bind(asset_id)
+        .fetch_one(&pool)
+        .await
+        .expect("deduplicated repair job should be queryable"),
+        1
+    );
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn asset_route_serves_bytes_when_repair_race_restores_cache(pool: PgPool) {
+    let asset_id = insert_asset_fixture(&pool).await;
+    sqlx::query("UPDATE asset_blobs SET data = NULL")
+        .execute(&pool)
+        .await
+        .expect("asset data should be evictable");
+
+    let mut repair_lock = pool
+        .begin()
+        .await
+        .expect("repair admission lock transaction should start");
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('asset-repair-admission', 0))")
+        .execute(&mut *repair_lock)
+        .await
+        .expect("repair admission lock should be acquired");
+
+    let mut read_lock = pool
+        .begin()
+        .await
+        .expect("asset read lock transaction should start");
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('asset-capacity', 0))")
+        .execute(&mut *read_lock)
+        .await
+        .expect("asset capacity lock should be acquired");
+
+    let app = router_with_assets(
+        &pool,
+        Some(
+            PostgresAssetStore::new(pool.clone(), AssetCachePolicy::default()).with_repair_policy(
+                AssetRepairPolicy::new(10, 10, std::time::Duration::from_secs(37), 3).unwrap(),
+            ),
+        ),
+    );
+    let request = tokio::spawn(async move {
+        app.oneshot(get_request(&format!("/assets/{asset_id}"), None))
+            .await
+            .expect("asset request should complete")
+    });
+
+    read_lock
+        .commit()
+        .await
+        .expect("asset capacity lock should be released");
+    wait_for_advisory_waiter(&pool, "asset-repair-admission").await;
+
+    sqlx::query("UPDATE asset_blobs SET data = $1")
+        .bind(b"\x89PNG\r\n\x1a\nfixture".as_slice())
+        .execute(&pool)
+        .await
+        .expect("restored asset data should be written");
+    repair_lock
+        .commit()
+        .await
+        .expect("repair admission lock should be released");
+
+    let response = tokio::time::timeout(std::time::Duration::from_secs(2), request)
+        .await
+        .expect("asset request should not remain blocked")
+        .expect("asset request task should not panic");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("restored asset body should be readable")
+            .as_ref(),
+        b"\x89PNG\r\n\x1a\nfixture"
     );
 }
 
@@ -2291,6 +2398,42 @@ async fn insert_asset_fixture(pool: &PgPool) -> Uuid {
     .await
     .expect("article asset relationship should be insertable");
     asset_id
+}
+
+async fn wait_for_advisory_waiter(pool: &PgPool, lock_name: &str) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        let waiting: bool = sqlx::query_scalar(
+            "SELECT EXISTS (
+                 SELECT 1
+                 FROM pg_locks AS locks
+                 JOIN pg_stat_activity AS activity ON activity.pid = locks.pid
+                 WHERE locks.locktype = 'advisory'
+                   AND NOT locks.granted
+                   AND locks.objsubid = 1
+                   AND activity.datname = current_database()
+                   AND locks.classid = (
+                       (hashtextextended($1, 0) >> 32)
+                       & 4294967295
+                   )::oid
+                   AND locks.objid = (
+                       hashtextextended($1, 0) & 4294967295
+                   )::oid
+             )",
+        )
+        .bind(lock_name)
+        .fetch_one(pool)
+        .await
+        .expect("advisory lock waiter should be queryable");
+        if waiting {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "request did not wait for the {lock_name} advisory lock"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
 }
 
 async fn publish_cache(pool: &PgPool, source_id: SourceId) {

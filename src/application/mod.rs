@@ -15,6 +15,7 @@
 pub mod archive_service;
 pub mod article_backfill_handler;
 pub mod asset_archive_service;
+pub mod asset_repair_handler;
 pub mod auth_service;
 pub mod browser_health;
 pub mod feed_rebuild_handler;

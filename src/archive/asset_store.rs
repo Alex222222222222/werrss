@@ -136,6 +136,89 @@ impl Default for AssetCachePolicy {
     }
 }
 
+/// Durable admission and retry policy for missing-asset repair jobs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AssetRepairPolicy {
+    max_pending: u32,
+    public_max_pending: u32,
+    requeue_after: Duration,
+    max_attempts: u32,
+}
+
+impl AssetRepairPolicy {
+    /// Creates a validated repair policy.
+    pub fn new(
+        max_pending: u32,
+        public_max_pending: u32,
+        requeue_after: Duration,
+        max_attempts: u32,
+    ) -> Result<Self, AssetRepairPolicyError> {
+        if max_pending == 0 {
+            return Err(AssetRepairPolicyError::ZeroLimit {
+                field: "max_pending",
+            });
+        }
+        if public_max_pending > max_pending {
+            return Err(AssetRepairPolicyError::PublicLimitExceedsGlobal);
+        }
+        if requeue_after.is_zero() {
+            return Err(AssetRepairPolicyError::ZeroDuration);
+        }
+        if max_attempts == 0 {
+            return Err(AssetRepairPolicyError::ZeroLimit {
+                field: "max_attempts",
+            });
+        }
+        Ok(Self {
+            max_pending,
+            public_max_pending,
+            requeue_after,
+            max_attempts,
+        })
+    }
+
+    /// Maximum number of active asset-repair jobs across the database.
+    pub const fn max_pending(self) -> u32 {
+        self.max_pending
+    }
+
+    /// Maximum number of active public cache-miss repair jobs.
+    pub const fn public_max_pending(self) -> u32 {
+        self.public_max_pending
+    }
+
+    /// Minimum delay before a terminal repair may be admitted again.
+    pub const fn requeue_after(self) -> Duration {
+        self.requeue_after
+    }
+
+    /// Number of independently admitted repair attempts before a circuit opens.
+    pub const fn max_attempts(self) -> u32 {
+        self.max_attempts
+    }
+}
+
+impl Default for AssetRepairPolicy {
+    fn default() -> Self {
+        Self::new(100, 50, Duration::from_secs(60), 3)
+            .expect("default asset repair policy must be valid")
+    }
+}
+
+/// Invalid asset-repair admission configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum AssetRepairPolicyError {
+    /// A positive repair limit was set to zero.
+    #[error("asset repair policy field {field} must be greater than zero")]
+    ZeroLimit { field: &'static str },
+    /// Public work cannot be allowed to exceed the global repair capacity.
+    #[error("public asset repair limit must not exceed the global limit")]
+    PublicLimitExceedsGlobal,
+    /// A retry delay must prevent a hot loop after a terminal failure.
+    #[error("asset repair requeue delay must be positive")]
+    ZeroDuration,
+}
+
 /// Invalid asset cache policy input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum AssetCachePolicyError {
@@ -171,6 +254,29 @@ pub struct AssetInput {
     pub user_agent: Option<String>,
     checksum: String,
     preparation_id: Uuid,
+}
+
+/// Non-secret context needed to repair one referenced asset.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssetRepairTarget {
+    /// Stable asset record restored by the repair.
+    pub asset_id: Uuid,
+    /// Original upstream asset URL.
+    pub source_url: Url,
+    /// Article page URL used as the request referer.
+    pub referer_url: Url,
+    /// Optional article origin captured at acquisition time.
+    pub origin: Option<String>,
+    /// Optional browser User-Agent captured at acquisition time.
+    pub user_agent: Option<String>,
+    /// Earliest instant at which this durable repair lineage may be attempted.
+    ///
+    /// This is populated when a worker records a failure before it crashes.
+    /// A recovered job must defer until this instant instead of bypassing the
+    /// public-admission backoff window.
+    pub next_allowed_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Whether the bounded repair-attempt budget is exhausted.
+    pub exhausted: bool,
 }
 
 impl AssetInput {
@@ -409,6 +515,42 @@ mod tests {
                 0,
             ),
             Err(AssetCachePolicyError::TimeoutExceedsArticleBudget)
+        );
+    }
+
+    #[test]
+    fn repair_policy_rejects_zero_global_pending_limit() {
+        assert_eq!(
+            AssetRepairPolicy::new(0, 0, Duration::from_secs(1), 1),
+            Err(AssetRepairPolicyError::ZeroLimit {
+                field: "max_pending"
+            })
+        );
+    }
+
+    #[test]
+    fn repair_policy_rejects_public_limit_above_global_limit() {
+        assert_eq!(
+            AssetRepairPolicy::new(1, 2, Duration::from_secs(1), 1),
+            Err(AssetRepairPolicyError::PublicLimitExceedsGlobal)
+        );
+    }
+
+    #[test]
+    fn repair_policy_rejects_zero_requeue_delay() {
+        assert_eq!(
+            AssetRepairPolicy::new(1, 0, Duration::ZERO, 1),
+            Err(AssetRepairPolicyError::ZeroDuration)
+        );
+    }
+
+    #[test]
+    fn repair_policy_rejects_zero_attempt_limit() {
+        assert_eq!(
+            AssetRepairPolicy::new(1, 0, Duration::from_secs(1), 0),
+            Err(AssetRepairPolicyError::ZeroLimit {
+                field: "max_attempts"
+            })
         );
     }
 }

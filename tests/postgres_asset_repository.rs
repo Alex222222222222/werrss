@@ -9,7 +9,7 @@ use chrono::Utc;
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
 use werrss::{
-    archive::asset_store::{AssetCachePolicy, AssetInput, AssetRead},
+    archive::asset_store::{AssetCachePolicy, AssetInput, AssetRead, AssetRepairPolicy},
     domain::{
         article::{ArticleObservationVersion, NewArticle},
         source::{NewSource, SchedulingGate, SourceId, VerifiedWechatArticleUrl},
@@ -18,8 +18,10 @@ use werrss::{
         repositories::{
             article_repository::ArticleTransactionRepository,
             asset_repository::{
-                AssetRepositoryError, AssetTransactionRepository, PostgresAssetStore,
+                AssetRepairEnqueueResult, AssetRepairRestoreResult, AssetRepositoryError,
+                AssetTransactionRepository, PostgresAssetStore,
             },
+            job_repository::{JobLease, JobQueue, PostgresJobRepository},
             source_repository::SourceTransactionRepository,
         },
         unit_of_work::UnitOfWorkFactory,
@@ -150,6 +152,541 @@ async fn asset_read_waits_for_eviction_lock_and_keeps_bytes_available(pool: PgPo
             .unwrap(),
         Some(AssetRead::Available { .. })
     ));
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn repair_admission_is_deduplicated_for_one_missing_asset(pool: PgPool) {
+    let source_id = SourceId::from_uuid(Uuid::new_v4());
+    create_source_and_articles(&pool, source_id, &["repair-dedupe"]).await;
+    let policy = test_policy(0, Duration::from_secs(30), 1024);
+    let stored = store_asset(
+        &pool,
+        policy,
+        source_id,
+        "repair-dedupe",
+        asset_input("https://cdn.example/repair-dedupe.png", FIRST_BYTES, 0),
+    )
+    .await;
+    sqlx::query("UPDATE asset_blobs SET data = NULL WHERE id = $1")
+        .bind(stored.blob_id())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let store = PostgresAssetStore::new(pool.clone(), policy);
+    let first = store.enqueue_repair(stored.id()).await.unwrap();
+    let second = store.enqueue_repair(stored.id()).await.unwrap();
+    let first_id = match first {
+        AssetRepairEnqueueResult::Enqueued { job_id } => job_id,
+        other => panic!("first admission should enqueue, got {other:?}"),
+    };
+    assert_eq!(
+        second,
+        AssetRepairEnqueueResult::AlreadyActive { job_id: first_id }
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM jobs WHERE job_type = 'asset_repair'")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        1
+    );
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn repair_admission_enforces_the_cluster_pending_cap(pool: PgPool) {
+    let source_id = SourceId::from_uuid(Uuid::new_v4());
+    create_source_and_articles(&pool, source_id, &["repair-cap-one", "repair-cap-two"]).await;
+    let policy = test_policy(0, Duration::from_secs(30), 1024);
+    let first = store_asset(
+        &pool,
+        policy,
+        source_id,
+        "repair-cap-one",
+        asset_input("https://cdn.example/repair-cap-one.png", FIRST_BYTES, 0),
+    )
+    .await;
+    let second = store_asset(
+        &pool,
+        policy,
+        source_id,
+        "repair-cap-two",
+        asset_input("https://cdn.example/repair-cap-two.png", SECOND_BYTES, 0),
+    )
+    .await;
+    sqlx::query("UPDATE asset_blobs SET data = NULL")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let repair_policy = AssetRepairPolicy::new(1, 1, Duration::from_secs(60), 3).unwrap();
+    let store = PostgresAssetStore::new(pool.clone(), policy).with_repair_policy(repair_policy);
+    assert!(matches!(
+        store.enqueue_repair(first.id()).await.unwrap(),
+        AssetRepairEnqueueResult::Enqueued { .. }
+    ));
+    assert_eq!(
+        store.enqueue_repair(second.id()).await.unwrap(),
+        AssetRepairEnqueueResult::CapacityFull
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM jobs WHERE job_type = 'asset_repair' AND status IN ('queued', 'running', 'retry_wait', 'deferred')",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        1
+    );
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn repair_admission_honors_backoff_and_exhausts_the_attempt_budget(pool: PgPool) {
+    let source_id = SourceId::from_uuid(Uuid::new_v4());
+    create_source_and_articles(&pool, source_id, &["repair-budget"]).await;
+    let policy = test_policy(0, Duration::from_secs(30), 1024);
+    let stored = store_asset(
+        &pool,
+        policy,
+        source_id,
+        "repair-budget",
+        asset_input("https://cdn.example/repair-budget.png", FIRST_BYTES, 0),
+    )
+    .await;
+    sqlx::query("UPDATE asset_blobs SET data = NULL WHERE id = $1")
+        .bind(stored.blob_id())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let repair_policy = AssetRepairPolicy::new(10, 10, Duration::from_secs(60), 2).unwrap();
+    let store = PostgresAssetStore::new(pool.clone(), policy).with_repair_policy(repair_policy);
+    let first_job = match store.enqueue_repair(stored.id()).await.unwrap() {
+        AssetRepairEnqueueResult::Enqueued { job_id } => job_id,
+        other => panic!("first admission should enqueue, got {other:?}"),
+    };
+    let first_lease = claim_repair_job(&pool).await;
+    assert!(!store
+        .record_repair_failure(&first_lease, stored.id(), "upstream unavailable")
+        .await
+        .unwrap());
+    finish_repair_job(&pool, first_job).await;
+    assert_eq!(
+        store.enqueue_repair(stored.id()).await.unwrap(),
+        AssetRepairEnqueueResult::Backoff
+    );
+
+    sqlx::query(
+        "UPDATE asset_repair_states
+         SET next_allowed_at = clock_timestamp() - interval '1 second'
+         WHERE asset_record_id = $1",
+    )
+    .bind(stored.id())
+    .execute(&pool)
+    .await
+    .unwrap();
+    let second_job = match store.enqueue_repair(stored.id()).await.unwrap() {
+        AssetRepairEnqueueResult::Enqueued { job_id } => job_id,
+        other => panic!("second admission should enqueue after backoff, got {other:?}"),
+    };
+    let second_lease = claim_repair_job(&pool).await;
+    assert!(store
+        .record_repair_failure(&second_lease, stored.id(), "upstream still unavailable")
+        .await
+        .unwrap());
+    finish_repair_job(&pool, second_job).await;
+    assert_eq!(
+        store.enqueue_repair(stored.id()).await.unwrap(),
+        AssetRepairEnqueueResult::Exhausted
+    );
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn maintenance_keeps_orphan_metadata_until_repair_job_is_terminal(pool: PgPool) {
+    let source_id = SourceId::from_uuid(Uuid::new_v4());
+    create_source_and_articles(&pool, source_id, &["repair-orphan"]).await;
+    let policy = test_policy(0, Duration::from_secs(30), 1024);
+    let stored = store_asset(
+        &pool,
+        policy,
+        source_id,
+        "repair-orphan",
+        asset_input("https://cdn.example/repair-orphan.png", FIRST_BYTES, 0),
+    )
+    .await;
+    sqlx::query("UPDATE asset_blobs SET data = NULL WHERE id = $1")
+        .bind(stored.blob_id())
+        .execute(&pool)
+        .await
+        .unwrap();
+    let store = PostgresAssetStore::new(pool.clone(), policy);
+    let job_id = match store.enqueue_repair(stored.id()).await.unwrap() {
+        AssetRepairEnqueueResult::Enqueued { job_id } => job_id,
+        other => panic!("repair should be admitted, got {other:?}"),
+    };
+
+    let factory = UnitOfWorkFactory::new(pool.clone());
+    let mut unit_of_work = factory.begin().await.unwrap();
+    unit_of_work
+        .assets(policy)
+        .clear_for_article(source_id, "repair-orphan")
+        .await
+        .unwrap();
+    unit_of_work.commit().await.unwrap();
+
+    assert_eq!(store.maintenance().await.unwrap().orphan_records, 0);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM asset_records WHERE id = $1")
+            .bind(stored.id())
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        1
+    );
+
+    finish_repair_job(&pool, job_id).await;
+    assert_eq!(store.maintenance().await.unwrap().orphan_records, 1);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM asset_records WHERE id = $1")
+            .bind(stored.id())
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        0
+    );
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn repair_admission_serializes_with_orphan_cleanup(pool: PgPool) {
+    let source_id = SourceId::from_uuid(Uuid::new_v4());
+    create_source_and_articles(&pool, source_id, &["repair-admission-race"]).await;
+    let policy = test_policy(0, Duration::from_secs(30), 1024);
+    let stored = store_asset(
+        &pool,
+        policy,
+        source_id,
+        "repair-admission-race",
+        asset_input(
+            "https://cdn.example/repair-admission-race.png",
+            FIRST_BYTES,
+            0,
+        ),
+    )
+    .await;
+    sqlx::query("UPDATE asset_blobs SET data = NULL WHERE id = $1")
+        .bind(stored.blob_id())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // Keep the repair transaction between its asset-row lock and commit. This
+    // lets the test remove the article relationship and start maintenance at
+    // exactly the point where the old lock order could delete the new job.
+    let mut trigger_blocker = pool.acquire().await.unwrap();
+    sqlx::query("SELECT pg_advisory_lock(2147483643::bigint)")
+        .execute(&mut *trigger_blocker)
+        .await
+        .unwrap();
+    sqlx::query(
+        "CREATE FUNCTION test_hold_asset_repair_job_insert() RETURNS trigger
+         LANGUAGE plpgsql AS $$
+         BEGIN
+             PERFORM pg_advisory_lock(2147483642::bigint);
+             PERFORM pg_advisory_lock(2147483643::bigint);
+             PERFORM pg_advisory_unlock(2147483643::bigint);
+             PERFORM pg_advisory_unlock(2147483642::bigint);
+             RETURN NEW;
+         END;
+         $$",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER test_hold_asset_repair_job_insert
+         AFTER INSERT ON jobs
+         FOR EACH ROW EXECUTE FUNCTION test_hold_asset_repair_job_insert()",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let asset_id = stored.id();
+    let enqueue = tokio::spawn({
+        let pool = pool.clone();
+        async move {
+            PostgresAssetStore::new(pool, policy)
+                .enqueue_repair(asset_id)
+                .await
+        }
+    });
+    wait_for_repair_insert_trigger(&pool).await;
+
+    // The relationship can disappear while admission is in progress. The
+    // active job must still protect the stable asset metadata from cleanup.
+    sqlx::query("DELETE FROM article_assets WHERE asset_record_id = $1")
+        .bind(asset_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let maintenance = tokio::spawn({
+        let pool = pool.clone();
+        async move { PostgresAssetStore::new(pool, policy).maintenance().await }
+    });
+    wait_for_capacity_waiter(&pool).await;
+
+    sqlx::query("SELECT pg_advisory_unlock(2147483643::bigint)")
+        .execute(&mut *trigger_blocker)
+        .await
+        .unwrap();
+
+    let enqueue_result = tokio::time::timeout(Duration::from_secs(5), enqueue)
+        .await
+        .expect("repair admission should finish after the trigger is released")
+        .unwrap()
+        .unwrap();
+    let job_id = match enqueue_result {
+        AssetRepairEnqueueResult::Enqueued { job_id } => job_id,
+        other => panic!("repair admission should enqueue one job, got {other:?}"),
+    };
+    let maintenance_result = tokio::time::timeout(Duration::from_secs(5), maintenance)
+        .await
+        .expect("maintenance should finish after repair admission")
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(maintenance_result.orphan_records, 0);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM asset_records WHERE id = $1")
+            .bind(asset_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        1,
+        "a newly admitted repair must preserve the stable asset record"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*)
+             FROM asset_repair_jobs AS arj
+             JOIN jobs AS j ON j.id = arj.job_id
+             WHERE arj.asset_record_id = $1
+               AND j.id = $2
+               AND j.status IN ('queued', 'running', 'retry_wait', 'deferred')",
+        )
+        .bind(asset_id)
+        .bind(job_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        1,
+        "maintenance must not cascade-delete the admitted repair job"
+    );
+
+    sqlx::query("DROP TRIGGER test_hold_asset_repair_job_insert ON jobs")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DROP FUNCTION test_hold_asset_repair_job_insert()")
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn repair_restores_bytes_without_changing_the_stable_asset_id(pool: PgPool) {
+    let source_id = SourceId::from_uuid(Uuid::new_v4());
+    create_source_and_articles(&pool, source_id, &["repair-restore"]).await;
+    let policy = test_policy(0, Duration::from_secs(30), 1024);
+    let input = asset_input("https://cdn.example/repair-restore.png", FIRST_BYTES, 0);
+    let stored = store_asset(&pool, policy, source_id, "repair-restore", input.clone()).await;
+    sqlx::query("UPDATE asset_blobs SET data = NULL WHERE id = $1")
+        .bind(stored.blob_id())
+        .execute(&pool)
+        .await
+        .unwrap();
+    let store = PostgresAssetStore::new(pool.clone(), policy);
+    let job_id = match store.enqueue_repair(stored.id()).await.unwrap() {
+        AssetRepairEnqueueResult::Enqueued { job_id } => job_id,
+        other => panic!("repair should be admitted, got {other:?}"),
+    };
+    let lease = claim_repair_job(&pool).await;
+    assert_eq!(
+        store
+            .repair_target(stored.id())
+            .await
+            .unwrap()
+            .unwrap()
+            .source_url,
+        input.source_url
+    );
+    assert_eq!(
+        store
+            .restore_missing_asset(&lease, stored.id(), &input)
+            .await
+            .unwrap(),
+        AssetRepairRestoreResult::Restored
+    );
+    finish_repair_job(&pool, job_id).await;
+    assert!(matches!(
+        store.read_and_touch(stored.id()).await.unwrap(),
+        Some(AssetRead::Available { ref bytes, .. }) if bytes == FIRST_BYTES
+    ));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM asset_records")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        1
+    );
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn source_preflight_and_repair_restore_share_capacity_first_lock_order(pool: PgPool) {
+    let source_id = SourceId::from_uuid(Uuid::new_v4());
+    create_source_and_articles(&pool, source_id, &["lock-order"]).await;
+    let policy = test_policy(0, Duration::from_secs(30), 1024);
+    let input = asset_input("https://cdn.example/lock-order.png", FIRST_BYTES, 0);
+    let stored = store_asset(&pool, policy, source_id, "lock-order", input.clone()).await;
+    sqlx::query("UPDATE asset_blobs SET data = NULL WHERE id = $1")
+        .bind(stored.blob_id())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let store = PostgresAssetStore::new(pool.clone(), policy);
+    let job_id = match store.enqueue_repair(stored.id()).await.unwrap() {
+        AssetRepairEnqueueResult::Enqueued { job_id } => job_id,
+        other => panic!("repair should be admitted, got {other:?}"),
+    };
+    let lease = claim_repair_job(&pool).await;
+
+    // Queue both operations behind one capacity lock. Before source preflight
+    // acquired this lock, it could hold the checksum lock while waiting for
+    // capacity, forming a cycle with repair restore.
+    let mut capacity_blocker = pool.acquire().await.unwrap();
+    sqlx::query("SELECT pg_advisory_lock(hashtextextended('asset-capacity', 0))")
+        .execute(&mut *capacity_blocker)
+        .await
+        .unwrap();
+
+    let repair_task = tokio::spawn({
+        let store = PostgresAssetStore::new(pool.clone(), policy);
+        let lease = lease.clone();
+        let input = input.clone();
+        async move {
+            store
+                .restore_missing_asset(&lease, stored.id(), &input)
+                .await?;
+            store.complete_repair(&lease, stored.id()).await
+        }
+    });
+    wait_for_capacity_waiters(&pool, 1).await;
+
+    let source_task = tokio::spawn({
+        let pool = pool.clone();
+        let input = input.clone();
+        async move {
+            let factory = UnitOfWorkFactory::new(pool);
+            let mut unit_of_work = factory
+                .begin_with_assets(std::slice::from_ref(&input))
+                .await
+                .map_err(|error| error.to_string())?;
+            unit_of_work
+                .assets(policy)
+                .store_for_article(source_id, "lock-order", &[input])
+                .await
+                .map_err(|error| error.to_string())?;
+            unit_of_work
+                .commit()
+                .await
+                .map_err(|error| error.to_string())
+        }
+    });
+    wait_for_capacity_waiters(&pool, 2).await;
+
+    sqlx::query("SELECT pg_advisory_unlock(hashtextextended('asset-capacity', 0))")
+        .execute(&mut *capacity_blocker)
+        .await
+        .unwrap();
+
+    let (repair_result, source_result) = tokio::time::timeout(Duration::from_secs(5), async {
+        (
+            repair_task.await.expect("repair task should not panic"),
+            source_task.await.expect("source task should not panic"),
+        )
+    })
+    .await
+    .expect("repair and source persistence should not deadlock");
+    repair_result.expect("repair restore should complete");
+    source_result.expect("source asset persistence should complete");
+    finish_repair_job(&pool, job_id).await;
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn empty_asset_replacement_does_not_deadlock_with_nonempty_preflight(pool: PgPool) {
+    let source_id = SourceId::from_uuid(Uuid::new_v4());
+    create_source_and_articles(
+        &pool,
+        source_id,
+        &["empty-replacement", "nonempty-preflight"],
+    )
+    .await;
+    let policy = test_policy(0, Duration::from_secs(30), 1024);
+    let input = asset_input("https://cdn.example/nonempty-preflight.png", FIRST_BYTES, 0);
+
+    // The empty transaction owns the source row without reserving the asset
+    // capacity lock, matching the source-sync path after all asset fetches
+    // failed.
+    let factory = UnitOfWorkFactory::new(pool.clone());
+    let mut empty_unit_of_work = factory.begin().await.unwrap();
+    empty_unit_of_work
+        .source()
+        .find_for_update(source_id)
+        .await
+        .unwrap();
+
+    // The non-empty transaction reserves capacity during preflight and then
+    // waits for the source row. Before the fix, the empty replacement waited
+    // for capacity here while holding the source row, forming a cycle.
+    let nonempty_task = tokio::spawn({
+        let pool = pool.clone();
+        async move {
+            let factory = UnitOfWorkFactory::new(pool);
+            let mut unit_of_work = factory
+                .begin_with_assets(std::slice::from_ref(&input))
+                .await
+                .unwrap();
+            unit_of_work
+                .source()
+                .find_for_update(source_id)
+                .await
+                .unwrap();
+            unit_of_work.commit().await.unwrap();
+        }
+    });
+    wait_for_capacity_holder(&pool).await;
+
+    let replacement = tokio::time::timeout(
+        Duration::from_secs(2),
+        empty_unit_of_work
+            .assets(policy)
+            .replace_for_article(source_id, "empty-replacement", &[]),
+    )
+    .await;
+    if replacement.is_err() {
+        nonempty_task.abort();
+        let _ = nonempty_task.await;
+        drop(empty_unit_of_work);
+        panic!("empty asset replacement deadlocked behind non-empty preflight");
+    }
+    assert!(replacement.unwrap().unwrap().is_empty());
+    empty_unit_of_work.commit().await.unwrap();
+
+    tokio::time::timeout(Duration::from_secs(2), nonempty_task)
+        .await
+        .expect("non-empty preflight should finish after the source row is released")
+        .expect("non-empty preflight task should not panic");
 }
 
 #[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
@@ -1073,6 +1610,34 @@ fn asset_input(url: &str, bytes: &[u8], occurrence: u32) -> AssetInput {
     )
 }
 
+async fn finish_repair_job(pool: &PgPool, job_id: Uuid) {
+    sqlx::query(
+        "UPDATE jobs
+         SET status = 'failed', failure_count = max_attempts,
+             lease_owner = NULL, lease_token = NULL, lease_until = NULL,
+             heartbeat_at = NULL,
+             finished_at = clock_timestamp(), updated_at = clock_timestamp()
+         WHERE id = $1",
+    )
+    .bind(job_id)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+async fn claim_repair_job(pool: &PgPool) -> JobLease {
+    PostgresJobRepository::new(pool.clone())
+        .claim_next(
+            "asset-repair-test-worker",
+            Utc::now(),
+            chrono::Duration::minutes(5),
+            &[werrss::domain::job::JobType::AssetRepair],
+        )
+        .await
+        .unwrap()
+        .expect("repair job should be claimable")
+}
+
 async fn store_asset(
     pool: &PgPool,
     policy: AssetCachePolicy,
@@ -1195,6 +1760,102 @@ async fn wait_for_capacity_waiter(pool: &PgPool) {
         assert!(
             Instant::now() < deadline,
             "asset read did not request the capacity lock"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+async fn wait_for_capacity_holder(pool: &PgPool) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let held: bool = sqlx::query_scalar(
+            "SELECT EXISTS (
+                 SELECT 1
+                 FROM pg_locks AS locks
+                 JOIN pg_stat_activity AS activity ON activity.pid = locks.pid
+                 WHERE locks.locktype = 'advisory'
+                   AND locks.granted
+                   AND locks.objsubid = 1
+                   AND activity.datname = current_database()
+                   AND locks.classid = (
+                       (hashtextextended('asset-capacity', 0) >> 32)
+                       & 4294967295
+                   )::oid
+                   AND locks.objid = (
+                       hashtextextended('asset-capacity', 0) & 4294967295
+                   )::oid
+             )",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        if held {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "non-empty preflight did not acquire the capacity lock"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+async fn wait_for_capacity_waiters(pool: &PgPool, minimum: i64) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT count(*)::bigint
+             FROM pg_locks AS locks
+             JOIN pg_stat_activity AS activity ON activity.pid = locks.pid
+             WHERE locks.locktype = 'advisory'
+               AND NOT locks.granted
+               AND locks.objsubid = 1
+               AND activity.datname = current_database()
+               AND locks.classid = (
+                   (hashtextextended('asset-capacity', 0) >> 32)
+                   & 4294967295
+               )::oid
+               AND locks.objid = (
+                   hashtextextended('asset-capacity', 0) & 4294967295
+               )::oid",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        if waiting >= minimum {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "expected at least {minimum} asset capacity waiters, found {waiting}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+async fn wait_for_repair_insert_trigger(pool: &PgPool) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let held: bool = sqlx::query_scalar(
+            "SELECT EXISTS (
+                 SELECT 1
+                 FROM pg_locks
+                 WHERE locktype = 'advisory'
+                   AND granted
+                   AND objsubid = 1
+                   AND classid = 0::oid
+                   AND objid = 2147483642::oid
+             )",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        if held {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "repair admission did not reach the synchronization trigger"
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }

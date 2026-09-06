@@ -206,8 +206,9 @@ images using a separate anonymous HTTP request with the article `Referer`,
 derived `Origin`, and configured User-Agent, validates the media type and
 signature, stores/deduplicates the bytes in PostgreSQL, and rewrites the
 article HTML to stable `/assets/{id}` paths. WeChat/WeRead cookies are never
-sent to asset hosts. Local-directory and S3 backends, and automatic repair
-jobs for evicted bytes, remain future work.
+sent to asset hosts. Missing cached bytes enqueue a deduplicated anonymous
+repair job and retain the same asset URL while the worker restores the data.
+Local-directory and S3 backends remain future work.
 
 | Variable | Default | Explanation |
 | --- | --- | --- |
@@ -220,13 +221,18 @@ jobs for evicted bytes, remain future work.
 | `ASSET_MAX_FETCH_TIME_PER_ARTICLE_SECONDS` | `120` | Wall-clock budget for fetching assets for one article. Excess assets remain external. |
 | `ASSET_FETCH_TIMEOUT_SECONDS` | `30` | Timeout for one asset request, including redirects and body transfer. |
 | `ASSET_MAX_REDIRECTS` | `5` | Maximum number of redirects followed for one asset request. |
+| `ASSET_REPAIR_MAX_PENDING` | `100` | PostgreSQL-wide maximum active asset-repair jobs. |
+| `ASSET_REPAIR_PUBLIC_MAX_PENDING` | `50` | PostgreSQL-wide maximum active repairs admitted by public asset requests; `0` disables public admission. |
+| `ASSET_REPAIR_REQUEUE_SECONDS` | `60` | Backoff after a failed repair before another public admission. |
+| `ASSET_REPAIR_MAX_ATTEMPTS` | `3` | Maximum repair admissions for one stable asset record before it becomes terminal. |
 
 The database backend runs a best-effort maintenance pass hourly in the runtime
 supervisor. Age and size eviction clear only binary data and mark the retained
 URL/version metadata as `missing`; orphan cleanup removes records and blobs
-that no longer have an article relationship. A missing asset currently returns
-`503` with `Retry-After: 60`; repair-job admission and automatic re-fetching are
-planned follow-up work.
+that no longer have an article relationship. A missing referenced asset returns
+`503` with `Retry-After` set to `ASSET_REPAIR_REQUEUE_SECONDS` after admitting
+one deduplicated `asset_repair` job. Unknown, unreferenced, or exhausted
+records return `404`.
 
 ### Administration and encryption
 
@@ -276,15 +282,10 @@ included in the current runtime. The responsive administrator UI polish and the
 English, French, and Simplified Chinese panel translations are also included in
 the current panel. The remaining roadmap items are future work:
 
-1. **Repair missing archived assets automatically.** The current database
-   cache retains URL metadata and returns a retryable miss after eviction;
-   durable repair jobs can re-fetch public assets with bounded admission,
-   retry, and circuit-breaker policies. The contract is documented in
-   [docs/ASSET_CACHING.md](docs/ASSET_CACHING.md).
-2. **Add local-directory and S3-compatible asset backends.** These can make
+1. **Add local-directory and S3-compatible asset backends.** These can make
    binary storage easier to operate at larger scale while preserving the
    database metadata and stable asset IDs.
-3. **Evaluate PGMQ as a queue transport optimization.** The current custom
+2. **Evaluate PGMQ as a queue transport optimization.** The current custom
    `jobs` table remains the version-one transport; PGMQ can be evaluated later
    if queue throughput or operational overhead becomes a demonstrated
    bottleneck.

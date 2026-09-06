@@ -11,16 +11,25 @@ use std::{
     fmt,
 };
 
+use chrono::Utc;
+use serde_json::json;
 use sqlx::{Acquire, PgPool, Postgres, Row, Transaction};
 use thiserror::Error;
 use url::Url;
 use uuid::Uuid;
 
 use crate::archive::asset_store::{
-    AssetCachePolicy, AssetInput, AssetMaintenanceResult, AssetRead, StoredAsset,
+    AssetCachePolicy, AssetInput, AssetMaintenanceResult, AssetRead, AssetRepairPolicy,
+    AssetRepairTarget, StoredAsset,
 };
+use crate::domain::job::{JobType, NewJob};
 
-use super::job_repository::{JobRepositoryError, PostgresJobTransaction};
+use super::job_repository::{JobLease, JobRepositoryError, PostgresJobTransaction};
+
+// Keep one queue-level retry independent from the per-asset admission budget:
+// an expired lease must be claimable by another worker even when the public
+// request has admitted only one repair attempt.
+const REPAIR_JOB_MAX_ATTEMPTS: u32 = 2;
 
 /// Errors returned while storing or reading archived assets.
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -68,9 +77,42 @@ pub enum AssetRepositoryError {
     /// Asset writes must be preceded by a preflight before article locks are held.
     #[error("asset inputs were not preflighted before persistence")]
     PreparationRequired,
+    /// The worker lease no longer authorizes an asset-repair mutation.
+    #[error("asset repair job lease is no longer live")]
+    LeaseLost,
     /// The database operation failed.
     #[error("asset repository storage error: {0}")]
     Storage(String),
+}
+
+/// Result of admitting a public cache-miss repair request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssetRepairEnqueueResult {
+    /// A new durable repair job was admitted.
+    Enqueued { job_id: Uuid },
+    /// An active repair already exists for this stable asset record.
+    AlreadyActive { job_id: Uuid },
+    /// The record is not referenced by an article or does not exist.
+    NotFound,
+    /// Another request restored the bytes before admission completed.
+    AlreadyAvailable,
+    /// The cluster-wide or public repair cap is currently full.
+    CapacityFull,
+    /// A previous failed attempt is still in its backoff window.
+    Backoff,
+    /// The bounded repair-attempt budget is exhausted.
+    Exhausted,
+}
+
+/// Result of restoring bytes into an existing stable asset record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssetRepairRestoreResult {
+    /// The missing record now points at available bytes.
+    Restored,
+    /// The record was already available, so the operation was idempotent.
+    AlreadyAvailable,
+    /// The record is no longer referenced or no longer exists.
+    NotFound,
 }
 
 /// Transaction-scoped asset persistence operations.
@@ -111,6 +153,7 @@ pub trait AssetTransactionRepository {
 pub struct PostgresAssetStore {
     pool: PgPool,
     policy: AssetCachePolicy,
+    repair_policy: AssetRepairPolicy,
 }
 
 impl fmt::Debug for PostgresAssetStore {
@@ -119,6 +162,7 @@ impl fmt::Debug for PostgresAssetStore {
             .debug_struct("PostgresAssetStore")
             .field("pool", &"<postgres pool>")
             .field("policy", &self.policy)
+            .field("repair_policy", &self.repair_policy)
             .finish()
     }
 }
@@ -126,12 +170,27 @@ impl fmt::Debug for PostgresAssetStore {
 impl PostgresAssetStore {
     /// Creates a database-backed asset store.
     pub fn new(pool: PgPool, policy: AssetCachePolicy) -> Self {
-        Self { pool, policy }
+        Self {
+            pool,
+            policy,
+            repair_policy: AssetRepairPolicy::default(),
+        }
+    }
+
+    /// Applies the durable admission policy used for public cache misses.
+    pub const fn with_repair_policy(mut self, repair_policy: AssetRepairPolicy) -> Self {
+        self.repair_policy = repair_policy;
+        self
     }
 
     /// Returns the policy used by this store.
     pub const fn policy(&self) -> AssetCachePolicy {
         self.policy
+    }
+
+    /// Returns the repair admission policy used by this store.
+    pub const fn repair_policy(&self) -> AssetRepairPolicy {
+        self.repair_policy
     }
 
     /// Reads one referenced asset and touches its last-accessed timestamp.
@@ -208,6 +267,261 @@ impl PostgresAssetStore {
         Ok(result)
     }
 
+    /// Returns the upstream request context for a referenced missing asset.
+    pub async fn repair_target(
+        &self,
+        asset_id: Uuid,
+    ) -> Result<Option<AssetRepairTarget>, AssetRepositoryError> {
+        let row = sqlx::query(
+            "SELECT r.source_url, aa.referer_url, aa.origin, aa.user_agent,
+                    ars.next_allowed_at, COALESCE(ars.exhausted, FALSE) AS exhausted
+             FROM asset_records AS r
+             JOIN article_assets AS aa ON aa.asset_record_id = r.id
+             LEFT JOIN asset_blobs AS b ON b.id = r.blob_id
+             LEFT JOIN asset_repair_states AS ars ON ars.asset_record_id = r.id
+             WHERE r.id = $1
+               AND (r.blob_id IS NULL OR b.data IS NULL)
+             ORDER BY aa.source_id, aa.review_id, aa.occurrence
+             LIMIT 1",
+        )
+        .bind(asset_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(storage_error)?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        Ok(Some(AssetRepairTarget {
+            asset_id,
+            source_url: parse_url(
+                &row.try_get::<String, _>("source_url")
+                    .map_err(storage_error)?,
+            )?,
+            referer_url: parse_url(
+                &row.try_get::<String, _>("referer_url")
+                    .map_err(storage_error)?,
+            )?,
+            origin: row.try_get("origin").map_err(storage_error)?,
+            user_agent: row.try_get("user_agent").map_err(storage_error)?,
+            next_allowed_at: row.try_get("next_allowed_at").map_err(storage_error)?,
+            exhausted: row.try_get("exhausted").map_err(storage_error)?,
+        }))
+    }
+
+    /// Admits one public repair job without doing network work in the request.
+    ///
+    /// The admission lock, active-job lookup, capacity check, state update,
+    /// and job insert are one transaction. This makes repeated requests from
+    /// several API replicas converge on one durable job and prevents a burst
+    /// of cache misses from bypassing the cluster cap.
+    pub async fn enqueue_repair(
+        &self,
+        asset_id: Uuid,
+    ) -> Result<AssetRepairEnqueueResult, AssetRepositoryError> {
+        let mut transaction = PostgresJobTransaction::begin(&self.pool)
+            .await
+            .map_err(storage_error)?;
+        let result =
+            enqueue_repair_in_transaction(&mut transaction, self.repair_policy, asset_id).await?;
+        transaction.commit_inner().await.map_err(storage_error)?;
+        Ok(result)
+    }
+
+    /// Restores bytes into the existing asset record, preserving its public ID.
+    pub async fn restore_missing_asset(
+        &self,
+        lease: &JobLease,
+        asset_id: Uuid,
+        input: &AssetInput,
+    ) -> Result<AssetRepairRestoreResult, AssetRepositoryError> {
+        validate_input(input, self.policy)?;
+        let source_url = normalize_url(input.source_url.clone())?;
+        let final_url = normalize_url(input.final_url.clone())?;
+        let checksum = input.checksum().to_owned();
+        let byte_size = input_byte_size(input)?;
+        let mut transaction = self.pool.begin().await.map_err(storage_error)?;
+        lock_asset_capacity(&mut transaction).await?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('asset-url:' || $1, 0))")
+            .bind(source_url.as_str())
+            .execute(&mut *transaction)
+            .await
+            .map_err(storage_error)?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('asset-checksum:' || $1, 0))")
+            .bind(&checksum)
+            .execute(&mut *transaction)
+            .await
+            .map_err(storage_error)?;
+
+        let record = sqlx::query(
+            "SELECT r.source_url, b.data
+             FROM asset_records AS r
+             LEFT JOIN asset_blobs AS b ON b.id = r.blob_id
+             WHERE r.id = $1
+               AND EXISTS (
+                   SELECT 1 FROM article_assets AS aa
+                   WHERE aa.asset_record_id = r.id
+               )
+             FOR UPDATE OF r",
+        )
+        .bind(asset_id)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+        let Some(record) = record else {
+            transaction.commit().await.map_err(storage_error)?;
+            return Ok(AssetRepairRestoreResult::NotFound);
+        };
+        let record_source_url = normalize_url(
+            Url::parse(
+                &record
+                    .try_get::<String, _>("source_url")
+                    .map_err(storage_error)?,
+            )
+            .map_err(|_| AssetRepositoryError::InvalidMetadata)?,
+        )?;
+        if record_source_url != source_url {
+            return Err(AssetRepositoryError::InvalidMetadata);
+        }
+        if record
+            .try_get::<Option<Vec<u8>>, _>("data")
+            .map_err(storage_error)?
+            .is_some()
+        {
+            transaction.commit().await.map_err(storage_error)?;
+            return Ok(AssetRepairRestoreResult::AlreadyAvailable);
+        }
+
+        let candidates = sqlx::query(
+            "SELECT id, media_type, data
+             FROM asset_blobs
+             WHERE checksum = $1 AND byte_size = $2 AND data IS NOT NULL
+             ORDER BY id
+             FOR UPDATE",
+        )
+        .bind(&checksum)
+        .bind(byte_size)
+        .fetch_all(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+        let matching = candidates.iter().find_map(|row| {
+            let data = row.try_get::<Vec<u8>, _>("data").ok()?;
+            if data != input.bytes {
+                return None;
+            }
+            Some((
+                row.try_get::<Uuid, _>("id").ok()?,
+                row.try_get::<String, _>("media_type").ok()?,
+            ))
+        });
+        let (blob_id, media_type) = if let Some(matching) = matching {
+            matching
+        } else {
+            insert_blob(
+                &mut transaction,
+                input,
+                &checksum,
+                byte_size,
+                self.policy,
+                &[],
+            )
+            .await?
+        };
+        // Hold the job row lock through commit so lease recovery cannot grant
+        // the same job to another worker while this mutation is being fenced.
+        lock_live_repair_lease(&mut transaction, lease).await?;
+        sqlx::query(
+            "UPDATE asset_records
+             SET final_url = $2, blob_id = $3, fetch_status = 'available',
+                 last_error = NULL, updated_at = clock_timestamp()
+             WHERE id = $1",
+        )
+        .bind(asset_id)
+        .bind(final_url.as_str())
+        .bind(blob_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+        sqlx::query(
+            "UPDATE asset_blobs
+             SET last_fetched_at = clock_timestamp(), last_accessed_at = clock_timestamp()
+             WHERE id = $1",
+        )
+        .bind(blob_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+        transaction.commit().await.map_err(storage_error)?;
+        let _ = media_type;
+        Ok(AssetRepairRestoreResult::Restored)
+    }
+
+    /// Records a failed admitted repair and opens a bounded backoff window.
+    /// Returns whether the per-record repair circuit is exhausted.
+    pub async fn record_repair_failure(
+        &self,
+        lease: &JobLease,
+        asset_id: Uuid,
+        error: &str,
+    ) -> Result<bool, AssetRepositoryError> {
+        let seconds = i64::try_from(self.repair_policy.requeue_after().as_secs())
+            .map_err(|_| AssetRepositoryError::Storage("repair delay is too large".to_owned()))?;
+        let safe_error: String = error.chars().take(512).collect();
+        let mut transaction = self.pool.begin().await.map_err(storage_error)?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('asset-repair-admission', 0))")
+            .execute(&mut *transaction)
+            .await
+            .map_err(storage_error)?;
+        // Keep repair-state mutations in the same lock order as admission:
+        // admission lock first, then the fenced job row.
+        lock_live_repair_lease(&mut transaction, lease).await?;
+        let exhausted = sqlx::query_scalar::<_, bool>(
+            "UPDATE asset_repair_states
+             SET next_allowed_at = clock_timestamp()
+                     + make_interval(secs => $2::double precision),
+                 exhausted = admitted_attempts >= $3,
+                 last_error = $4,
+                 updated_at = clock_timestamp()
+             WHERE asset_record_id = $1
+             RETURNING exhausted",
+        )
+        .bind(asset_id)
+        .bind(seconds)
+        .bind(i64::from(self.repair_policy.max_attempts()))
+        .bind(safe_error)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(storage_error)?
+        .unwrap_or(false);
+        transaction.commit().await.map_err(storage_error)?;
+        Ok(exhausted)
+    }
+
+    /// Clears the repair circuit after a successful or idempotent restore.
+    pub async fn complete_repair(
+        &self,
+        lease: &JobLease,
+        asset_id: Uuid,
+    ) -> Result<(), AssetRepositoryError> {
+        let mut transaction = self.pool.begin().await.map_err(storage_error)?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('asset-repair-admission', 0))")
+            .execute(&mut *transaction)
+            .await
+            .map_err(storage_error)?;
+        lock_live_repair_lease(&mut transaction, lease).await?;
+        sqlx::query(
+            "UPDATE asset_repair_states
+             SET admitted_attempts = 0, next_allowed_at = NULL,
+                 exhausted = FALSE, last_error = NULL, updated_at = clock_timestamp()
+             WHERE asset_record_id = $1",
+        )
+        .bind(asset_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+        transaction.commit().await.map_err(storage_error)?;
+        Ok(())
+    }
+
     /// Evicts stale/old binary data and removes rows without article
     /// relationships. This operation never deletes a referenced URL record.
     pub async fn maintenance(&self) -> Result<AssetMaintenanceResult, AssetRepositoryError> {
@@ -262,6 +576,13 @@ impl PostgresAssetStore {
              WHERE NOT EXISTS (
                  SELECT 1 FROM article_assets AS aa
                  WHERE aa.asset_record_id = r.id
+             )
+             AND NOT EXISTS (
+                 SELECT 1
+                 FROM asset_repair_jobs AS arj
+                 JOIN jobs AS j ON j.id = arj.job_id
+                 WHERE arj.asset_record_id = r.id
+                   AND j.status IN ('queued', 'running', 'retry_wait', 'deferred')
              )",
         )
         .execute(&mut *transaction)
@@ -291,6 +612,181 @@ impl PostgresAssetStore {
     }
 }
 
+async fn enqueue_repair_in_transaction(
+    job_transaction: &mut PostgresJobTransaction<'_>,
+    policy: AssetRepairPolicy,
+    asset_id: Uuid,
+) -> Result<AssetRepairEnqueueResult, AssetRepositoryError> {
+    let sql_transaction = job_transaction
+        .transaction_mut()
+        .map_err(job_transaction_error)?;
+    // Coordinate admission with maintenance's orphan deletion. Capacity is
+    // the first lock in the asset write order; without it, maintenance can
+    // snapshot this record as an orphan, wait for its row lock, and delete it
+    // after the repair job commits.
+    lock_asset_capacity(sql_transaction).await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('asset-repair-admission', 0))")
+        .execute(&mut **sql_transaction)
+        .await
+        .map_err(storage_error)?;
+
+    let target = sqlx::query(
+        "SELECT r.blob_id, b.data
+         FROM asset_records AS r
+         LEFT JOIN asset_blobs AS b ON b.id = r.blob_id
+         WHERE r.id = $1
+           AND EXISTS (
+               SELECT 1 FROM article_assets AS aa
+               WHERE aa.asset_record_id = r.id
+           )
+         FOR UPDATE OF r",
+    )
+    .bind(asset_id)
+    .fetch_optional(&mut **sql_transaction)
+    .await
+    .map_err(storage_error)?;
+    let Some(target) = target else {
+        return Ok(AssetRepairEnqueueResult::NotFound);
+    };
+    if target
+        .try_get::<Option<Vec<u8>>, _>("data")
+        .map_err(storage_error)?
+        .is_some()
+    {
+        return Ok(AssetRepairEnqueueResult::AlreadyAvailable);
+    }
+
+    let active = sqlx::query(
+        "SELECT j.id
+         FROM asset_repair_jobs AS arj
+         JOIN jobs AS j ON j.id = arj.job_id
+         WHERE arj.asset_record_id = $1
+           AND j.status IN ('queued', 'running', 'retry_wait', 'deferred')
+         ORDER BY j.created_at ASC
+         LIMIT 1",
+    )
+    .bind(asset_id)
+    .fetch_optional(&mut **sql_transaction)
+    .await
+    .map_err(storage_error)?;
+    if let Some(active) = active {
+        return Ok(AssetRepairEnqueueResult::AlreadyActive {
+            job_id: active.try_get("id").map_err(storage_error)?,
+        });
+    }
+
+    let state = sqlx::query(
+        "SELECT admitted_attempts, next_allowed_at, exhausted
+         FROM asset_repair_states
+         WHERE asset_record_id = $1
+         FOR UPDATE",
+    )
+    .bind(asset_id)
+    .fetch_optional(&mut **sql_transaction)
+    .await
+    .map_err(storage_error)?;
+    if let Some(state) = &state {
+        let exhausted: bool = state.try_get("exhausted").map_err(storage_error)?;
+        if exhausted {
+            return Ok(AssetRepairEnqueueResult::Exhausted);
+        }
+        let next_allowed_at = state
+            .try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("next_allowed_at")
+            .map_err(storage_error)?;
+        let db_now: chrono::DateTime<chrono::Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
+            .fetch_one(&mut **sql_transaction)
+            .await
+            .map_err(storage_error)?;
+        if next_allowed_at.is_some_and(|next| next > db_now) {
+            return Ok(AssetRepairEnqueueResult::Backoff);
+        }
+        let admitted_attempts: i64 = state.try_get("admitted_attempts").map_err(storage_error)?;
+        if admitted_attempts >= i64::from(policy.max_attempts()) {
+            return Ok(AssetRepairEnqueueResult::Exhausted);
+        }
+    }
+
+    let global_pending: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::bigint
+         FROM asset_repair_jobs AS arj
+         JOIN jobs AS j ON j.id = arj.job_id
+         WHERE j.status IN ('queued', 'running', 'retry_wait', 'deferred')",
+    )
+    .fetch_one(&mut **sql_transaction)
+    .await
+    .map_err(storage_error)?;
+    let public_pending: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::bigint
+         FROM asset_repair_jobs AS arj
+         JOIN jobs AS j ON j.id = arj.job_id
+         WHERE arj.admission_class = 'public_repair'
+           AND j.status IN ('queued', 'running', 'retry_wait', 'deferred')",
+    )
+    .fetch_one(&mut **sql_transaction)
+    .await
+    .map_err(storage_error)?;
+    if global_pending >= i64::from(policy.max_pending())
+        || public_pending >= i64::from(policy.public_max_pending())
+    {
+        return Ok(AssetRepairEnqueueResult::CapacityFull);
+    }
+
+    let now = Utc::now();
+    let job_id = match job_transaction
+        .enqueue_internal(
+            NewJob {
+                job_type: JobType::AssetRepair,
+                source_id: None,
+                priority: 0,
+                run_after: now,
+                max_attempts: REPAIR_JOB_MAX_ATTEMPTS,
+                payload: json!({ "asset_id": asset_id }),
+                dedupe_key: format!("asset-repair:{asset_id}"),
+                now,
+            },
+            true,
+        )
+        .await
+        .map_err(job_transaction_error)?
+    {
+        crate::persistence::repositories::job_repository::EnqueueResult::Inserted(job) => job.id(),
+        crate::persistence::repositories::job_repository::EnqueueResult::AlreadyActive {
+            job_id,
+        } => {
+            return Ok(AssetRepairEnqueueResult::AlreadyActive { job_id });
+        }
+    };
+
+    let sql_transaction = job_transaction
+        .transaction_mut()
+        .map_err(job_transaction_error)?;
+    sqlx::query(
+        "INSERT INTO asset_repair_states
+                (asset_record_id, admitted_attempts, next_allowed_at, exhausted, last_error)
+         VALUES ($1, 1, NULL, FALSE, NULL)
+         ON CONFLICT (asset_record_id) DO UPDATE
+         SET admitted_attempts = asset_repair_states.admitted_attempts + 1,
+             next_allowed_at = NULL,
+             exhausted = FALSE,
+             last_error = NULL,
+             updated_at = clock_timestamp()",
+    )
+    .bind(asset_id)
+    .execute(&mut **sql_transaction)
+    .await
+    .map_err(storage_error)?;
+    sqlx::query(
+        "INSERT INTO asset_repair_jobs (job_id, asset_record_id, admission_class)
+         VALUES ($1, $2, 'public_repair')",
+    )
+    .bind(job_id)
+    .bind(asset_id)
+    .execute(&mut **sql_transaction)
+    .await
+    .map_err(storage_error)?;
+    Ok(AssetRepairEnqueueResult::Enqueued { job_id })
+}
+
 /// Raw-byte deduplication results collected before source/article persistence
 /// locks are acquired.
 #[derive(Debug, Clone, Default)]
@@ -312,13 +808,22 @@ impl AssetBatchPreparation {
     }
 }
 
-/// Acquires the checksum locks and compares candidate raw bytes before the
-/// caller begins source/article row locking. The returned IDs are only hints;
-/// the write path verifies that the selected immutable blob still has data.
+/// Acquires the aggregate-capacity lock, then checksum locks, and compares
+/// candidate raw bytes before the caller begins source/article row locking.
+/// The returned IDs are only hints; the write path verifies that the selected
+/// immutable blob still has data.
 pub(crate) async fn prepare_asset_batch(
     transaction: &mut Transaction<'_, Postgres>,
     inputs: &[AssetInput],
 ) -> Result<AssetBatchPreparation, AssetRepositoryError> {
+    // `store_for_article` acquires the same lock before taking URL locks. Do
+    // the preflight in that order too, otherwise a source-sync transaction
+    // can hold a checksum lock while waiting for capacity and deadlock with
+    // repair or maintenance holding capacity while waiting for the checksum.
+    if !inputs.is_empty() {
+        lock_asset_capacity(transaction).await?;
+    }
+
     let checksums = inputs
         .iter()
         .map(|input| input.checksum().to_owned())
@@ -499,9 +1004,13 @@ impl AssetTransactionRepository for PostgresAssetTransaction<'_, '_> {
         let policy = self.policy;
         let preparation = self.preparation.clone();
         let transaction = self.transaction()?;
-        // Relationship replacement and the subsequent asset writes must use
-        // the same capacity-first lock order as maintenance.
-        lock_asset_capacity(transaction).await?;
+        // Non-empty replacements retain the capacity-first lock order used by
+        // maintenance. An empty replacement only changes article relationships;
+        // do not acquire capacity after source/article row locks because
+        // begin_with_assets(&[]) intentionally does not reserve that lock.
+        if !inputs.is_empty() {
+            lock_asset_capacity(transaction).await?;
+        }
         let mut savepoint = transaction.begin().await.map_err(storage_error)?;
         let result = async {
             sqlx::query(
@@ -974,6 +1483,37 @@ async fn lock_asset_capacity(
         .await
         .map_err(storage_error)?;
     Ok(())
+}
+
+/// Locks and verifies the current lease before an asset-repair mutation.
+///
+/// The row lock is held until the surrounding transaction commits. This makes
+/// lease recovery wait for a fenced mutation instead of allowing an expired
+/// worker to commit after a replacement worker has been granted the job.
+async fn lock_live_repair_lease(
+    transaction: &mut Transaction<'_, Postgres>,
+    lease: &JobLease,
+) -> Result<(), AssetRepositoryError> {
+    let Some(owner) = lease.job.lease_owner() else {
+        return Err(AssetRepositoryError::LeaseLost);
+    };
+    let live_job = sqlx::query_scalar::<_, Uuid>(
+        "SELECT id
+         FROM jobs
+         WHERE id = $1
+           AND status = 'running'
+           AND lease_owner = $2
+           AND lease_token = $3
+           AND lease_until > clock_timestamp()
+         FOR UPDATE",
+    )
+    .bind(lease.job.id())
+    .bind(owner)
+    .bind(lease.token.as_uuid())
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(storage_error)?;
+    live_job.map(|_| ()).ok_or(AssetRepositoryError::LeaseLost)
 }
 
 fn validate_article_identity(

@@ -108,7 +108,24 @@ impl AssetArchiveService {
         referer: &VerifiedWechatArticleUrl,
         urls: &[Url],
     ) -> Vec<AssetInput> {
-        let origin = origin_for(referer.as_str());
+        self.fetch_assets_with_context(referer, urls, None, None)
+            .await
+    }
+
+    /// Fetches assets using request context captured with the article
+    /// relationship. The optional values are used by repair jobs; initial
+    /// acquisition derives the origin and uses the configured browser profile.
+    pub async fn fetch_assets_with_context(
+        &self,
+        referer: &VerifiedWechatArticleUrl,
+        urls: &[Url],
+        captured_origin: Option<&str>,
+        captured_user_agent: Option<&str>,
+    ) -> Vec<AssetInput> {
+        let origin = captured_origin
+            .map(str::to_owned)
+            .or_else(|| origin_for(referer.as_str()));
+        let user_agent = captured_user_agent.or(self.user_agent.as_deref());
         let started = Instant::now();
         let mut fetched_bytes = 0_u64;
         let mut fetched = Vec::new();
@@ -156,7 +173,7 @@ impl AssetArchiveService {
             if let Some(origin) = origin.as_deref() {
                 request = request.header(header::ORIGIN, origin);
             }
-            if let Some(user_agent) = &self.user_agent {
+            if let Some(user_agent) = user_agent {
                 request = request.header(header::USER_AGENT, user_agent);
             }
             let response = match timeout(remaining_time, request.send()).await {
