@@ -236,7 +236,10 @@ cookies are never sent to asset hosts. Feed delivery detects an existing cache
 with the wrong asset URL form and rebuilds it before serving. Missing cached
 bytes enqueue a deduplicated anonymous repair job and retain the same asset URL
 while the worker restores the data.
-Local-directory and S3 backends remain future work.
+Local-directory and S3-compatible backends remain future work and will use a
+shared `AssetBlobStore` boundary backed by Apache OpenDAL. PostgreSQL will
+continue to own asset metadata, relationships, deduplication, leases, repair
+jobs, and eviction state.
 
 | Variable | Default | Explanation |
 | --- | --- | --- |
@@ -311,10 +314,20 @@ included in the current runtime. The responsive administrator UI polish and the
 English, French, and Simplified Chinese panel translations are also included in
 the current panel. The remaining roadmap items are future work:
 
-1. **Add local-directory and S3-compatible asset backends.** These can make
-   binary storage easier to operate at larger scale while preserving the
-   database metadata and stable asset IDs.
-2. **Evaluate PGMQ as a queue transport optimization.** The current custom
+1. **Add `AssetBlobStore` and adapt the existing database implementation.**
+   Keep the application-facing storage contract independent of OpenDAL while
+   preserving PostgreSQL metadata, relationships, deduplication, and stable
+   asset IDs.
+2. **Add the OpenDAL filesystem backend.** Store immutable asset objects in a
+   configured local directory while retaining the existing `/assets/{id}`
+   route and repair behavior.
+3. **Add the OpenDAL S3-compatible backend.** Support configurable buckets,
+   endpoints, regions, and secret-backed credentials without exposing provider
+   URLs in feeds.
+4. **Add GCS, Azure, OSS, FTP, SFTP, and WebDAV only after the common contract
+   is stable.** Each backend must pass the shared contract and provider-
+   appropriate integration tests before its configuration is accepted.
+5. **Evaluate PGMQ as a queue transport optimization.** The current custom
    `jobs` table remains the version-one transport; PGMQ can be evaluated later
    if queue throughput or operational overhead becomes a demonstrated
    bottleneck.

@@ -28,12 +28,97 @@ unavailable, or later replaced. It has four separate responsibilities:
 
 The first enabled storage implementation is PostgreSQL. The storage interface
 must remain independent of PostgreSQL so a local-directory or S3-compatible
-backend can be added later, but neither of those backends is part of the first
-asset-cache implementation.
+backend can be added without changing asset-domain behavior. Apache OpenDAL
+will provide the infrastructure adapter for those object backends; it must not
+become the domain or transaction abstraction.
 
 Asset caching is best effort. An article remains persistable when one or more
 asset downloads fail. The article can retain its external URL until an asset
 is successfully stored and its feed representation is rebuilt.
+
+## Storage abstraction and OpenDAL boundary
+
+The application exposes a narrow binary-storage port. It describes the
+operations needed by the asset repository and deliberately does not expose an
+OpenDAL `Operator` or provider-specific options to domain code:
+
+```rust
+#[async_trait]
+pub trait AssetBlobStore: Send + Sync {
+    async fn put(
+        &self,
+        key: &str,
+        bytes: Bytes,
+        media_type: Option<&str>,
+    ) -> Result<(), BlobStoreError>;
+
+    async fn read(&self, key: &str) -> Result<Option<Bytes>, BlobStoreError>;
+    async fn delete(&self, key: &str) -> Result<(), BlobStoreError>;
+    async fn stat(&self, key: &str) -> Result<Option<u64>, BlobStoreError>;
+}
+```
+
+The trait uses `#[async_trait]` to match the repository's async boundary. The
+`put` operation is idempotent rather than requiring every backend to provide an
+atomic `put-if-absent`: keys identify one allocated blob and are never reused
+for a different byte sequence, so repeated writes of the same validated bytes
+are safe. A backend must either verify an existing object's bytes before
+accepting a repeated write or report a conflict. `delete` must be retryable
+and `read`/`stat` must distinguish a missing object from a backend failure.
+
+The implementations are adapters only:
+
+- `DatabaseBlobStore` keeps the current PostgreSQL binary behavior;
+- `OpenDalFsBlobStore` uses OpenDAL's filesystem service for a local directory;
+- `OpenDalS3BlobStore` uses OpenDAL's S3 service for S3-compatible providers;
+- later adapters may use OpenDAL's GCS, Azure Blob, OSS, FTP, SFTP, WebDAV, or
+  PostgreSQL services after the common contract is stable.
+
+OpenDAL service features should be enabled selectively. The initial OpenDAL
+integration must enable only filesystem and S3 support rather than compiling
+every service into the application. The async OpenDAL operator is required in
+this Tokio application; its blocking wrapper must not be called from async
+request or worker paths.
+
+OpenDAL simplifies object I/O, but it does not replace PostgreSQL's relational
+responsibilities. PostgreSQL remains authoritative for asset IDs, source URL
+versions, checksums, byte sizes, media types, article relationships, access
+timestamps, eviction state, repair jobs, and leases. OpenDAL's PostgreSQL
+service is an object-like key/value backend and is not a replacement for the
+application's SQLx schema or transaction boundaries.
+
+### Object keys and metadata
+
+External backends use generated immutable per-blob keys such as
+`blobs/{blob_id}`. A source URL or checksum alone must never become an object
+path: the checksum is only a candidate-deduplication index, and two different
+raw byte sequences must be able to receive different keys even if they share a
+checksum and size. The database retains the stable opaque asset ID and the
+`storage_key`; provider metadata is not used as the source of truth for media
+type, checksum, or accounting. The stable `/assets/{id}` route continues to
+proxy through the application so access timestamps, repair admission, and
+public URL behavior remain unchanged.
+
+### Planned backend configuration
+
+The existing `disabled` and `database` modes remain unchanged and
+`disabled` remains the default. Once implemented, `local` and `s3` will be
+explicit backend values rather than a generic provider string:
+
+| Variable | Meaning |
+| --- | --- |
+| `ASSET_ARCHIVE_BACKEND` | `disabled`, `database`, `local`, or `s3`; `postgres` remains an alias for `database`. |
+| `ASSET_LOCAL_ROOT` | Root directory for the local OpenDAL filesystem backend. |
+| `ASSET_S3_BUCKET` | Bucket used by the S3-compatible backend. |
+| `ASSET_S3_ENDPOINT` | Optional provider endpoint, including MinIO or another S3-compatible service. |
+| `ASSET_S3_REGION` | S3 signing region. |
+| `ASSET_S3_ACCESS_KEY_ID` | Secret-backed S3 access key. |
+| `ASSET_S3_SECRET_ACCESS_KEY` | Secret-backed S3 secret key. |
+
+Credentials must be loaded as secrets and must never be logged. Provider
+specific settings for GCS, Azure Blob, OSS, FTP, SFTP, and WebDAV should be
+added only when those services are implemented and tested; they should not be
+accepted as silently ignored configuration in earlier releases.
 
 ## Configuration contract
 
@@ -153,7 +238,11 @@ records and articles.
 - `checksum_algorithm` and `checksum`: currently SHA-256 and its digest;
 - `byte_size`: exact raw response length;
 - `media_type`: validated media type used when serving;
-- `data`: PostgreSQL binary data, nullable after eviction;
+- `data`: PostgreSQL binary data for the database backend, nullable after
+  eviction or when an external backend is selected;
+- `storage_key`: immutable backend key for external storage, or the internal
+  key used by the database adapter;
+- `storage_state`: whether the binary is present, missing, or pending cleanup;
 - `created_at`, `last_fetched_at`, and `last_accessed_at`.
 
 The blob ID must not be only the checksum. A checksum match is a candidate for
@@ -495,17 +584,61 @@ HTML and JavaScript content.
 ## Transaction and recovery rules
 
 Network fetches and hashing happen before the final persistence transaction.
-The unit-of-work asset preflight performs raw-byte comparisons at the start of
-that transaction, before source/article row locks are acquired, while holding
-only ordered checksum advisory locks. The final transaction then atomically
-records the blob candidate, URL/version record, article relationship, rewritten
-HTML, and any feed revision invalidation without loading large candidate bodies
-after those row locks are held.
+The asset preflight uses ordered checksum coordination locks before making an
+authoritative deduplication decision. For the database backend, raw-byte
+comparisons happen inside the short transaction. For an external backend, the
+candidate object is read and compared while a dedicated coordination lock is
+held, then that lock remains held until the metadata transaction commits. No
+external network operation may run while source, article, or feed row locks are
+held. The final transaction rechecks the locked decision and atomically records
+the blob candidate, URL/version record, article relationship, rewritten HTML,
+and any feed revision invalidation.
 
 Blob writes and asset attachment are independently retryable. A worker crash
 can leave an unreferenced blob or a missing-data URL record, but cannot leave a
 partially attached article relationship. Leases must expire and be recoverable
 without deleting referenced data.
+
+For an external OpenDAL backend, the write and database commit are not one
+distributed transaction. The workflow is therefore:
+
+1. Fetch, validate, and hash the bytes before opening the final persistence
+   transaction.
+2. Acquire the ordered checksum coordination lock. Under that lock, look up
+   checksum/size candidates and compare raw bytes using the database adapter or
+   `AssetBlobStore::read`. Reuse the existing blob only after the raw bytes
+   match; otherwise allocate a new opaque `blob_id` and per-blob key.
+3. For a new blob, write the immutable object through `AssetBlobStore`. The
+   write is safe to repeat when a worker retries the same per-blob key. Keep
+   the coordination lock while the object write and final metadata transaction
+   complete.
+4. In a short PostgreSQL transaction, recheck the locked decision, insert or
+   reuse the blob metadata, attach the asset record to the article, and publish
+   the rewritten article/feed state. Release the coordination lock only after
+   this transaction commits.
+5. If the PostgreSQL transaction fails, leave the unreferenced object for
+   orphan cleanup. Do not rely on a compensating delete, which can race with a
+   successful concurrent reference or fail independently.
+
+External eviction uses a durable intent so a crash cannot lose the deletion
+state:
+
+Eviction and serving use the same per-blob lease. A `pending_cleanup` state is
+not a permission to delete concurrently with a read: a reader either finishes
+before the lease is acquired or waits for cleanup. If cleanup cannot delete the
+object, the next reader may restore `present` and refresh `last_accessed_at`
+under the same lease.
+
+1. A short PostgreSQL transaction acquires the per-blob lease, marks the blob
+   `pending_cleanup`, and records an eviction lease/version.
+2. Maintenance deletes the external object idempotently while holding that
+   lease. A delete failure leaves the intent pending for retry.
+3. A short PostgreSQL transaction marks the blob `missing` only after the
+   delete succeeds or a backend `stat` confirms that it is already absent.
+4. A later maintenance pass recovers an expired cleanup lease, reconciles the
+   object with `stat`, and retries or finalizes the intent. A referenced asset
+   record and its URL metadata are retained throughout; only orphan cleanup
+   may delete the metadata entry itself.
 
 PostgreSQL `bytea` storage increases WAL, backup, TOAST, vacuum, and
 replication load. Asset download concurrency must be bounded independently of
@@ -551,6 +684,21 @@ PostgreSQL integration tests should cover:
 - repair concurrency, public pending, per-asset requeue, and per-asset attempt
   limits;
 - a repair worker performing an anonymous fetch with the expected headers;
+- the `AssetBlobStore` contract for write, read, missing object, stat, delete,
+  repeated immutable writes, and backend failures;
+- a local OpenDAL filesystem backend using a temporary directory;
+- an S3-compatible OpenDAL backend against an optional local S3-compatible
+  service such as MinIO, without requiring cloud credentials in normal CI;
+- an external object write followed by a failed PostgreSQL commit leaving an
+  orphan eligible for cleanup;
+- concurrent external additions with equal checksums but different raw bytes
+  never overwriting or attaching the wrong object;
+- eviction deleting external bytes while retaining the asset metadata and
+  article relationship;
+- cleanup recovery after a crash before deletion and after deletion but before
+  the `missing` state commit;
+- a read racing with eviction either completes before deletion or prevents
+  eviction by refreshing the access time;
 - a permanent `404`/`410` producing one terminal response and no later repair
   jobs until a new asset observation from normal article acquisition clears the
   state, while re-persisting the same failed article does not;
