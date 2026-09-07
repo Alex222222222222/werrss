@@ -204,15 +204,21 @@ The detailed, implementation-neutral contract is in
 default. With the `database` backend, the worker fetches approved article
 images using a separate anonymous HTTP request with the article `Referer`,
 derived `Origin`, and configured User-Agent, validates the media type and
-signature, stores/deduplicates the bytes in PostgreSQL, and rewrites the
-article HTML to stable `/assets/{id}` paths. WeChat/WeRead cookies are never
-sent to asset hosts. Missing cached bytes enqueue a deduplicated anonymous
-repair job and retain the same asset URL while the worker restores the data.
+signature, stores/deduplicates the bytes in PostgreSQL, and rewrites stored
+article HTML to stable `/assets/{id}` paths. Generated feeds emit those links
+as full URLs rooted at `SERVER_ROOT_URL` by default, which prevents RSS clients
+from resolving them against the original WeChat article link. Set
+`ASSET_USE_ABSOLUTE_URLS=false` to retain relative asset links. WeChat/WeRead
+cookies are never sent to asset hosts. Feed delivery detects an existing cache
+with the wrong asset URL form and rebuilds it before serving. Missing cached
+bytes enqueue a deduplicated anonymous repair job and retain the same asset URL
+while the worker restores the data.
 Local-directory and S3 backends remain future work.
 
 | Variable | Default | Explanation |
 | --- | --- | --- |
 | `ASSET_ARCHIVE_BACKEND` | `disabled` | `disabled` keeps approved external URLs. `database` (or `postgres`) stores bytes and URL/version metadata in PostgreSQL. `local` and `s3` are not implemented and are rejected. |
+| `ASSET_USE_ABSOLUTE_URLS` | `true` | When database asset caching is enabled, emits cached image links as full URLs rooted at `SERVER_ROOT_URL` in generated feeds. Set to `false` to keep `/assets/{id}` links relative; the default requires `SERVER_ROOT_URL`. |
 | `ASSET_CACHE_MAX_SIZE_MB` | `5000` | Aggregate limit for cached raw binary bytes, in decimal megabytes. `0` disables size-based eviction. |
 | `ASSET_CACHE_MAX_AGE_DAYS` | `30` | Maximum idle age since the last successful asset read before bytes are evicted. `0` disables age-based eviction. |
 | `ASSET_MAX_SIZE_MB` | `10` | Maximum size of one downloaded asset, in decimal megabytes. It is always enforced. |

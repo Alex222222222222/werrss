@@ -54,7 +54,8 @@
 //!
 //! The database-only rebuild orchestration lives in
 //! [`super::feed_rebuild_service::FeedRebuildService`]. It is intentionally
-//! invoked only for cache misses/expiry, so fresh requests remain a fast read.
+//! invoked only for cache misses, expiry, or a persisted cache whose asset URL
+//! format no longer matches the configured public feed format.
 
 use std::{fmt, time::Duration as StdDuration};
 
@@ -62,9 +63,14 @@ use chrono::{Duration, Utc};
 use serde_json::json;
 use thiserror::Error;
 use tokio::time::{sleep, Instant};
+use url::Url;
 
 use crate::{
     application::feed_rebuild_service::{FeedRebuildOutcome, FeedRebuilder},
+    archive::url_rewriter::{
+        contains_absolute_asset_urls_outside_root, contains_any_absolute_asset_urls,
+        contains_relative_asset_urls,
+    },
     domain::{
         feed::{FeedCache, FeedCacheRead},
         job::{JobType, NewJob},
@@ -156,6 +162,33 @@ pub enum FeedDelivery {
 pub struct FeedServiceConfig {
     stale_while_revalidate: Duration,
     cache_miss_retry_after: Duration,
+}
+
+/// Describes the asset URL format required in delivered feed documents.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FeedAssetUrlPolicy {
+    server_root_url: Url,
+    use_absolute_urls: bool,
+}
+
+impl FeedAssetUrlPolicy {
+    /// Creates a policy for the configured public root and URL mode.
+    pub fn new(server_root_url: Url, use_absolute_urls: bool) -> Self {
+        Self {
+            server_root_url,
+            use_absolute_urls,
+        }
+    }
+
+    fn is_compatible(&self, xml_bytes: &[u8]) -> bool {
+        let xml = String::from_utf8_lossy(xml_bytes);
+        if self.use_absolute_urls {
+            !contains_relative_asset_urls(&xml)
+                && !contains_absolute_asset_urls_outside_root(&xml, &self.server_root_url)
+        } else {
+            !contains_any_absolute_asset_urls(&xml)
+        }
+    }
 }
 
 impl FeedServiceConfig {
@@ -356,6 +389,7 @@ pub struct FeedService<C, Q, B> {
     rebuild_queue: Q,
     rebuilder: B,
     config: FeedServiceConfig,
+    asset_url_policy: Option<FeedAssetUrlPolicy>,
 }
 
 impl<C, Q, B> FeedService<C, Q, B>
@@ -372,7 +406,14 @@ where
             rebuild_queue,
             rebuilder,
             config,
+            asset_url_policy: None,
         }
+    }
+
+    /// Configures the asset URL format that persisted feeds must contain.
+    pub fn with_asset_url_policy(mut self, policy: Option<FeedAssetUrlPolicy>) -> Self {
+        self.asset_url_policy = policy;
+        self
     }
 
     /// Returns fresh feed bytes, rebuilding a missing or expired cache first.
@@ -381,15 +422,24 @@ where
         validate_source_id(request.source_id)?;
         let read = self.read_cache(request.source_id).await?;
         match read {
-            Some(read) if read.is_fresh() => Ok(cached_delivery(
-                &request,
-                read.cache().clone(),
-                FeedCacheStatus::Fresh,
-                FeedRebuildStatus::NotNeeded,
-            )),
+            Some(read) if read.is_fresh() && self.cache_is_compatible(read.cache()) => {
+                Ok(cached_delivery(
+                    &request,
+                    read.cache().clone(),
+                    FeedCacheStatus::Fresh,
+                    FeedRebuildStatus::NotNeeded,
+                ))
+            }
             Some(read) => {
-                tracing::debug!("feed cache is expired; rebuilding before delivery");
-                self.rebuild_and_deliver(request, Some(read.cache().clone()))
+                let compatible = self.cache_is_compatible(read.cache());
+                if compatible {
+                    tracing::debug!("feed cache is expired; rebuilding before delivery");
+                } else {
+                    tracing::debug!(
+                        "feed cache asset URL format is incompatible; rebuilding before delivery"
+                    );
+                }
+                self.rebuild_and_deliver(request, compatible.then(|| read.cache().clone()))
                     .await
             }
             None => {
@@ -493,7 +543,10 @@ where
         let deadline = Instant::now() + wait_for;
         loop {
             let read = self.read_cache(source_id).await?;
-            if read.as_ref().is_some_and(|read| read.is_fresh()) {
+            if read
+                .as_ref()
+                .is_some_and(|read| read.is_fresh() && self.cache_is_compatible(read.cache()))
+            {
                 return Ok(read);
             }
 
@@ -519,6 +572,12 @@ where
                 FeedRebuildStatus::Unavailable
             }
         }
+    }
+
+    fn cache_is_compatible(&self, cache: &FeedCache) -> bool {
+        self.asset_url_policy
+            .as_ref()
+            .is_none_or(|policy| policy.is_compatible(cache.xml_bytes()))
     }
 }
 
@@ -578,6 +637,7 @@ mod tests {
 
     use chrono::{DateTime, TimeZone};
     use tokio::sync::Mutex;
+    use url::Url;
     use uuid::Uuid;
 
     use super::*;
@@ -800,6 +860,203 @@ mod tests {
         ));
         assert_eq!(queue.request_count().await, 0);
         assert_eq!(rebuilder.call_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn fresh_relative_cache_is_rebuilt_for_absolute_asset_urls() {
+        let queue = TestQueue::successful(FeedRebuildEnqueueResult::Enqueued);
+        let cache = TestCache::hit(cache_read_with_xml(
+            true,
+            b"<img src=\"/assets/bd264535-3e4f-4da5-be01-73f3dcc98625\" />",
+        ));
+        let rebuilder = TestRebuilder::publishing(
+            &cache,
+            cache_read_with_xml(
+                true,
+                b"<img src=\"https://rss.example.test/werrss/assets/bd264535-3e4f-4da5-be01-73f3dcc98625\" />",
+            ),
+        );
+        let service = FeedService::new(
+            cache,
+            queue,
+            rebuilder.clone(),
+            FeedServiceConfig::default(),
+        )
+        .with_asset_url_policy(Some(FeedAssetUrlPolicy::new(
+            Url::parse("https://rss.example.test/werrss").unwrap(),
+            true,
+        )));
+
+        let delivery = service
+            .get_feed(FeedRequest::new(source_id(), None))
+            .await
+            .expect("incompatible fresh cache should be rebuilt");
+
+        assert!(matches!(
+            delivery,
+            FeedDelivery::Cached {
+                cache,
+                status: FeedCacheStatus::Fresh,
+                rebuild: FeedRebuildStatus::Rebuilt,
+            } if String::from_utf8_lossy(cache.xml_bytes()).contains("https://rss.example.test/werrss/assets/")
+        ));
+        assert_eq!(rebuilder.call_count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn fresh_absolute_cache_is_rebuilt_for_relative_asset_urls() {
+        let queue = TestQueue::successful(FeedRebuildEnqueueResult::Enqueued);
+        let cache = TestCache::hit(cache_read_with_xml(
+            true,
+            b"<img src=\"https://rss.example.test/werrss/assets/bd264535-3e4f-4da5-be01-73f3dcc98625\" />",
+        ));
+        let rebuilder = TestRebuilder::publishing(
+            &cache,
+            cache_read_with_xml(
+                true,
+                b"<img src=\"/assets/bd264535-3e4f-4da5-be01-73f3dcc98625\" />",
+            ),
+        );
+        let service = FeedService::new(
+            cache,
+            queue,
+            rebuilder.clone(),
+            FeedServiceConfig::default(),
+        )
+        .with_asset_url_policy(Some(FeedAssetUrlPolicy::new(
+            Url::parse("https://rss.example.test/werrss").unwrap(),
+            false,
+        )));
+
+        let delivery = service
+            .get_feed(FeedRequest::new(source_id(), None))
+            .await
+            .expect("incompatible fresh cache should be rebuilt");
+
+        assert!(matches!(
+            delivery,
+            FeedDelivery::Cached {
+                cache,
+                status: FeedCacheStatus::Fresh,
+                rebuild: FeedRebuildStatus::Rebuilt,
+            } if String::from_utf8_lossy(cache.xml_bytes()).contains("src=\"/assets/")
+        ));
+        assert_eq!(rebuilder.call_count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn fresh_absolute_cache_from_a_previous_root_is_rebuilt_for_absolute_asset_urls() {
+        let queue = TestQueue::successful(FeedRebuildEnqueueResult::Enqueued);
+        let cache = TestCache::hit(cache_read_with_xml(
+            true,
+            b"<img src=\"https://old.example.test/werrss/assets/bd264535-3e4f-4da5-be01-73f3dcc98625\" />",
+        ));
+        let rebuilder = TestRebuilder::publishing(
+            &cache,
+            cache_read_with_xml(
+                true,
+                b"<img src=\"https://rss.example.test/werrss/assets/bd264535-3e4f-4da5-be01-73f3dcc98625\" />",
+            ),
+        );
+        let service = FeedService::new(
+            cache,
+            queue,
+            rebuilder.clone(),
+            FeedServiceConfig::default(),
+        )
+        .with_asset_url_policy(Some(FeedAssetUrlPolicy::new(
+            Url::parse("https://rss.example.test/werrss").unwrap(),
+            true,
+        )));
+
+        let delivery = service
+            .get_feed(FeedRequest::new(source_id(), None))
+            .await
+            .expect("cache from a previous root should be rebuilt");
+
+        assert!(matches!(
+            delivery,
+            FeedDelivery::Cached {
+                cache,
+                status: FeedCacheStatus::Fresh,
+                rebuild: FeedRebuildStatus::Rebuilt,
+            } if String::from_utf8_lossy(cache.xml_bytes()).contains("https://rss.example.test/werrss/assets/")
+        ));
+        assert_eq!(rebuilder.call_count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn fresh_absolute_cache_from_a_previous_root_is_rebuilt_for_relative_asset_urls() {
+        let queue = TestQueue::successful(FeedRebuildEnqueueResult::Enqueued);
+        let cache = TestCache::hit(cache_read_with_xml(
+            true,
+            b"<img src=\"https://old.example.test/werrss/assets/bd264535-3e4f-4da5-be01-73f3dcc98625\" />",
+        ));
+        let rebuilder = TestRebuilder::publishing(
+            &cache,
+            cache_read_with_xml(
+                true,
+                b"<img src=\"/assets/bd264535-3e4f-4da5-be01-73f3dcc98625\" />",
+            ),
+        );
+        let service = FeedService::new(
+            cache,
+            queue,
+            rebuilder.clone(),
+            FeedServiceConfig::default(),
+        )
+        .with_asset_url_policy(Some(FeedAssetUrlPolicy::new(
+            Url::parse("https://rss.example.test/werrss").unwrap(),
+            false,
+        )));
+
+        let delivery = service
+            .get_feed(FeedRequest::new(source_id(), None))
+            .await
+            .expect("cache from a previous root should be rebuilt");
+
+        assert!(matches!(
+            delivery,
+            FeedDelivery::Cached {
+                cache,
+                status: FeedCacheStatus::Fresh,
+                rebuild: FeedRebuildStatus::Rebuilt,
+            } if String::from_utf8_lossy(cache.xml_bytes()).contains("src=\"/assets/")
+        ));
+        assert_eq!(rebuilder.call_count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn incompatible_cache_is_not_served_when_rebuild_fails() {
+        let queue = TestQueue::successful(FeedRebuildEnqueueResult::Enqueued);
+        let rebuilder = TestRebuilder::failing();
+        let service = FeedService::new(
+            TestCache::hit(cache_read_with_xml(
+                true,
+                b"<img src=\"/assets/bd264535-3e4f-4da5-be01-73f3dcc98625\" />",
+            )),
+            queue.clone(),
+            rebuilder,
+            FeedServiceConfig::default(),
+        )
+        .with_asset_url_policy(Some(FeedAssetUrlPolicy::new(
+            Url::parse("https://rss.example.test/werrss").unwrap(),
+            true,
+        )));
+
+        let delivery = service
+            .get_feed(FeedRequest::new(source_id(), None))
+            .await
+            .expect("rebuild failure should produce a retryable delivery");
+
+        assert!(matches!(
+            delivery,
+            FeedDelivery::Unavailable {
+                rebuild: FeedRebuildStatus::Enqueued,
+                ..
+            }
+        ));
+        assert_eq!(queue.request_count().await, 1);
     }
 
     #[tokio::test]

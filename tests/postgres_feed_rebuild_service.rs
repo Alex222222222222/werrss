@@ -1,5 +1,6 @@
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use sqlx::PgPool;
+use url::Url;
 use uuid::Uuid;
 use werrss::{
     application::{
@@ -89,6 +90,62 @@ async fn rebuild_renders_normalized_articles_and_releases_the_build_lease(pool: 
             .await
             .expect("lease count should be queryable");
     assert_eq!(lease_count, 0);
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn rebuild_emits_absolute_asset_urls_when_public_root_is_configured(pool: PgPool) {
+    let source_id = SourceId::from_uuid(Uuid::new_v4());
+    let factory = UnitOfWorkFactory::new(pool.clone());
+    create_source(&factory, source_id).await;
+    insert_article_with_content(
+        &pool,
+        &factory,
+        source_id,
+        "asset-review",
+        "Asset article",
+        200,
+        "<p>Body</p><img src=\"/assets/bd264535-3e4f-4da5-be01-73f3dcc98625\" />",
+    )
+    .await;
+
+    let config = FeedRebuildConfig::new(
+        Duration::minutes(5),
+        Duration::minutes(30),
+        "https://rss.example.test/feed.xml",
+        "Integration test feed",
+    )
+    .expect("rebuild config should be valid")
+    .with_asset_url_root(
+        Url::parse("https://rss.example.test/werrss").expect("asset root should be valid"),
+    );
+    let service = FeedRebuildService::new(
+        FeedRebuildDependencies::new(
+            PostgresSourceRepository::new(pool.clone()),
+            PostgresArticleRepository::new(pool.clone()),
+            PostgresFeedBuildLeaseRepository::new(pool.clone()),
+            factory,
+        ),
+        config,
+        "builder-a",
+    )
+    .expect("rebuild service should be valid");
+
+    service
+        .rebuild(source_id)
+        .await
+        .expect("feed rebuild should succeed");
+
+    let cache = PostgresFeedCacheRepository::new(pool)
+        .get(source_id)
+        .await
+        .expect("cache read should succeed")
+        .expect("rebuild should publish a cache row");
+    let xml = String::from_utf8(cache.cache().xml_bytes().to_vec())
+        .expect("rendered feed should be UTF-8");
+    assert!(xml.contains(
+        "src=\"https://rss.example.test/werrss/assets/bd264535-3e4f-4da5-be01-73f3dcc98625\""
+    ));
+    assert!(!xml.contains("src=\"/assets/bd264535-3e4f-4da5-be01-73f3dcc98625\""));
 }
 
 #[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
@@ -395,6 +452,27 @@ async fn insert_article(
     title: &str,
     published_at: i64,
 ) {
+    insert_article_with_content(
+        pool,
+        factory,
+        source_id,
+        review_id,
+        title,
+        published_at,
+        &format!("<p>{title}</p>"),
+    )
+    .await;
+}
+
+async fn insert_article_with_content(
+    pool: &PgPool,
+    factory: &UnitOfWorkFactory,
+    source_id: SourceId,
+    review_id: &str,
+    title: &str,
+    published_at: i64,
+    content_html: &str,
+) {
     let repository = PostgresArticleRepository::new(pool.clone());
     let observation_version = repository
         .allocate_observation_version()
@@ -416,7 +494,7 @@ async fn insert_article(
                     .expect("article URL should be valid"),
             ),
             published_at: timestamp(published_at),
-            content_html: format!("<p>{title}</p>"),
+            content_html: content_html.to_owned(),
             content_hash: Some(format!("hash-{review_id}")),
             observation_version,
             fetched_at: timestamp(published_at + 10),

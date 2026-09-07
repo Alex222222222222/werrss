@@ -860,6 +860,7 @@ FEED_BUILD_LEASE_SECONDS / FEED_BUILD_HEARTBEAT_SECONDS
 PACING_* / SCROLL_*
 ASSET_ARCHIVE_BACKEND / ASSET_CACHE_MAX_SIZE_MB /
 ASSET_CACHE_MAX_AGE_DAYS / ASSET_MAX_SIZE_MB /
+ASSET_USE_ABSOLUTE_URLS /
 ASSET_MAX_COUNT_PER_ARTICLE / ASSET_MAX_FETCH_BYTES_PER_ARTICLE_MB /
 ASSET_MAX_FETCH_TIME_PER_ARTICLE_SECONDS / ASSET_FETCH_TIMEOUT_SECONDS /
 ASSET_MAX_REDIRECTS
@@ -949,8 +950,13 @@ enrolled account when each job runs; without one, the job records a warning and
 waits for the source's next due interval. Worker concurrency is
 configured independently from API replica count. `SERVER_ROOT_URL` is an optional
 validated public HTTP(S) URL for generated RSS channel links and is required
-when the worker role is enabled. The current asset-cache implementation accepts
-only `disabled | database` and defaults to `disabled`; `database` is the
+when the worker role is enabled. `ASSET_USE_ABSOLUTE_URLS` defaults to `true`;
+when database asset caching is enabled it also requires `SERVER_ROOT_URL` and
+makes feed image links full URLs rooted there. Set it to `false` to retain
+root-relative `/assets/{id}` links. Feed delivery rebuilds persisted caches
+whose asset URL form does not match the configured mode. The current asset-cache
+implementation accepts only `disabled | database` and defaults to `disabled`;
+`database` is the
 canonical PostgreSQL-backed value. `local` and `s3` are reserved for future
 implementations. Local paths or object-store credentials are not part of the
 first implementation; the target cache limits and fetch settings are defined in

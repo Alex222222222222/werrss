@@ -31,6 +31,7 @@
 //! PACING_* / SCROLL_*
 //! ASSET_ARCHIVE_BACKEND / ASSET_CACHE_MAX_SIZE_MB /
 //! ASSET_CACHE_MAX_AGE_DAYS / ASSET_MAX_SIZE_MB /
+//! ASSET_USE_ABSOLUTE_URLS /
 //! ASSET_MAX_COUNT_PER_ARTICLE / ASSET_MAX_FETCH_BYTES_PER_ARTICLE_MB /
 //! ASSET_MAX_FETCH_TIME_PER_ARTICLE_SECONDS / ASSET_FETCH_TIMEOUT_SECONDS /
 //! ASSET_MAX_REDIRECTS / ASSET_REPAIR_MAX_PENDING /
@@ -152,6 +153,7 @@ const KNOWN_ENVIRONMENT_VARIABLES: &[&str] = &[
     "ASSET_ARCHIVE_BACKEND",
     "ASSET_CACHE_MAX_SIZE_MB",
     "ASSET_CACHE_MAX_AGE_DAYS",
+    "ASSET_USE_ABSOLUTE_URLS",
     "ASSET_MAX_SIZE_MB",
     "ASSET_MAX_COUNT_PER_ARTICLE",
     "ASSET_MAX_FETCH_BYTES_PER_ARTICLE_MB",
@@ -438,6 +440,8 @@ pub struct AppConfig {
     pub pacing: PacingPolicy,
     /// Optional binary asset archive configuration.
     pub asset_archive: AssetArchiveConfig,
+    /// Whether generated feeds should use absolute URLs for cached assets.
+    pub asset_use_absolute_urls: bool,
     /// Whether administrative routes should be constructed.
     pub admin_enabled: bool,
     /// Administrator username, present only when administration is enabled.
@@ -656,6 +660,18 @@ impl AppConfig {
             MAX_CACHE_MISS_WAIT_MS,
         )?;
         let server_root_url = parse_optional_http_url(raw.server_root_url, "SERVER_ROOT_URL")?;
+        let asset_use_absolute_urls = parse_bool(
+            raw.asset_use_absolute_urls.as_deref().unwrap_or("true"),
+            "ASSET_USE_ABSOLUTE_URLS",
+        )?;
+        if asset_use_absolute_urls
+            && matches!(&asset_archive, AssetArchiveConfig::Database { .. })
+            && server_root_url.is_none()
+        {
+            return Err(ConfigError::Missing {
+                variable: "SERVER_ROOT_URL",
+            });
+        }
 
         let feed_build_lease_seconds = positive_u64(
             raw.feed_build_lease_seconds.unwrap_or(600),
@@ -784,6 +800,7 @@ impl AppConfig {
             feed_build_heartbeat: Duration::from_secs(feed_build_heartbeat_seconds),
             pacing,
             asset_archive,
+            asset_use_absolute_urls,
             admin_enabled,
             admin_username,
             admin_password,
@@ -860,6 +877,7 @@ struct RawConfig {
     asset_archive_backend: Option<String>,
     asset_cache_max_size_mb: Option<u64>,
     asset_cache_max_age_days: Option<u64>,
+    asset_use_absolute_urls: Option<String>,
     asset_max_size_mb: Option<u64>,
     asset_max_count_per_article: Option<u32>,
     asset_max_fetch_bytes_per_article_mb: Option<u64>,
@@ -1443,6 +1461,7 @@ mod tests {
         assert_eq!(config.rss_stale_while_revalidate, Duration::from_secs(60));
         assert_eq!(config.rss_cache_miss_wait, Duration::from_secs(5));
         assert!(config.server_root_url.is_none());
+        assert!(config.asset_use_absolute_urls);
         assert_eq!(config.feed_build_lease, Duration::from_secs(600));
         assert_eq!(config.feed_build_heartbeat, Duration::from_secs(60));
         assert!(matches!(config.asset_archive, AssetArchiveConfig::Disabled));
@@ -1878,6 +1897,10 @@ mod tests {
         let mut environment =
             replace_environment(valid_environment(), "ASSET_ARCHIVE_BACKEND", " database ");
         environment.extend([
+            (
+                "SERVER_ROOT_URL".to_owned(),
+                "https://rss.example.test/werrss".to_owned(),
+            ),
             ("ASSET_CACHE_MAX_SIZE_MB".to_owned(), "12".to_owned()),
             ("ASSET_CACHE_MAX_AGE_DAYS".to_owned(), "0".to_owned()),
             ("ASSET_MAX_SIZE_MB".to_owned(), "2".to_owned()),
@@ -1914,12 +1937,54 @@ mod tests {
         assert_eq!(repair_policy.public_max_pending(), 50);
         assert_eq!(repair_policy.requeue_after(), Duration::from_secs(60));
         assert_eq!(repair_policy.max_attempts(), 3);
+        assert!(config.asset_use_absolute_urls);
+    }
+
+    #[test]
+    fn database_asset_mode_requires_server_root_for_default_absolute_urls() {
+        let environment =
+            replace_environment(valid_environment(), "ASSET_ARCHIVE_BACKEND", "database");
+
+        assert!(matches!(
+            AppConfig::from_env_iter(environment),
+            Err(ConfigError::Missing {
+                variable: "SERVER_ROOT_URL"
+            })
+        ));
+    }
+
+    #[test]
+    fn database_asset_mode_can_keep_relative_urls_without_server_root() {
+        let mut environment =
+            replace_environment(valid_environment(), "ASSET_ARCHIVE_BACKEND", "database");
+        environment.push(("ASSET_USE_ABSOLUTE_URLS".to_owned(), "false".to_owned()));
+
+        let config = AppConfig::from_env_iter(environment).unwrap();
+
+        assert!(!config.asset_use_absolute_urls);
+    }
+
+    #[test]
+    fn rejects_invalid_asset_absolute_url_setting() {
+        let environment =
+            replace_environment(valid_environment(), "ASSET_USE_ABSOLUTE_URLS", "sometimes");
+
+        assert!(matches!(
+            AppConfig::from_env_iter(environment),
+            Err(ConfigError::InvalidValue {
+                variable: "ASSET_USE_ABSOLUTE_URLS",
+                ..
+            })
+        ));
     }
 
     #[test]
     fn accepts_postgres_as_the_database_asset_backend_alias() {
-        let environment =
-            replace_environment(valid_environment(), "ASSET_ARCHIVE_BACKEND", "postgres");
+        let environment = replace_environment(
+            replace_environment(valid_environment(), "ASSET_ARCHIVE_BACKEND", "postgres"),
+            "SERVER_ROOT_URL",
+            "https://rss.example.test",
+        );
 
         assert!(matches!(
             AppConfig::from_env_iter(environment).unwrap().asset_archive,
@@ -1932,6 +1997,10 @@ mod tests {
         let mut environment =
             replace_environment(valid_environment(), "ASSET_ARCHIVE_BACKEND", "database");
         environment.extend([
+            (
+                "SERVER_ROOT_URL".to_owned(),
+                "https://rss.example.test".to_owned(),
+            ),
             ("ASSET_REPAIR_MAX_PENDING".to_owned(), "12".to_owned()),
             ("ASSET_REPAIR_PUBLIC_MAX_PENDING".to_owned(), "7".to_owned()),
             ("ASSET_REPAIR_REQUEUE_SECONDS".to_owned(), "45".to_owned()),

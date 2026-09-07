@@ -1,13 +1,14 @@
 use chrono::{DateTime, TimeZone, Utc};
 use sqlx::PgPool;
+use url::Url;
 use uuid::Uuid;
 use werrss::{
     application::feed_rebuild_service::{
         FeedRebuildConfig, FeedRebuildDependencies, FeedRebuildService,
     },
     application::feed_service::{
-        FeedDelivery, FeedRebuildJobConfig, FeedRebuildStatus, FeedRequest, FeedService,
-        FeedServiceConfig, PostgresFeedRebuildQueue,
+        FeedAssetUrlPolicy, FeedDelivery, FeedRebuildJobConfig, FeedRebuildStatus, FeedRequest,
+        FeedService, FeedServiceConfig, PostgresFeedRebuildQueue,
     },
     domain::{
         feed::FeedCacheCandidate,
@@ -238,6 +239,91 @@ async fn feed_service_rebuilds_an_expired_cache_before_delivery(pool: PgPool) {
 }
 
 #[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn feed_service_rebuilds_a_fresh_cache_with_incompatible_asset_urls(pool: PgPool) {
+    let source_id = insert_source(&pool, 1).await;
+    insert_article(
+        &pool,
+        source_id,
+        "<p>Body</p><img src=\"/assets/bd264535-3e4f-4da5-be01-73f3dcc98625\" />",
+    )
+    .await;
+    let asset_root =
+        Url::parse("https://rss.example.test/werrss").expect("asset root should be valid");
+    let lease_repository = PostgresFeedBuildLeaseRepository::new(pool.clone());
+    let generated_at = Utc::now() - chrono::Duration::seconds(1);
+    publish(
+        &pool,
+        &lease_repository,
+        candidate_at(
+            source_id,
+            1,
+            generated_at,
+            generated_at + chrono::Duration::minutes(30),
+            b"<rss><channel><item><content:encoded><![CDATA[<img src=\"/assets/bd264535-3e4f-4da5-be01-73f3dcc98625\" />]]></content:encoded></item></channel></rss>",
+            "etag-relative-assets",
+        ),
+    )
+    .await;
+
+    let queue = PostgresFeedRebuildQueue::new(
+        PostgresJobRepository::new(pool.clone()),
+        FeedRebuildJobConfig::default(),
+    );
+    let factory = UnitOfWorkFactory::new(pool.clone());
+    let rebuild_service = FeedRebuildService::new(
+        FeedRebuildDependencies::new(
+            PostgresSourceRepository::new(pool.clone()),
+            PostgresArticleRepository::new(pool.clone()),
+            PostgresFeedBuildLeaseRepository::new(pool.clone()),
+            factory,
+        ),
+        FeedRebuildConfig::new(
+            chrono::Duration::minutes(5),
+            chrono::Duration::minutes(30),
+            "https://rss.example.test/werrss.xml",
+            "Integration test feed",
+        )
+        .expect("feed rebuild configuration should be valid")
+        .with_asset_url_root(asset_root.clone()),
+        "api-feed-builder",
+    )
+    .expect("feed rebuild service should be constructible");
+    let service = FeedService::new(
+        PostgresFeedCacheRepository::new(pool.clone()),
+        queue,
+        rebuild_service,
+        FeedServiceConfig::default(),
+    )
+    .with_asset_url_policy(Some(FeedAssetUrlPolicy::new(asset_root, true)));
+
+    let delivery = service
+        .get_feed(FeedRequest::new(source_id, None))
+        .await
+        .expect("incompatible fresh cache should be rebuilt");
+    assert!(matches!(
+        delivery,
+        FeedDelivery::Cached {
+            status: werrss::application::feed_service::FeedCacheStatus::Fresh,
+            rebuild: FeedRebuildStatus::Rebuilt,
+            cache,
+        } if String::from_utf8_lossy(cache.xml_bytes()).contains(
+            "src=\"https://rss.example.test/werrss/assets/bd264535-3e4f-4da5-be01-73f3dcc98625\""
+        )
+    ));
+
+    let persisted = PostgresFeedCacheRepository::new(pool)
+        .get(source_id)
+        .await
+        .expect("rebuilt cache should be readable")
+        .expect("rebuilt cache should be persisted");
+    assert!(
+        String::from_utf8_lossy(persisted.cache().xml_bytes()).contains(
+            "src=\"https://rss.example.test/werrss/assets/bd264535-3e4f-4da5-be01-73f3dcc98625\""
+        )
+    );
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
 async fn postgres_feed_cache_rejects_older_candidates_and_releases_on_revision_conflict(
     pool: PgPool,
 ) {
@@ -461,6 +547,20 @@ async fn insert_source(pool: &PgPool, revision: i64) -> SourceId {
         .await
         .expect("test source should be insertable");
     source_id
+}
+
+async fn insert_article(pool: &PgPool, source_id: SourceId, content_html: &str) {
+    sqlx::query(
+        "INSERT INTO articles (source_id, review_id, title, published_at, content_html, fetched_at) VALUES ($1, $2, $3, $4, $5, $4)",
+    )
+    .bind(source_id.as_uuid())
+    .bind("asset-review")
+    .bind("Asset article")
+    .bind(Utc::now())
+    .bind(content_html)
+    .execute(pool)
+    .await
+    .expect("test article should be insertable");
 }
 
 async fn expire_lease(pool: &PgPool, source_id: SourceId) {

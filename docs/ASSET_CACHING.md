@@ -47,6 +47,7 @@ storage implementations exist.
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `ASSET_ARCHIVE_BACKEND` | `disabled` | `disabled` leaves external URLs unchanged; `database` stores bytes in PostgreSQL. `local` and `s3` are future backends and are not part of the first implementation. |
+| `ASSET_USE_ABSOLUTE_URLS` | `true` | When database caching is enabled, feed rendering converts stable `/assets/{id}` links to full URLs rooted at `SERVER_ROOT_URL`. Set to `false` to keep relative links; the default requires `SERVER_ROOT_URL`. |
 | `ASSET_CACHE_MAX_SIZE_MB` | `5000` | Maximum aggregate size of cached binary bytes. `0` disables size-based eviction. The value is decimal megabytes: `5000` means 5,000,000,000 bytes. |
 | `ASSET_CACHE_MAX_AGE_DAYS` | `30` | Maximum age since the last successful access before cached bytes are evicted. `0` disables age-based eviction. |
 | `ASSET_MAX_SIZE_MB` | `10` | Maximum size of one downloaded asset, in decimal megabytes. This is always enforced and must be greater than zero. |
@@ -318,9 +319,17 @@ does not create duplicate data.
 
 ## Rewriting and serving
 
-When an asset is successfully added, sanitized HTML uses the stable local URL
-`/assets/{asset_record_id}`. Rewriting is limited to URLs reported by the
-sanitizer for that article; unrelated attributes and links are never rewritten.
+When an asset is successfully added, sanitized article HTML stores the stable
+local URL `/assets/{asset_record_id}`. During RSS rendering,
+`ASSET_USE_ABSOLUTE_URLS=true` converts those stable `src` values to full URLs
+under `SERVER_ROOT_URL`; this is the default because RSS clients may resolve a
+root-relative URL against the article's original WeChat link. Setting it to
+`false` keeps the root-relative form. Rewriting is limited to stable asset
+`src` values; unrelated attributes, links, and external image URLs are never
+rewritten. Feed delivery treats a fresh persisted feed with the wrong asset URL
+form as incompatible and rebuilds it before serving; if that rebuild is not
+available, it does not serve the incompatible cache. Changing the setting does
+not rewrite stored article rows.
 
 The public asset route:
 

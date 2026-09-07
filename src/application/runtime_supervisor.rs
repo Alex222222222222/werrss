@@ -77,7 +77,8 @@ use super::{
     },
     feed_rebuild_service::{FeedRebuildConfig, FeedRebuildDependencies, FeedRebuildService},
     feed_service::{
-        FeedRebuildJobConfig, FeedService, FeedServiceConfig, PostgresFeedRebuildQueue,
+        FeedAssetUrlPolicy, FeedRebuildJobConfig, FeedService, FeedServiceConfig,
+        PostgresFeedRebuildQueue,
     },
     feed_token_service::FeedTokenService,
     job_service::JobService,
@@ -595,7 +596,8 @@ impl RuntimeSupervisor {
             queue,
             rebuild_service,
             feed_config,
-        );
+        )
+        .with_asset_url_policy(self.feed_asset_url_policy());
         let asset_store = self.config.asset_archive.database_policy().map(|policy| {
             PostgresAssetStore::new(self.pool.clone(), policy).with_repair_policy(
                 self.config
@@ -920,13 +922,27 @@ impl RuntimeSupervisor {
             .server_root_url
             .as_ref()
             .ok_or(RuntimeSupervisorError::ServerRootUrlNotConfigured)?;
-        FeedRebuildConfig::new(
+        let rebuild_config = FeedRebuildConfig::new(
             lease_for,
             cache_ttl,
             feed_url.as_str(),
             "WeChat article feed",
         )
-        .map_err(RuntimeSupervisorError::FeedRebuildConfig)
+        .map_err(RuntimeSupervisorError::FeedRebuildConfig)?;
+        if self.config.asset_use_absolute_urls {
+            Ok(rebuild_config.with_asset_url_root(feed_url.clone()))
+        } else {
+            Ok(rebuild_config)
+        }
+    }
+
+    fn feed_asset_url_policy(&self) -> Option<FeedAssetUrlPolicy> {
+        self.config.asset_archive.database_policy().and_then(|_| {
+            self.config
+                .server_root_url
+                .clone()
+                .map(|root| FeedAssetUrlPolicy::new(root, self.config.asset_use_absolute_urls))
+        })
     }
 
     fn build_feed_rebuild_service(
@@ -1192,7 +1208,8 @@ mod tests {
     use super::*;
     use crate::{
         application::auth_service::{CredentialRefreshError, RefreshedCredentials},
-        config::AppConfig,
+        archive::asset_store::{AssetCachePolicy, AssetRepairPolicy},
+        config::{AppConfig, AssetArchiveConfig},
         domain::credentials::WeReadAccountId,
     };
 
@@ -1421,6 +1438,61 @@ mod tests {
         assert_eq!(
             rebuild_config.feed_url(),
             "https://feeds.example.test/werrss.xml"
+        );
+    }
+
+    #[tokio::test]
+    async fn feed_rebuild_config_uses_server_root_for_absolute_asset_urls() {
+        let supervisor = RuntimeSupervisor::new(config("worker"), lazy_pool()).unwrap();
+
+        let rebuild_config = supervisor
+            .feed_rebuild_config(Duration::minutes(10), Duration::minutes(30))
+            .expect("configured feed URL should produce rebuild settings");
+
+        assert_eq!(
+            rebuild_config.asset_url_root().map(|url| url.as_str()),
+            Some("https://feeds.example.test/werrss.xml")
+        );
+    }
+
+    #[tokio::test]
+    async fn feed_rebuild_config_keeps_relative_asset_urls_when_disabled() {
+        let mut app_config = config("worker");
+        app_config.asset_use_absolute_urls = false;
+        let supervisor = RuntimeSupervisor::new(app_config, lazy_pool()).unwrap();
+
+        let rebuild_config = supervisor
+            .feed_rebuild_config(Duration::minutes(10), Duration::minutes(30))
+            .expect("configured feed URL should produce rebuild settings");
+
+        assert!(rebuild_config.asset_url_root().is_none());
+    }
+
+    #[tokio::test]
+    async fn feed_asset_url_policy_is_disabled_without_database_asset_archive() {
+        let supervisor = RuntimeSupervisor::new(config("worker"), lazy_pool()).unwrap();
+
+        assert!(supervisor.feed_asset_url_policy().is_none());
+    }
+
+    #[tokio::test]
+    async fn feed_asset_url_policy_is_enabled_for_database_asset_archive() {
+        let mut app_config = config("worker");
+        app_config.asset_archive = AssetArchiveConfig::Database {
+            policy: AssetCachePolicy::default(),
+            repair_policy: AssetRepairPolicy::default(),
+        };
+        let supervisor = RuntimeSupervisor::new(app_config, lazy_pool()).unwrap();
+        let policy = supervisor
+            .feed_asset_url_policy()
+            .expect("database asset mode should configure feed URL compatibility");
+
+        assert_eq!(
+            policy,
+            FeedAssetUrlPolicy::new(
+                url::Url::parse("https://feeds.example.test/werrss.xml").unwrap(),
+                true,
+            )
         );
     }
 

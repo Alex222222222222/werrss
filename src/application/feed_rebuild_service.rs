@@ -59,9 +59,11 @@
 
 use chrono::{DateTime, Duration, Utc};
 use thiserror::Error;
+use url::Url;
 
 use crate::{
     application::source_service::{SourceReader, SourceServiceError},
+    archive::url_rewriter::absolutize_asset_urls,
     domain::{
         article::Article,
         feed::FeedCacheCandidate,
@@ -89,6 +91,7 @@ pub struct FeedRebuildConfig {
     cache_ttl: Duration,
     feed_url: String,
     description: String,
+    asset_url_root: Option<Url>,
 }
 
 impl FeedRebuildConfig {
@@ -114,6 +117,7 @@ impl FeedRebuildConfig {
             cache_ttl,
             feed_url,
             description: description.into(),
+            asset_url_root: None,
         })
     }
 
@@ -135,6 +139,21 @@ impl FeedRebuildConfig {
     /// Returns the channel description supplied to the RSS renderer.
     pub fn description(&self) -> &str {
         &self.description
+    }
+
+    /// Configures the public root used for stable asset URLs in RSS content.
+    ///
+    /// Article rows retain relative `/assets/{id}` routes. The root is only
+    /// applied while rendering a feed so changing deployment hostnames does
+    /// not require rewriting every stored article.
+    pub fn with_asset_url_root(mut self, root: Url) -> Self {
+        self.asset_url_root = Some(root);
+        self
+    }
+
+    /// Returns the optional public root used for asset URLs.
+    pub fn asset_url_root(&self) -> Option<&Url> {
+        self.asset_url_root.as_ref()
     }
 }
 
@@ -508,7 +527,10 @@ where
             source_revision: source.feed_revision(),
             generated_at,
             expires_at,
-            articles: articles.into_iter().map(render_article).collect(),
+            articles: articles
+                .into_iter()
+                .map(|article| render_article(article, self.config.asset_url_root()))
+                .collect(),
         })?;
 
         let mut unit_of_work = self.unit_of_work.begin().await?;
@@ -587,7 +609,11 @@ struct JobCompletion {
     token: LeaseToken,
 }
 
-fn render_article(article: Article) -> RenderArticle {
+fn render_article(article: Article, asset_url_root: Option<&Url>) -> RenderArticle {
+    let content_html = asset_url_root.map_or_else(
+        || article.content_html().to_owned(),
+        |root| absolutize_asset_urls(article.content_html(), root),
+    );
     RenderArticle {
         review_id: article.review_id().to_owned(),
         title: article.title().to_owned(),
@@ -595,7 +621,7 @@ fn render_article(article: Article) -> RenderArticle {
         summary: article.summary().map(str::to_owned),
         original_url: article.original_url().map(|url| url.as_str().to_owned()),
         published_at: article.published_at(),
-        content_html: article.content_html().to_owned(),
+        content_html,
     }
 }
 
