@@ -228,8 +228,14 @@ impl RuntimePlan {
                 allowed_job_types.push(JobType::AssetRepair);
             }
             let source_sync_enabled = true;
-            let dispatch = WorkerConfig::new(allowed_job_types, heartbeat)
-                .map_err(RuntimePlanError::WorkerConfig)?;
+            let execution_timeout =
+                positive_duration(config.job_execution_timeout, "worker execution timeout")?;
+            let dispatch = WorkerConfig::new_with_execution_timeout(
+                allowed_job_types,
+                heartbeat,
+                execution_timeout,
+            )
+            .map_err(RuntimePlanError::WorkerConfig)?;
             let poll_interval = config.job_poll_interval;
             let loop_config = WorkerLoopConfig::new(poll_interval, poll_interval)
                 .map_err(RuntimePlanError::WorkerLoop)?;

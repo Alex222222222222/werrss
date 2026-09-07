@@ -94,6 +94,22 @@ fn worker_plan_uses_only_executable_jobs_and_preserves_concurrency() {
 }
 
 #[test]
+fn worker_plan_propagates_the_absolute_execution_timeout() {
+    let mut config = config("worker");
+    config.job_execution_timeout = std::time::Duration::from_secs(90);
+
+    let plan = RuntimePlan::from_config(&config).unwrap();
+    let RuntimeComponent::Worker(worker) = plan.component(AppRole::Worker).unwrap() else {
+        panic!("worker role should produce a worker component")
+    };
+
+    assert_eq!(
+        worker.worker_config().execution_timeout(),
+        std::time::Duration::from_secs(90)
+    );
+}
+
+#[test]
 fn api_and_scheduler_roles_ignore_invalid_worker_only_values() {
     let mut config = config("api,scheduler");
     config.worker_concurrency = 0;
@@ -129,6 +145,19 @@ fn invalid_worker_clock_is_rejected_before_a_worker_plan_is_returned() {
         RuntimePlan::from_config(&config),
         Err(RuntimePlanError::InvalidDuration {
             field: "worker heartbeat"
+        })
+    );
+}
+
+#[test]
+fn invalid_worker_execution_timeout_is_rejected_before_startup() {
+    let mut config = config("worker");
+    config.job_execution_timeout = std::time::Duration::ZERO;
+
+    assert_eq!(
+        RuntimePlan::from_config(&config),
+        Err(RuntimePlanError::InvalidDuration {
+            field: "worker execution timeout"
         })
     );
 }

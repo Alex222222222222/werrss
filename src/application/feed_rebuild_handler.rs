@@ -90,7 +90,7 @@ impl<S, A, L, U> JobHandler for FeedRebuildJobHandler<S, A, L, U>
 where
     S: SourceReader,
     A: ArticleRepository,
-    L: FeedBuildLeaseRepository,
+    L: FeedBuildLeaseRepository + 'static,
     U: FeedRebuildUnitOfWorkFactory,
 {
     #[tracing::instrument(skip_all, level = "debug", fields(job_id = %lease.job.id()))]

@@ -12,9 +12,9 @@
 //! [`AuthenticatedBrowserSession`] is a separate non-cloneable capability for
 //! WeRead account/list operations. It carries one account lease guard and an
 //! authenticated WebDriver client, and cannot be converted into a public
-//! session. Dropping either session releases only local capacity;
-//! authenticated callers should explicitly call `release()` so the durable
-//! account lease and remote browser session are cleaned up promptly.
+//! session. Normal completion explicitly calls `release()`; if cancellation
+//! drops the session, it schedules cleanup for the durable account lease and
+//! remote browser session while releasing local capacity immediately.
 //!
 //! The concrete public adapter now connects a fresh WebDriver session and
 //! exposes only safe navigation, current-URL, source, bounded scrolling, close,
@@ -45,6 +45,7 @@ use thirtyfour::common::capabilities::firefox::FirefoxPreferences;
 use thirtyfour::prelude::{ChromiumLikeCapabilities, DesiredCapabilities};
 use thirtyfour::{Capabilities, Cookie, WebDriver};
 use thiserror::Error;
+use tokio::runtime::Handle;
 use url::Url;
 use uuid::Uuid;
 
@@ -362,7 +363,7 @@ impl WebDriverFactory {
         lease_for: chrono::Duration,
     ) -> Result<Option<AuthenticatedBrowserSession<R>>, WebDriverError>
     where
-        R: AccountLeaseStore,
+        R: AccountLeaseStore + 'static,
     {
         tracing::debug!(account_id = %account_id, engine = ?self.engine, endpoint_host = ?self.endpoint.host_str(), "opening authenticated WebDriver session");
         let Some(session) = pool
@@ -682,14 +683,22 @@ pub struct PublicBrowserSession {
     _permit: tokio::sync::OwnedSemaphorePermit,
     session_id: Uuid,
     client: Option<WebDriver>,
+    cleanup: Option<PublicSessionCleanup>,
 }
+
+type PublicSessionCleanup = Box<dyn FnOnce(Option<WebDriver>) + Send + Sync>;
 
 impl PublicBrowserSession {
     pub(crate) fn from_permit(permit: tokio::sync::OwnedSemaphorePermit) -> Self {
+        let runtime = Handle::try_current().ok();
+        let cleanup = Box::new(move |client| {
+            schedule_public_session_cleanup(runtime, client);
+        });
         Self {
             _permit: permit,
             session_id: Uuid::new_v4(),
             client: None,
+            cleanup: Some(cleanup),
         }
     }
 
@@ -796,6 +805,7 @@ impl PublicBrowserSession {
     }
 
     pub(crate) async fn close_client(&mut self) -> Result<(), WebDriverError> {
+        self.cleanup.take();
         if let Some(client) = self.client.take() {
             close_webdriver(client)
                 .await
@@ -807,6 +817,15 @@ impl PublicBrowserSession {
     /// Closes the remote browser session and releases the local permit.
     pub async fn close(mut self) -> Result<(), WebDriverError> {
         self.close_client().await
+    }
+}
+
+impl Drop for PublicBrowserSession {
+    fn drop(&mut self) {
+        let Some(cleanup) = self.cleanup.take() else {
+            return;
+        };
+        cleanup(self.client.take());
     }
 }
 
@@ -826,10 +845,17 @@ where
 {
     _permit: tokio::sync::OwnedSemaphorePermit,
     session_id: Uuid,
-    lease: AccountLeaseGuard<R>,
+    lease: Option<AccountLeaseGuard<R>>,
     lease_heartbeat: Option<AccountLeaseHeartbeat>,
     client: Option<WebDriver>,
+    cleanup: Option<AuthenticatedSessionCleanup<R>>,
 }
+
+type AuthenticatedSessionCleanup<R> = Box<
+    dyn FnOnce(Option<AccountLeaseGuard<R>>, Option<WebDriver>, Option<AccountLeaseHeartbeat>)
+        + Send
+        + Sync,
+>;
 
 impl<R> AuthenticatedBrowserSession<R>
 where
@@ -838,13 +864,21 @@ where
     pub(crate) fn from_permit(
         permit: tokio::sync::OwnedSemaphorePermit,
         lease: AccountLeaseGuard<R>,
-    ) -> Self {
+    ) -> Self
+    where
+        R: 'static,
+    {
+        let runtime = Handle::try_current().ok();
+        let cleanup = Box::new(move |lease, client, heartbeat| {
+            schedule_authenticated_session_cleanup(runtime, lease, client, heartbeat);
+        });
         Self {
             _permit: permit,
             session_id: Uuid::new_v4(),
-            lease,
+            lease: Some(lease),
             lease_heartbeat: None,
             client: None,
+            cleanup: Some(cleanup),
         }
     }
 
@@ -859,8 +893,8 @@ where
     }
 
     /// Returns the stable account identity used by this session.
-    pub const fn account_id(&self) -> crate::domain::credentials::WeReadAccountId {
-        self.lease.account_id()
+    pub fn account_id(&self) -> crate::domain::credentials::WeReadAccountId {
+        self.lease().account_id()
     }
 
     /// Heartbeats the account lease before more authenticated work.
@@ -868,7 +902,7 @@ where
         &mut self,
         lease_for: chrono::Duration,
     ) -> Result<(), AccountLeaseError> {
-        self.lease.heartbeat(lease_for).await
+        self.lease_mut().heartbeat(lease_for).await
     }
 
     /// Starts the periodic lease heartbeat for a long-running authenticated
@@ -888,7 +922,7 @@ where
                 "authenticated lease heartbeat is already running".to_owned(),
             ));
         }
-        self.lease_heartbeat = Some(self.lease.start_heartbeat(heartbeat_for, lease_for)?);
+        self.lease_heartbeat = Some(self.lease().start_heartbeat(heartbeat_for, lease_for)?);
         Ok(())
     }
 
@@ -903,7 +937,7 @@ where
 
     /// Proves that no background heartbeat has lost this session's lease.
     pub(crate) fn ensure_usable(&self) -> Result<(), AccountLeaseError> {
-        self.lease.ensure_usable()
+        self.lease().ensure_usable()
     }
 
     /// Proves account-lease liveness immediately before one authenticated
@@ -917,38 +951,104 @@ where
         &mut self,
         lease_for: chrono::Duration,
     ) -> Result<AuthenticatedRequest<'_, R>, AccountLeaseError> {
-        self.lease.heartbeat(lease_for).await?;
+        self.lease_mut().heartbeat(lease_for).await?;
         Ok(AuthenticatedRequest { session: self })
     }
 
     /// Releases the durable account lease and then drops local browser capacity.
-    pub async fn release(self) -> Result<(), AccountLeaseError> {
-        let Self {
-            _permit,
-            mut client,
-            lease,
-            lease_heartbeat,
-            ..
-        } = self;
-        let heartbeat_error = if let Some(mut heartbeat) = lease_heartbeat {
-            heartbeat.stop().await.err()
-        } else {
-            None
-        };
-        let cleanup_error = if let Some(client) = client.take() {
+    pub async fn release(mut self) -> Result<(), AccountLeaseError> {
+        // Keep the WebDriver owned by the session until heartbeat shutdown has
+        // completed. If this future is cancelled while waiting for the
+        // heartbeat task, Drop must still be able to hand the client to the
+        // asynchronous cleanup closure instead of synchronously dropping it
+        // on the Tokio executor.
+        let heartbeat_error = self.stop_lease_heartbeat().await.err();
+        let cleanup_error = if let Some(client) = self.client.take() {
             close_webdriver(client).await.err().map(|error| {
                 AccountLeaseError::Backend(format!("authenticated browser cleanup failed: {error}"))
             })
         } else {
             None
         };
-        let lease_result = lease.release().await;
+        let lease_result = self.lease().release().await;
+        if lease_result.is_ok() {
+            self.lease.take();
+            self.cleanup.take();
+        }
         match (lease_result, cleanup_error) {
             (Err(error), _) => Err(error),
             (Ok(()), Some(error)) => Err(heartbeat_error.unwrap_or(error)),
             (Ok(()), None) => heartbeat_error.map_or(Ok(()), Err),
         }
     }
+
+    fn lease(&self) -> &AccountLeaseGuard<R> {
+        self.lease
+            .as_ref()
+            .expect("authenticated session must own an account lease")
+    }
+
+    fn lease_mut(&mut self) -> &mut AccountLeaseGuard<R> {
+        self.lease
+            .as_mut()
+            .expect("authenticated session must own an account lease")
+    }
+}
+
+impl<R> Drop for AuthenticatedBrowserSession<R>
+where
+    R: AccountLeaseStore,
+{
+    fn drop(&mut self) {
+        let Some(cleanup) = self.cleanup.take() else {
+            return;
+        };
+        cleanup(
+            self.lease.take(),
+            self.client.take(),
+            self.lease_heartbeat.take(),
+        );
+    }
+}
+
+fn schedule_authenticated_session_cleanup<R>(
+    runtime: Option<Handle>,
+    lease: Option<AccountLeaseGuard<R>>,
+    client: Option<WebDriver>,
+    heartbeat: Option<AccountLeaseHeartbeat>,
+) where
+    R: AccountLeaseStore + 'static,
+{
+    let account_id = lease.as_ref().map(AccountLeaseGuard::account_id);
+    drop(heartbeat);
+    let Some(runtime) = runtime else {
+        tracing::warn!(
+            account_id = ?account_id,
+            "authenticated session dropped outside a Tokio runtime; account lease will expire"
+        );
+        return;
+    };
+
+    runtime.spawn(async move {
+        if let Some(lease) = lease {
+            if let Err(error) = lease.release().await {
+                tracing::warn!(
+                    account_id = ?account_id,
+                    error = %error,
+                    "unable to release authenticated account lease after cancellation"
+                );
+            }
+        }
+        if let Some(client) = client {
+            if let Err(error) = close_webdriver(client).await {
+                tracing::warn!(
+                    account_id = ?account_id,
+                    error = %error,
+                    "unable to close authenticated WebDriver session after cancellation"
+                );
+            }
+        }
+    });
 }
 
 impl<R> std::fmt::Debug for AuthenticatedBrowserSession<R>
@@ -979,23 +1079,63 @@ where
 /// The cloned handle is leaked in every non-success path, which marks the
 /// remote session as abandoned while the cleanup task may still finish.
 async fn close_webdriver(client: WebDriver) -> Result<(), &'static str> {
-    let abandon_guard = client.clone();
-    let cleanup = tokio::spawn(async move { client.quit().await });
+    let mut abandon_guard = WebDriverCleanupGuard(Some(client.clone()));
+    let cleanup = tokio::spawn(async move {
+        let result = client.clone().quit().await;
+        if result.is_err() {
+            let _ = client.leak();
+        }
+        result
+    });
     match tokio::time::timeout(WEBDRIVER_CLEANUP_TIMEOUT, cleanup).await {
-        Ok(Ok(Ok(()))) => Ok(()),
-        Ok(Ok(Err(_error))) => {
-            let _ = abandon_guard.leak();
-            Err("WebDriver quit command failed")
+        Ok(Ok(Ok(()))) => {
+            // A successful quit marks the shared session as closed, so the
+            // clone used as the cancellation guard can be dropped normally.
+            // Keeping it leaked here would retain the session handle forever.
+            abandon_guard.disarm();
+            Ok(())
         }
-        Ok(Err(_error)) => {
-            let _ = abandon_guard.leak();
-            Err("WebDriver cleanup task failed")
-        }
-        Err(_) => {
-            let _ = abandon_guard.leak();
-            Err("WebDriver cleanup timed out")
+        Ok(Ok(Err(_error))) => Err("WebDriver quit command failed"),
+        Ok(Err(_error)) => Err("WebDriver cleanup task failed"),
+        Err(_) => Err("WebDriver cleanup timed out"),
+    }
+}
+
+struct WebDriverCleanupGuard(Option<WebDriver>);
+
+impl WebDriverCleanupGuard {
+    fn disarm(&mut self) {
+        self.0.take();
+    }
+}
+
+impl Drop for WebDriverCleanupGuard {
+    fn drop(&mut self) {
+        if let Some(client) = self.0.take() {
+            let _ = client.leak();
         }
     }
+}
+
+fn schedule_public_session_cleanup(runtime: Option<Handle>, client: Option<WebDriver>) {
+    let Some(client) = client else {
+        return;
+    };
+    let Some(runtime) = runtime else {
+        tracing::warn!(
+            "public browser session dropped outside a Tokio runtime; remote session may remain"
+        );
+        let _ = client.leak();
+        return;
+    };
+    runtime.spawn(async move {
+        if let Err(error) = close_webdriver(client).await {
+            tracing::warn!(
+                error = %error,
+                "unable to close public WebDriver session after cancellation"
+            );
+        }
+    });
 }
 
 impl<R> AuthenticatedRequest<'_, R>
@@ -1003,11 +1143,11 @@ where
     R: AccountLeaseStore,
 {
     pub(crate) fn ensure_usable(&self) -> Result<(), AccountLeaseError> {
-        self.session.lease.ensure_usable()
+        self.session.lease().ensure_usable()
     }
 
     /// Returns the account identity whose lease was just proven live.
-    pub const fn account_id(&self) -> crate::domain::credentials::WeReadAccountId {
+    pub fn account_id(&self) -> crate::domain::credentials::WeReadAccountId {
         self.session.account_id()
     }
 
@@ -1232,6 +1372,42 @@ mod tests {
     async fn failing_quit_driver() -> WebDriver {
         WebDriver::builder("http://webdriver.test", DesiredCapabilities::firefox())
             .client(FailingQuitHttpClient)
+            .connect()
+            .await
+            .expect("the fake WebDriver should accept session setup")
+    }
+
+    #[derive(Debug, Clone)]
+    struct RecordingQuitHttpClient {
+        quit_thread: Arc<Mutex<Option<std::thread::ThreadId>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl HttpClient for RecordingQuitHttpClient {
+        async fn send(&self, request: Request<Body<'_>>) -> WebDriverResult<Response<Bytes>> {
+            if request.method() == Method::DELETE {
+                *self.quit_thread.lock().unwrap() = Some(std::thread::current().id());
+                return webdriver_json_response(Value::Null);
+            }
+            if request.method() == Method::POST && request.uri().path().ends_with("/session") {
+                return webdriver_json_response(json!({
+                    "sessionId": "test-session",
+                    "capabilities": {}
+                }));
+            }
+            webdriver_json_response(Value::Null)
+        }
+
+        async fn new(&self) -> Arc<dyn HttpClient> {
+            Arc::new(self.clone())
+        }
+    }
+
+    async fn recording_quit_driver(
+        quit_thread: Arc<Mutex<Option<std::thread::ThreadId>>>,
+    ) -> WebDriver {
+        WebDriver::builder("http://webdriver.test", DesiredCapabilities::firefox())
+            .client(RecordingQuitHttpClient { quit_thread })
             .connect()
             .await
             .expect("the fake WebDriver should accept session setup")
@@ -1679,6 +1855,68 @@ mod tests {
         ));
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn dropping_a_public_session_closes_the_driver_on_the_async_runtime() {
+        let quit_thread = Arc::new(Mutex::new(None));
+        let pool = BrowserPool::new(1).unwrap();
+        let session = pool
+            .open_public()
+            .await
+            .unwrap()
+            .attach_client(recording_quit_driver(Arc::clone(&quit_thread)).await);
+        let runtime_thread = std::thread::current().id();
+
+        drop(session);
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if quit_thread.lock().unwrap().is_some() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("public-session drop should schedule WebDriver cleanup");
+        assert_eq!(*quit_thread.lock().unwrap(), Some(runtime_thread));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dropping_an_authenticated_session_closes_the_driver_on_the_async_runtime() {
+        let quit_thread = Arc::new(Mutex::new(None));
+        let repository = crate::persistence::repositories::account_lease_repository::
+            MemoryAccountLeaseRepository::new(chrono::Utc::now());
+        let account_id =
+            crate::domain::credentials::WeReadAccountId::from_uuid(uuid::Uuid::from_u128(1));
+        let pool = BrowserPool::new(1).unwrap();
+        let session = pool
+            .open_authenticated(
+                repository,
+                account_id,
+                "worker-a",
+                chrono::Duration::seconds(30),
+            )
+            .await
+            .unwrap()
+            .expect("the test worker should acquire the account")
+            .attach_client(recording_quit_driver(Arc::clone(&quit_thread)).await);
+        let runtime_thread = std::thread::current().id();
+
+        drop(session);
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if quit_thread.lock().unwrap().is_some() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("authenticated-session drop should schedule WebDriver cleanup");
+        assert_eq!(*quit_thread.lock().unwrap(), Some(runtime_thread));
+    }
+
     #[tokio::test]
     async fn authenticated_release_releases_the_lease_when_browser_cleanup_fails() {
         let repository = crate::persistence::repositories::account_lease_repository::
@@ -1710,6 +1948,50 @@ mod tests {
             .await
             .unwrap()
             .is_some());
+    }
+
+    #[tokio::test]
+    async fn dropping_authenticated_session_releases_the_account_lease() {
+        let repository = crate::persistence::repositories::account_lease_repository::
+            MemoryAccountLeaseRepository::new(chrono::Utc::now());
+        let account_id =
+            crate::domain::credentials::WeReadAccountId::from_uuid(uuid::Uuid::from_u128(1));
+        let pool = BrowserPool::new(1).unwrap();
+        let session = pool
+            .open_authenticated(
+                repository.clone(),
+                account_id,
+                "worker-a",
+                chrono::Duration::seconds(30),
+            )
+            .await
+            .unwrap()
+            .expect("the test worker should acquire the account");
+
+        drop(session);
+
+        let reacquired = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if let Some(lease) = repository
+                    .acquire(account_id, "worker-b", chrono::Duration::seconds(30))
+                    .await
+                    .unwrap()
+                {
+                    break lease;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("drop cleanup should release the account lease promptly");
+        repository
+            .release(
+                reacquired.account_id(),
+                reacquired.owner(),
+                reacquired.token(),
+            )
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

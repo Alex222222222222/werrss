@@ -127,6 +127,7 @@ keys in a secret manager or an ignored local environment file.
 | `JOB_POLL_SECONDS` | `30` | Scheduler/worker polling interval for due work and expired-job recovery. It must be positive. |
 | `JOB_LEASE_SECONDS` | `600` | Duration of a claimed job lease. It must exceed `JOB_HEARTBEAT_SECONDS` plus the maximum page-operation duration. |
 | `JOB_HEARTBEAT_SECONDS` | `60` | Maximum interval between job-lease heartbeats. It must be less than `JOB_LEASE_SECONDS`. |
+| `JOB_EXECUTION_TIMEOUT_SECONDS` | `1800` | Absolute wall-clock limit for one claimed job handler attempt. It is independent of lease heartbeats, must be positive, and is capped at 24 hours. A timed-out attempt is cancelled and recorded as retryable work. |
 | `JOB_MAX_ATTEMPTS` | `3` | Failure-attempt budget for retryable jobs. It must be positive. |
 | `ACCOUNT_LEASE_SECONDS` | `600` | Duration of an authenticated WeRead account lease. It must exceed its heartbeat interval. |
 | `ACCOUNT_HEARTBEAT_SECONDS` | `60` | Maximum interval between authenticated-account lease heartbeats. It must be less than `ACCOUNT_LEASE_SECONDS`. |
@@ -138,9 +139,9 @@ setting in the admin API and defaults to one hour for a newly created source.
 The next fetch is scheduled relative to the completion time of the previous
 sync.
 
-#### Job recovery
+#### Job recovery and execution timeout
 
-Jobs use a durable PostgreSQL lease rather than a hard execution timeout.
+Jobs use a durable PostgreSQL lease for ownership and crash recovery.
 `JOB_LEASE_SECONDS` (default `600`) is renewed by the worker every
 `JOB_HEARTBEAT_SECONDS` (default `60`). If a worker crashes, its `running` job
 becomes eligible for recovery after the lease expires. Recovery is designed to
@@ -148,12 +149,34 @@ increment the failure count and requeue the job, or mark it failed after
 `JOB_MAX_ATTEMPTS` is exhausted; the lease token also prevents a stale worker
 from completing a job after another worker takes it over.
 
+`JOB_EXECUTION_TIMEOUT_SECONDS` (default `1800`) is a separate absolute
+wall-clock deadline for each claimed handler attempt. Heartbeats keep the
+durable lease alive while a handler is running, but never extend this deadline.
+When the deadline expires, the worker cancels the handler and records a
+retryable timeout at the current queue time. The normal retry-attempt budget
+then decides whether the job is requeued or marked failed. This prevents a
+live but stuck handler from running forever while allowing deliberately long
+`PACING_REQUEST_*` delays within the configured execution budget.
+
+Authenticated browser sessions also clean up safely when cancellation drops
+them: account-lease release and remote browser close are scheduled on the
+active Tokio runtime. Normal handler completion should still call the session
+release method and await its result so cleanup failures remain observable.
+
+Public browser sessions use the same bounded asynchronous WebDriver cleanup
+when a timed-out article or identity operation is cancelled. Feed rebuilds
+heartbeat their distributed build lease at `FEED_BUILD_HEARTBEAT_SECONDS` and
+release it asynchronously if cancellation drops the rebuild before its
+publication transaction. This keeps the 30-minute default job timeout from
+being constrained by the default 10-minute build lease.
+
 The production worker performs a bounded `JobService::recover_expired` pass
 before each claim. Because `claim_next` only selects queued, retry-waiting, or
 deferred jobs, this pass is what makes an expired `running` row claimable again.
 PostgreSQL uses row locks and `SKIP LOCKED`, so concurrent worker replicas can
-recover the same queue without applying the transition twice. Heartbeat-active
-jobs have no maximum execution duration and may run indefinitely by design.
+recover the same queue without applying the transition twice. A timeout only
+covers handler execution; queue recovery, claiming, and the fenced outcome
+transaction remain separate database operations.
 
 ### RSS and feed-cache behavior
 

@@ -47,6 +47,10 @@
 //! Candidate timestamps come from the PostgreSQL clock supplied by the unit of
 //! work factory, so same-revision publication ordering is independent of a
 //! replica's local wall clock.
+//! When configured, a background heartbeat extends the build lease while the
+//! render is in progress. If cancellation drops the rebuild before the final
+//! publication transaction, an owned cleanup guard releases the lease on the
+//! active Tokio runtime rather than waiting for natural expiry.
 //! Rebuilding does not bump the revision because it only republishes the
 //! current normalized records. Article/source synchronization owns revision
 //! changes. Token rotation and revocation remain independent of this path.
@@ -57,8 +61,11 @@
 //! primary error is preserved; an unclean lease remains bounded by its durable
 //! expiry.
 
+use std::sync::Arc;
+
 use chrono::{DateTime, Duration, Utc};
 use thiserror::Error;
+use tokio::{runtime::Handle, task::JoinHandle, time};
 use url::Url;
 
 use crate::{
@@ -88,6 +95,7 @@ use crate::{
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FeedRebuildConfig {
     lease_for: Duration,
+    heartbeat_for: Option<Duration>,
     cache_ttl: Duration,
     feed_url: String,
     description: String,
@@ -114,6 +122,7 @@ impl FeedRebuildConfig {
         }
         Ok(Self {
             lease_for,
+            heartbeat_for: None,
             cache_ttl,
             feed_url,
             description: description.into(),
@@ -124,6 +133,28 @@ impl FeedRebuildConfig {
     /// Returns the duration for which the build fence is held.
     pub const fn lease_for(&self) -> Duration {
         self.lease_for
+    }
+
+    /// Configures the maximum interval between feed-build lease heartbeats.
+    ///
+    /// Production composition should enable this with the configured
+    /// `FEED_BUILD_HEARTBEAT_SECONDS` value. The optional setting keeps this
+    /// storage-neutral service usable by callers that intentionally rely only
+    /// on bounded lease expiry.
+    pub fn with_heartbeat(
+        mut self,
+        heartbeat_for: Duration,
+    ) -> Result<Self, FeedRebuildConfigError> {
+        if heartbeat_for <= Duration::zero() || heartbeat_for >= self.lease_for {
+            return Err(FeedRebuildConfigError::InvalidHeartbeatDuration);
+        }
+        self.heartbeat_for = Some(heartbeat_for);
+        Ok(self)
+    }
+
+    /// Returns the configured feed-build heartbeat interval, if enabled.
+    pub const fn heartbeat_for(&self) -> Option<Duration> {
+        self.heartbeat_for
     }
 
     /// Returns the freshness TTL assigned to a newly rendered cache row.
@@ -175,6 +206,9 @@ pub enum FeedRebuildConfigError {
     /// The build lease must protect rendering for a positive period.
     #[error("feed rebuild lease duration must be positive")]
     InvalidLeaseDuration,
+    /// A lease heartbeat must be positive and shorter than its lease.
+    #[error("feed rebuild heartbeat duration must be positive and shorter than the lease")]
+    InvalidHeartbeatDuration,
     /// A cache candidate must have a future expiry.
     #[error("feed rebuild cache TTL must be positive")]
     InvalidCacheTtl,
@@ -357,7 +391,7 @@ impl FeedRebuildUnitOfWorkFactory for UnitOfWorkFactory {
 pub struct FeedRebuildService<S, A, L, U> {
     sources: S,
     articles: A,
-    leases: L,
+    leases: Arc<L>,
     unit_of_work: U,
     config: FeedRebuildConfig,
     owner: String,
@@ -368,7 +402,7 @@ impl<S, A, L, U> FeedRebuildService<S, A, L, U>
 where
     S: SourceReader,
     A: ArticleRepository,
-    L: FeedBuildLeaseRepository,
+    L: FeedBuildLeaseRepository + 'static,
     U: FeedRebuildUnitOfWorkFactory,
 {
     /// Creates a rebuild service over the supplied persistence capabilities.
@@ -384,7 +418,7 @@ where
         Ok(Self {
             sources: dependencies.sources,
             articles: dependencies.articles,
-            leases: dependencies.leases,
+            leases: Arc::new(dependencies.leases),
             unit_of_work: dependencies.unit_of_work,
             config,
             owner: owner.trim().to_owned(),
@@ -475,9 +509,26 @@ where
         };
 
         let token = lease.token();
+        let mut lease_guard = FeedBuildLeaseGuard::new(
+            Arc::clone(&self.leases),
+            source_id,
+            self.owner.clone(),
+            token,
+            self.config.heartbeat_for(),
+            self.config.lease_for(),
+        );
         let result = self.rebuild_with_lease(source_id, lease, completion).await;
         if result.is_err() {
-            self.release_after_failure(source_id, token, &result).await;
+            if let Err(error) = lease_guard.release().await {
+                tracing::warn!(
+                    %source_id,
+                    error = %error,
+                    primary_error = ?result.as_ref().err(),
+                    "unable to release failed feed rebuild lease"
+                );
+            }
+        } else {
+            lease_guard.disarm().await;
         }
         match &result {
             Ok(outcome) => tracing::info!(
@@ -568,25 +619,137 @@ where
         tracing::debug!(source_id = %source_id, outcome = ?outcome, "published feed rebuild result");
         Ok(outcome)
     }
+}
 
-    async fn release_after_failure(
-        &self,
+struct FeedBuildLeaseGuard<L>
+where
+    L: FeedBuildLeaseRepository + 'static,
+{
+    repository: Option<Arc<L>>,
+    source_id: SourceId,
+    owner: String,
+    token: FeedBuildLeaseToken,
+    runtime: Option<Handle>,
+    heartbeat_task: Option<JoinHandle<()>>,
+}
+
+impl<L> FeedBuildLeaseGuard<L>
+where
+    L: FeedBuildLeaseRepository + 'static,
+{
+    fn new(
+        repository: Arc<L>,
         source_id: SourceId,
+        owner: String,
         token: FeedBuildLeaseToken,
-        result: &Result<FeedRebuildOutcome, FeedRebuildError>,
-    ) {
-        if let Err(error) = self
-            .leases
-            .release_build(source_id, &self.owner, token)
-            .await
-        {
-            tracing::warn!(
-                %source_id,
-                error = %error,
-                primary_error = ?result.as_ref().err(),
-                "unable to release failed feed rebuild lease"
-            );
+        heartbeat_for: Option<Duration>,
+        lease_for: Duration,
+    ) -> Self {
+        let runtime = Handle::try_current().ok();
+        let heartbeat_task = runtime
+            .as_ref()
+            .zip(heartbeat_for)
+            .map(|(runtime, heartbeat_for)| {
+                let repository = Arc::clone(&repository);
+                let owner = owner.clone();
+                let heartbeat_for = heartbeat_for
+                    .to_std()
+                    .expect("validated feed-build heartbeat must fit std duration");
+                runtime.spawn(async move {
+                    let mut interval =
+                        time::interval_at(time::Instant::now() + heartbeat_for, heartbeat_for);
+                    interval.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+                    loop {
+                        interval.tick().await;
+                        match repository
+                            .heartbeat_build(source_id, &owner, token, lease_for)
+                            .await
+                        {
+                            Ok(lease) => tracing::trace!(
+                                %source_id,
+                                lease_until = %lease.lease_until(),
+                                "renewed feed rebuild lease"
+                            ),
+                            Err(error) => {
+                                tracing::warn!(
+                                    %source_id,
+                                    error = %error,
+                                    "feed rebuild lease heartbeat stopped"
+                                );
+                                break;
+                            }
+                        }
+                    }
+                })
+            });
+
+        Self {
+            repository: Some(repository),
+            source_id,
+            owner,
+            token,
+            runtime,
+            heartbeat_task,
         }
+    }
+
+    async fn stop_heartbeat(&mut self) {
+        if let Some(task) = self.heartbeat_task.take() {
+            task.abort();
+            let _ = task.await;
+        }
+    }
+
+    async fn release(&mut self) -> Result<(), FeedBuildLeaseError> {
+        self.stop_heartbeat().await;
+        let Some(repository) = self.repository.as_ref().cloned() else {
+            return Ok(());
+        };
+        let result = repository
+            .release_build(self.source_id, &self.owner, self.token)
+            .await;
+        if result.is_ok() {
+            self.repository.take();
+        }
+        result
+    }
+
+    async fn disarm(&mut self) {
+        self.stop_heartbeat().await;
+        self.repository.take();
+    }
+}
+
+impl<L> Drop for FeedBuildLeaseGuard<L>
+where
+    L: FeedBuildLeaseRepository + 'static,
+{
+    fn drop(&mut self) {
+        if let Some(task) = self.heartbeat_task.take() {
+            task.abort();
+        }
+        let Some(repository) = self.repository.take() else {
+            return;
+        };
+        let Some(runtime) = self.runtime.clone() else {
+            tracing::warn!(
+                source_id = %self.source_id,
+                "feed rebuild lease dropped outside a Tokio runtime; lease will expire"
+            );
+            return;
+        };
+        let source_id = self.source_id;
+        let owner = self.owner.clone();
+        let token = self.token;
+        runtime.spawn(async move {
+            if let Err(error) = repository.release_build(source_id, &owner, token).await {
+                tracing::warn!(
+                    %source_id,
+                    error = %error,
+                    "unable to release feed rebuild lease after cancellation"
+                );
+            }
+        });
     }
 }
 
@@ -595,7 +758,7 @@ impl<S, A, L, U> FeedRebuilder for FeedRebuildService<S, A, L, U>
 where
     S: SourceReader,
     A: ArticleRepository,
-    L: FeedBuildLeaseRepository,
+    L: FeedBuildLeaseRepository + 'static,
     U: FeedRebuildUnitOfWorkFactory,
 {
     async fn rebuild(&self, source_id: SourceId) -> Result<FeedRebuildOutcome, FeedRebuildError> {
@@ -630,7 +793,7 @@ mod tests {
     use std::sync::Arc;
 
     use chrono::{DateTime, Duration, TimeZone, Utc};
-    use tokio::sync::Mutex;
+    use tokio::sync::{Mutex, Notify};
     use uuid::Uuid;
 
     use super::*;
@@ -678,6 +841,63 @@ mod tests {
                 .as_ref()
                 .filter(|source| source.book_id() == book_id)
                 .cloned())
+        }
+    }
+
+    #[derive(Clone, Copy, Default)]
+    struct PendingSources;
+
+    #[async_trait::async_trait]
+    impl SourceReader for PendingSources {
+        async fn find(&self, _source_id: SourceId) -> Result<Option<Source>, SourceServiceError> {
+            std::future::pending().await
+        }
+
+        async fn find_by_book_id(
+            &self,
+            _book_id: &str,
+        ) -> Result<Option<Source>, SourceServiceError> {
+            std::future::pending().await
+        }
+    }
+
+    #[derive(Clone)]
+    struct LeaseHeartbeatProbe {
+        inner: MemoryFeedBuildLeaseRepository,
+        heartbeat: Arc<Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl FeedBuildLeaseRepository for LeaseHeartbeatProbe {
+        async fn acquire_build(
+            &self,
+            source_id: SourceId,
+            owner: &str,
+            lease_for: Duration,
+        ) -> Result<Option<FeedBuildLease>, FeedBuildLeaseError> {
+            self.inner.acquire_build(source_id, owner, lease_for).await
+        }
+
+        async fn heartbeat_build(
+            &self,
+            source_id: SourceId,
+            owner: &str,
+            token: FeedBuildLeaseToken,
+            lease_for: Duration,
+        ) -> Result<FeedBuildLease, FeedBuildLeaseError> {
+            self.heartbeat.notify_one();
+            self.inner
+                .heartbeat_build(source_id, owner, token, lease_for)
+                .await
+        }
+
+        async fn release_build(
+            &self,
+            source_id: SourceId,
+            owner: &str,
+            token: FeedBuildLeaseToken,
+        ) -> Result<(), FeedBuildLeaseError> {
+            self.inner.release_build(source_id, owner, token).await
         }
     }
 
@@ -1095,6 +1315,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancelling_a_rebuild_releases_the_build_lease() {
+        let leases = MemoryFeedBuildLeaseRepository::new(timestamp(0));
+        let service = FeedRebuildService::new(
+            FeedRebuildDependencies::new(
+                PendingSources,
+                FakeArticles,
+                leases.clone(),
+                FakeUnitOfWorkFactory::default(),
+            ),
+            FeedRebuildConfig::new(
+                Duration::minutes(1),
+                Duration::minutes(1),
+                "https://rss.example.test/feed.xml",
+                "description",
+            )
+            .unwrap()
+            .with_heartbeat(Duration::seconds(1))
+            .unwrap(),
+            "builder-a",
+        )
+        .unwrap();
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(10),
+            service.rebuild(source_id()),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "the pending source read should be cancelled"
+        );
+
+        let reacquired = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if let Some(lease) = leases
+                    .acquire_build(source_id(), "builder-b", Duration::minutes(1))
+                    .await
+                    .unwrap()
+                {
+                    break lease;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancellation should release the feed-build lease promptly");
+        leases
+            .release_build(source_id(), "builder-b", reacquired.token())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn feed_build_lease_heartbeat_extends_a_live_lease() {
+        let start = timestamp(0);
+        let inner = MemoryFeedBuildLeaseRepository::new(start);
+        let probe = LeaseHeartbeatProbe {
+            inner: inner.clone(),
+            heartbeat: Arc::new(Notify::new()),
+        };
+        let lease = probe
+            .acquire_build(source_id(), "builder-a", Duration::milliseconds(100))
+            .await
+            .unwrap()
+            .expect("the probe should acquire the source");
+        inner.set_now(start + Duration::milliseconds(80)).await;
+        let mut guard = FeedBuildLeaseGuard::new(
+            Arc::new(probe.clone()),
+            source_id(),
+            "builder-a".to_owned(),
+            lease.token(),
+            Some(Duration::milliseconds(5)),
+            Duration::milliseconds(100),
+        );
+
+        probe.heartbeat.notified().await;
+        inner.set_now(start + Duration::milliseconds(120)).await;
+        assert!(probe
+            .acquire_build(source_id(), "builder-b", Duration::milliseconds(100))
+            .await
+            .unwrap()
+            .is_none());
+        guard.disarm().await;
+    }
+
+    #[tokio::test]
     async fn active_lease_is_reported_without_reading_the_source() {
         let leases = MemoryFeedBuildLeaseRepository::new(timestamp(0));
         leases
@@ -1127,6 +1433,28 @@ mod tests {
         assert_eq!(
             FeedRebuildConfig::new(Duration::minutes(1), Duration::zero(), "url", "description"),
             Err(FeedRebuildConfigError::InvalidCacheTtl)
+        );
+        assert_eq!(
+            FeedRebuildConfig::new(
+                Duration::minutes(1),
+                Duration::minutes(1),
+                "url",
+                "description"
+            )
+            .unwrap()
+            .with_heartbeat(Duration::zero()),
+            Err(FeedRebuildConfigError::InvalidHeartbeatDuration)
+        );
+        assert_eq!(
+            FeedRebuildConfig::new(
+                Duration::minutes(1),
+                Duration::minutes(1),
+                "url",
+                "description"
+            )
+            .unwrap()
+            .with_heartbeat(Duration::minutes(1)),
+            Err(FeedRebuildConfigError::InvalidHeartbeatDuration)
         );
         assert_eq!(
             FeedRebuildConfig::new(

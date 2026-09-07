@@ -1,3 +1,11 @@
+use std::{
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::Duration as StdDuration,
+};
+
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use serde_json::json;
 use sqlx::PgPool;
@@ -22,6 +30,27 @@ struct FixedHandler {
 impl JobHandler for FixedHandler {
     async fn execute(&self, _lease: &JobLease, _now: DateTime<Utc>) -> JobExecution {
         self.outcome.clone()
+    }
+}
+
+struct CancellationProbe(Arc<AtomicBool>);
+
+impl Drop for CancellationProbe {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
+struct HangingHandler {
+    cancelled: Arc<AtomicBool>,
+}
+
+#[async_trait::async_trait]
+impl JobHandler for HangingHandler {
+    async fn execute(&self, _lease: &JobLease, _now: DateTime<Utc>) -> JobExecution {
+        let _probe = CancellationProbe(self.cancelled.clone());
+        std::future::pending::<()>().await;
+        unreachable!("the execution timeout should cancel this handler")
     }
 }
 
@@ -175,6 +204,67 @@ async fn worker_retries_through_the_shared_unit_of_work_and_records_failure_stat
         .expect("retried job should remain");
     assert_eq!(persisted.status(), JobStatus::RetryWait);
     assert_eq!(persisted.failure_count(), 1);
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn worker_timeout_requeues_a_postgres_job_for_a_later_worker(pool: PgPool) {
+    let queue = PostgresJobRepository::new(pool.clone());
+    let job_id = enqueue_job(&queue, "shared-uow-timeout").await;
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let first_worker = Worker::new(
+        JobService::new(
+            queue.clone(),
+            JobServiceConfig::new("worker-timeout", Duration::seconds(30), 1)
+                .expect("job service configuration should be valid"),
+        ),
+        UnitOfWorkFactory::new(pool.clone()),
+        HangingHandler {
+            cancelled: cancelled.clone(),
+        },
+        WorkerConfig::new_with_execution_timeout(
+            vec![JobType::SourceSync],
+            StdDuration::from_secs(1),
+            StdDuration::from_millis(20),
+        )
+        .expect("worker configuration should be valid"),
+    )
+    .expect("worker should be valid");
+
+    let result = first_worker
+        .run_once(timestamp(1))
+        .await
+        .expect("worker should persist a timeout retry");
+    let WorkerRun::Completed { job, outcome } = result else {
+        panic!("a due job should receive a timeout outcome")
+    };
+    assert_eq!(job.id(), job_id);
+    assert!(matches!(
+        outcome,
+        JobExecution::Retry { retry_at, error }
+            if retry_at == timestamp(1) && error.contains("job execution timed out")
+    ));
+    assert_eq!(job.status(), JobStatus::RetryWait);
+    assert_eq!(job.failure_count(), 1);
+    assert!(job.lease_owner().is_none());
+    assert!(cancelled.load(Ordering::Relaxed));
+
+    let second_worker = worker(
+        queue.clone(),
+        UnitOfWorkFactory::new(pool),
+        JobExecution::Succeeded,
+    );
+    let result = second_worker
+        .run_once(timestamp(1))
+        .await
+        .expect("a later worker should reclaim the timed-out job");
+    let WorkerRun::Completed { job, outcome } = result else {
+        panic!("the retried job should be claimable")
+    };
+    assert_eq!(job.id(), job_id);
+    assert_eq!(outcome, JobExecution::Succeeded);
+    assert_eq!(job.status(), JobStatus::Succeeded);
+    assert_eq!(job.claim_count(), 2);
+    assert_eq!(job.failure_count(), 1);
 }
 
 fn worker(

@@ -11,7 +11,9 @@ use std::{
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use serde_json::json;
 use tokio::sync::{watch, Mutex};
+use uuid::Uuid;
 use werrss::{
+    acquisition::{browser_pool::AccountLeaseStore, browser_pool::BrowserPool},
     application::{
         job_service::{JobService, JobServiceConfig},
         worker::{
@@ -19,7 +21,9 @@ use werrss::{
             WorkerLoopStats, WorkerRun,
         },
     },
+    domain::credentials::WeReadAccountId,
     domain::job::{JobStatus, JobType, NewJob},
+    persistence::repositories::account_lease_repository::MemoryAccountLeaseRepository,
     persistence::repositories::job_repository::{
         EnqueueResult, JobLease, JobQueue, JobRepository, JobRepositoryTransaction,
         MemoryJobRepository,
@@ -149,6 +153,33 @@ impl JobHandler for CloseSenderHandler {
     async fn execute(&self, _lease: &JobLease, _now: DateTime<Utc>) -> JobExecution {
         self.calls.fetch_add(1, Ordering::Relaxed);
         drop(self.shutdown.lock().await.take());
+        JobExecution::Succeeded
+    }
+}
+
+#[derive(Clone)]
+struct AuthenticatedHangingHandler {
+    browser_pool: BrowserPool,
+    leases: MemoryAccountLeaseRepository,
+    account_id: WeReadAccountId,
+}
+
+#[async_trait::async_trait]
+impl JobHandler for AuthenticatedHangingHandler {
+    async fn execute(&self, _lease: &JobLease, _now: DateTime<Utc>) -> JobExecution {
+        let _session = self
+            .browser_pool
+            .open_authenticated(
+                self.leases.clone(),
+                self.account_id,
+                "integration-timeout-worker",
+                Duration::seconds(30),
+            )
+            .await
+            .expect("authenticated browser acquisition should succeed")
+            .expect("the integration worker should acquire the account lease");
+
+        std::future::pending::<()>().await;
         JobExecution::Succeeded
     }
 }
@@ -351,6 +382,69 @@ async fn retry_outcome_increments_failure_count_without_running_a_second_job() {
         worker.run_once(at(2)).await.expect("worker should wait"),
         WorkerRun::Idle
     );
+}
+
+#[tokio::test]
+async fn timed_out_authenticated_handler_releases_account_lease() {
+    let repository = MemoryJobRepository::new();
+    repository
+        .enqueue(job("authenticated-timeout", JobType::SourceSync))
+        .await
+        .expect("job should enqueue");
+    let leases = MemoryAccountLeaseRepository::new(Utc::now());
+    let account_id = WeReadAccountId::from_uuid(Uuid::from_u128(1));
+    let worker = Worker::new(
+        JobService::new(
+            repository.clone(),
+            JobServiceConfig::new("integration-timeout", Duration::seconds(1), 2)
+                .expect("job service configuration should be valid"),
+        ),
+        repository,
+        AuthenticatedHangingHandler {
+            browser_pool: BrowserPool::new(1).expect("browser pool should be valid"),
+            leases: leases.clone(),
+            account_id,
+        },
+        WorkerConfig::new_with_execution_timeout(
+            vec![JobType::SourceSync],
+            StdDuration::from_millis(5),
+            StdDuration::from_millis(50),
+        )
+        .expect("worker configuration should be valid"),
+    )
+    .expect("worker configuration should match the job lease");
+
+    let WorkerRun::Completed { outcome, .. } = worker
+        .run_once(at(1))
+        .await
+        .expect("timed-out work should be converted into a retry")
+    else {
+        panic!("the authenticated job should be claimed")
+    };
+    assert!(matches!(outcome, JobExecution::Retry { .. }));
+
+    let reacquired = tokio::time::timeout(StdDuration::from_secs(1), async {
+        loop {
+            if let Some(lease) = leases
+                .acquire(account_id, "integration-reclaimer", Duration::seconds(30))
+                .await
+                .expect("account lease lookup should succeed")
+            {
+                break lease;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("dropping timed-out work should release the account lease promptly");
+    leases
+        .release(
+            reacquired.account_id(),
+            reacquired.owner(),
+            reacquired.token(),
+        )
+        .await
+        .expect("the test reclaimer should release the account lease");
 }
 
 #[tokio::test]

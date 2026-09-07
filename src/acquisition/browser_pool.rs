@@ -17,7 +17,9 @@
 //! leases prevent duplicate source work, while the repository-backed account
 //! lease serializes authenticated use of one account across replicas. The
 //! browser pool is not a distributed lock and must not replace either durable
-//! lease.
+//! lease. Authenticated browser sessions schedule best-effort durable lease
+//! cleanup when cancellation drops them; callers should still explicitly
+//! release sessions on normal completion so remote browser cleanup is awaited.
 //!
 //! Non-responsibilities: WebDriver commands, navigation, article parsing,
 //! source scheduling, credential persistence, or RSS caching. Sidecar health
@@ -301,16 +303,18 @@ where
     /// This is explicit because Rust `Drop` cannot await a database call. If a
     /// guard is dropped without release, its durable lease remains protected
     /// by its expiry and can be recovered by another worker after expiration.
-    pub async fn release(self) -> Result<(), AccountLeaseError> {
-        let Self {
-            repository,
-            lease,
-            cancelled,
-        } = self;
-        cancelled.store(true, Ordering::Release);
-        let account_id = lease.account_id();
-        let result = repository
-            .release(lease.account_id(), lease.owner(), lease.token())
+    /// Borrowing the guard keeps its lease metadata available if a caller's
+    /// future is cancelled while the release request is in flight.
+    pub async fn release(&self) -> Result<(), AccountLeaseError> {
+        self.cancelled.store(true, Ordering::Release);
+        let account_id = self.account_id();
+        let result = self
+            .repository
+            .release(
+                self.lease.account_id(),
+                self.lease.owner(),
+                self.lease.token(),
+            )
             .await;
         match &result {
             Ok(()) => tracing::debug!(account_id = %account_id, "released WeRead account lease"),
@@ -321,10 +325,10 @@ where
         result
     }
 
-    pub(crate) fn into_session(
-        self,
-        permit: OwnedSemaphorePermit,
-    ) -> AuthenticatedBrowserSession<R> {
+    pub(crate) fn into_session(self, permit: OwnedSemaphorePermit) -> AuthenticatedBrowserSession<R>
+    where
+        R: 'static,
+    {
         AuthenticatedBrowserSession::from_permit(permit, self)
     }
 }
@@ -415,7 +419,7 @@ impl BrowserPool {
         lease_for: Duration,
     ) -> Result<Option<AuthenticatedBrowserSession<R>>, BrowserPoolError>
     where
-        R: AccountLeaseStore,
+        R: AccountLeaseStore + 'static,
     {
         tracing::trace!(account_id = %account_id, "acquiring authenticated browser capacity");
         let permit = match self.permits.clone().acquire_owned().await {

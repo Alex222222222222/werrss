@@ -922,12 +922,18 @@ impl RuntimeSupervisor {
             .server_root_url
             .as_ref()
             .ok_or(RuntimeSupervisorError::ServerRootUrlNotConfigured)?;
+        let heartbeat_for = chrono_duration(
+            self.config.feed_build_heartbeat,
+            "FEED_BUILD_HEARTBEAT_SECONDS",
+        )?;
         let rebuild_config = FeedRebuildConfig::new(
             lease_for,
             cache_ttl,
             feed_url.as_str(),
             "WeChat article feed",
         )
+        .map_err(RuntimeSupervisorError::FeedRebuildConfig)?
+        .with_heartbeat(heartbeat_for)
         .map_err(RuntimeSupervisorError::FeedRebuildConfig)?;
         if self.config.asset_use_absolute_urls {
             Ok(rebuild_config.with_asset_url_root(feed_url.clone()))
@@ -1439,6 +1445,7 @@ mod tests {
             rebuild_config.feed_url(),
             "https://feeds.example.test/werrss.xml"
         );
+        assert_eq!(rebuild_config.heartbeat_for(), Some(Duration::minutes(1)));
     }
 
     #[tokio::test]

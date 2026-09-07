@@ -22,7 +22,7 @@
 //! APP_INSTANCE_ID / HTTP_BIND / HTTP_PORT / APP_ROLES / LOG_LEVEL
 //! APP_TIMEZONE / QUIET_HOURS_START / QUIET_HOURS_END
 //! JOB_POLL_SECONDS / JOB_LEASE_SECONDS / JOB_HEARTBEAT_SECONDS /
-//! JOB_MAX_ATTEMPTS
+//! JOB_EXECUTION_TIMEOUT_SECONDS / JOB_MAX_ATTEMPTS
 //! ACCOUNT_LEASE_SECONDS / ACCOUNT_HEARTBEAT_SECONDS
 //! SOURCE_FAILURE_COOLDOWN_SECONDS
 //! RSS_CACHE_TTL_SECONDS / RSS_STALE_WHILE_REVALIDATE_SECONDS /
@@ -85,6 +85,7 @@ use crate::{
 
 const MAX_CONFIGURED_DELAY_MS: f64 = 300_000.0;
 const MAX_PAGE_OPERATION_SECONDS: u64 = 3_600;
+const MAX_JOB_EXECUTION_TIMEOUT_SECONDS: u64 = 24 * 60 * 60;
 const MAX_WORKER_CONCURRENCY: u32 = 1_024;
 const MAX_SOURCE_FAILURE_COOLDOWN_SECONDS: u64 = 7 * 24 * 60 * 60;
 const MAX_STALE_WHILE_REVALIDATE_SECONDS: u64 = 24 * 60 * 60;
@@ -121,6 +122,7 @@ const KNOWN_ENVIRONMENT_VARIABLES: &[&str] = &[
     "JOB_POLL_SECONDS",
     "JOB_LEASE_SECONDS",
     "JOB_HEARTBEAT_SECONDS",
+    "JOB_EXECUTION_TIMEOUT_SECONDS",
     "JOB_MAX_ATTEMPTS",
     "ACCOUNT_LEASE_SECONDS",
     "ACCOUNT_HEARTBEAT_SECONDS",
@@ -413,6 +415,8 @@ pub struct AppConfig {
     pub job_lease: Duration,
     /// Maximum interval between worker lease heartbeats.
     pub job_heartbeat: Duration,
+    /// Absolute wall-clock limit for one claimed job execution.
+    pub job_execution_timeout: Duration,
     /// Maximum attempts for retryable jobs.
     pub job_max_attempts: u32,
     /// Duration for which one authenticated account may be leased.
@@ -610,6 +614,11 @@ impl AppConfig {
             raw.job_heartbeat_seconds.unwrap_or(60),
             "JOB_HEARTBEAT_SECONDS",
         )?;
+        let job_execution_timeout_seconds = bounded_positive_u64(
+            raw.job_execution_timeout_seconds.unwrap_or(30 * 60),
+            "JOB_EXECUTION_TIMEOUT_SECONDS",
+            MAX_JOB_EXECUTION_TIMEOUT_SECONDS,
+        )?;
         if job_heartbeat_seconds >= job_lease_seconds {
             return Err(ConfigError::InvalidValue {
                 variable: "JOB_LEASE_SECONDS",
@@ -788,6 +797,7 @@ impl AppConfig {
             job_poll_interval: Duration::from_secs(job_poll_seconds),
             job_lease: Duration::from_secs(job_lease_seconds),
             job_heartbeat: Duration::from_secs(job_heartbeat_seconds),
+            job_execution_timeout: Duration::from_secs(job_execution_timeout_seconds),
             job_max_attempts,
             account_lease: Duration::from_secs(account_lease_seconds),
             account_heartbeat: Duration::from_secs(account_heartbeat_seconds),
@@ -845,6 +855,7 @@ struct RawConfig {
     job_poll_seconds: Option<u64>,
     job_lease_seconds: Option<u64>,
     job_heartbeat_seconds: Option<u64>,
+    job_execution_timeout_seconds: Option<u64>,
     job_max_attempts: Option<u32>,
     account_lease_seconds: Option<u64>,
     account_heartbeat_seconds: Option<u64>,
@@ -1454,6 +1465,7 @@ mod tests {
         assert_eq!(config.timezone, chrono_tz::Asia::Shanghai);
         assert_eq!(config.job_lease, Duration::from_secs(120));
         assert_eq!(config.job_heartbeat, Duration::from_secs(60));
+        assert_eq!(config.job_execution_timeout, Duration::from_secs(1_800));
         assert_eq!(config.account_lease, Duration::from_secs(600));
         assert_eq!(config.account_heartbeat, Duration::from_secs(60));
         assert_eq!(config.source_failure_cooldown, Duration::from_secs(300));
@@ -2128,6 +2140,47 @@ mod tests {
             AppConfig::from_env_iter(environment),
             Err(ConfigError::InvalidValue {
                 variable: "HTTP_BIND",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn accepts_a_configured_job_execution_timeout() {
+        let environment =
+            replace_environment(valid_environment(), "JOB_EXECUTION_TIMEOUT_SECONDS", "90");
+
+        let config = AppConfig::from_env_iter(environment).unwrap();
+
+        assert_eq!(config.job_execution_timeout, Duration::from_secs(90));
+    }
+
+    #[test]
+    fn rejects_a_zero_job_execution_timeout() {
+        let environment =
+            replace_environment(valid_environment(), "JOB_EXECUTION_TIMEOUT_SECONDS", "0");
+
+        assert!(matches!(
+            AppConfig::from_env_iter(environment),
+            Err(ConfigError::InvalidValue {
+                variable: "JOB_EXECUTION_TIMEOUT_SECONDS",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn rejects_an_oversized_job_execution_timeout() {
+        let environment = replace_environment(
+            valid_environment(),
+            "JOB_EXECUTION_TIMEOUT_SECONDS",
+            &(MAX_JOB_EXECUTION_TIMEOUT_SECONDS + 1).to_string(),
+        );
+
+        assert!(matches!(
+            AppConfig::from_env_iter(environment),
+            Err(ConfigError::InvalidValue {
+                variable: "JOB_EXECUTION_TIMEOUT_SECONDS",
                 ..
             })
         ));

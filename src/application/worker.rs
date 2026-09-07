@@ -113,14 +113,36 @@ pub trait BrowserJobReadiness: Send + Sync {
 pub struct WorkerConfig {
     allowed_job_types: Vec<JobType>,
     heartbeat_every: StdDuration,
+    execution_timeout: StdDuration,
 }
 
 impl WorkerConfig {
+    /// Default maximum wall-clock duration for one claimed job execution.
+    pub const DEFAULT_EXECUTION_TIMEOUT: StdDuration = StdDuration::from_secs(30 * 60);
+
     /// Creates a worker policy. An empty allowed-kind list is rejected so a
     /// configured worker cannot appear healthy while it can never claim work.
+    /// The default execution timeout is thirty minutes.
     pub fn new(
         allowed_job_types: impl Into<Vec<JobType>>,
         heartbeat_every: StdDuration,
+    ) -> Result<Self, WorkerConfigError> {
+        Self::new_with_execution_timeout(
+            allowed_job_types,
+            heartbeat_every,
+            Self::DEFAULT_EXECUTION_TIMEOUT,
+        )
+    }
+
+    /// Creates a worker policy with an explicit per-attempt execution timeout.
+    ///
+    /// The timeout is an absolute wall-clock deadline for the handler. Lease
+    /// heartbeats keep the durable job claim alive, but do not extend this
+    /// deadline.
+    pub fn new_with_execution_timeout(
+        allowed_job_types: impl Into<Vec<JobType>>,
+        heartbeat_every: StdDuration,
+        execution_timeout: StdDuration,
     ) -> Result<Self, WorkerConfigError> {
         let allowed_job_types = allowed_job_types.into();
         if allowed_job_types.is_empty() {
@@ -129,9 +151,13 @@ impl WorkerConfig {
         if heartbeat_every.is_zero() {
             return Err(WorkerConfigError::InvalidHeartbeat);
         }
+        if execution_timeout.is_zero() {
+            return Err(WorkerConfigError::InvalidExecutionTimeout);
+        }
         Ok(Self {
             allowed_job_types,
             heartbeat_every,
+            execution_timeout,
         })
     }
 
@@ -147,6 +173,11 @@ impl WorkerConfig {
     /// Returns the interval between lease heartbeats.
     pub const fn heartbeat_every(&self) -> StdDuration {
         self.heartbeat_every
+    }
+
+    /// Returns the absolute wall-clock limit for one handler execution.
+    pub const fn execution_timeout(&self) -> StdDuration {
+        self.execution_timeout
     }
 
     fn validate_for_lease(&self, lease_for: chrono::Duration) -> Result<(), WorkerConfigError> {
@@ -169,6 +200,9 @@ pub enum WorkerConfigError {
     /// The heartbeat interval must be positive.
     #[error("worker heartbeat interval must be positive")]
     InvalidHeartbeat,
+    /// The execution timeout must be positive.
+    #[error("worker execution timeout must be positive")]
+    InvalidExecutionTimeout,
     /// The configured lease could not be converted to a standard duration.
     #[error("worker lease duration is invalid")]
     InvalidLease,
@@ -450,7 +484,28 @@ where
             "worker claimed job"
         );
 
-        let outcome = self.execute_with_heartbeats(&lease, now).await?;
+        let outcome = match time::timeout(
+            self.config.execution_timeout(),
+            self.execute_with_heartbeats(&lease, now),
+        )
+        .await
+        {
+            Ok(outcome) => outcome?,
+            Err(_) => {
+                let timeout = self.config.execution_timeout();
+                let error = format!("job execution timed out after {timeout:?}");
+                tracing::warn!(
+                    job_id = %lease.job.id(),
+                    job_type = ?lease.job.job_type(),
+                    timeout_ms = timeout.as_millis(),
+                    "worker cancelled a job that exceeded its execution timeout"
+                );
+                JobExecution::Retry {
+                    retry_at: now,
+                    error,
+                }
+            }
+        };
         match &outcome {
             JobExecution::Succeeded | JobExecution::Committed => tracing::info!(
                 job_id = %lease.job.id(),
@@ -515,9 +570,11 @@ where
     /// Successful passes immediately try the next job, while idle passes and
     /// errors wait before polling again. Shutdown is checked between passes and
     /// during waits; a pass that has already claimed a job is allowed to finish
-    /// its handler and fenced outcome transaction before returning. Errors are
-    /// counted and retried because an expired lease, temporary database outage,
-    /// or lost heartbeat should not terminate an otherwise healthy replica.
+    /// its handler and fenced outcome transaction before returning. Handler
+    /// execution is still bounded by the configured execution timeout. Errors
+    /// are counted and retried because an expired lease, temporary database
+    /// outage, or lost heartbeat should not terminate an otherwise healthy
+    /// replica.
     pub async fn run_until_shutdown(
         &self,
         mut shutdown: tokio::sync::watch::Receiver<bool>,
@@ -659,7 +716,7 @@ fn execution_kind(execution: &JobExecution) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use chrono::TimeZone;
     use serde_json::json;
@@ -711,6 +768,27 @@ mod tests {
         }
     }
 
+    struct CancellationProbe(Arc<AtomicBool>);
+
+    impl Drop for CancellationProbe {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
+
+    struct HangingHandler {
+        cancelled: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl JobHandler for HangingHandler {
+        async fn execute(&self, _lease: &JobLease, _now: DateTime<Utc>) -> JobExecution {
+            let _probe = CancellationProbe(self.cancelled.clone());
+            std::future::pending::<()>().await;
+            unreachable!("the execution timeout should cancel this handler")
+        }
+    }
+
     #[test]
     fn rejects_empty_kinds_zero_heartbeat_and_heartbeat_at_lease() {
         assert_eq!(
@@ -746,6 +824,18 @@ mod tests {
             ),
             Err(WorkerConfigError::HeartbeatNotShorterThanLease)
         ));
+    }
+
+    #[test]
+    fn rejects_a_zero_execution_timeout() {
+        assert_eq!(
+            WorkerConfig::new_with_execution_timeout(
+                vec![JobType::SourceSync],
+                StdDuration::from_secs(1),
+                StdDuration::ZERO,
+            ),
+            Err(WorkerConfigError::InvalidExecutionTimeout)
+        );
     }
 
     #[test]
@@ -825,5 +915,54 @@ mod tests {
             repository.find(job.id()).await.unwrap().unwrap().status(),
             JobStatus::Succeeded
         );
+    }
+
+    #[tokio::test]
+    async fn timed_out_handler_is_cancelled_and_requeued() {
+        let repository = MemoryJobRepository::new();
+        let inserted = repository.enqueue(new_job("worker-timeout")).await.unwrap();
+        let job_id = match inserted {
+            EnqueueResult::Inserted(job) => job.id(),
+            EnqueueResult::AlreadyActive { .. } => panic!("the timeout test job should be new"),
+        };
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_config = WorkerConfig::new_with_execution_timeout(
+            vec![JobType::SourceSync],
+            StdDuration::from_millis(5),
+            StdDuration::from_millis(20),
+        )
+        .unwrap();
+        let worker = Worker::new(
+            JobService::new(
+                repository.clone(),
+                crate::application::job_service::JobServiceConfig::new(
+                    "worker",
+                    chrono::Duration::seconds(1),
+                    1,
+                )
+                .unwrap(),
+            ),
+            repository.clone(),
+            HangingHandler {
+                cancelled: cancelled.clone(),
+            },
+            worker_config,
+        )
+        .unwrap();
+
+        let result = worker.run_once(at(1)).await.unwrap();
+        let WorkerRun::Completed { job, outcome } = result else {
+            panic!("a queued job should complete with a timeout outcome")
+        };
+        assert!(matches!(
+            outcome,
+            JobExecution::Retry { retry_at, error }
+                if retry_at == at(1) && error.contains("job execution timed out")
+        ));
+        assert_eq!(job.id(), job_id);
+        assert_eq!(job.status(), JobStatus::RetryWait);
+        assert_eq!(job.failure_count(), 1);
+        assert!(job.lease_owner().is_none());
+        assert!(cancelled.load(Ordering::Relaxed));
     }
 }
