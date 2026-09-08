@@ -312,22 +312,24 @@ Structured application logging, sensitive-value redaction, browser health and
 worker-readiness diagnostics, and missed-article repair/backfill jobs are
 included in the current runtime. The responsive administrator UI polish and the
 English, French, and Simplified Chinese panel translations are also included in
-the current panel. The remaining roadmap items are future work:
+the current panel. The first storage-boundary step is also implemented:
+`AssetBlobStore` is the backend-neutral contract and `PostgresAssetBlobStore`
+adapts the existing PostgreSQL binary table without a migration. Both
+`PostgresAssetStore::with_blob_store` and
+`UnitOfWorkFactory::with_blob_store` accept an injected
+`Arc<dyn AssetBlobStore>`; their default constructors continue to use the
+database backend. The remaining roadmap items are future work:
 
-1. **Add `AssetBlobStore` and adapt the existing database implementation.**
-   Keep the application-facing storage contract independent of OpenDAL while
-   preserving PostgreSQL metadata, relationships, deduplication, and stable
-   asset IDs.
-2. **Add the OpenDAL filesystem backend.** Store immutable asset objects in a
+1. **Add the OpenDAL filesystem backend.** Store immutable asset objects in a
    configured local directory while retaining the existing `/assets/{id}`
    route and repair behavior.
-3. **Add the OpenDAL S3-compatible backend.** Support configurable buckets,
+2. **Add the OpenDAL S3-compatible backend.** Support configurable buckets,
    endpoints, regions, and secret-backed credentials without exposing provider
    URLs in feeds.
-4. **Add GCS, Azure, OSS, FTP, SFTP, and WebDAV only after the common contract
+3. **Add GCS, Azure, OSS, FTP, SFTP, and WebDAV only after the common contract
    is stable.** Each backend must pass the shared contract and provider-
    appropriate integration tests before its configuration is accepted.
-5. **Evaluate PGMQ as a queue transport optimization.** The current custom
+4. **Evaluate PGMQ as a queue transport optimization.** The current custom
    `jobs` table remains the version-one transport; PGMQ can be evaluated later
    if queue throughput or operational overhead becomes a demonstrated
    bottleneck.

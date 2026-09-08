@@ -20,6 +20,17 @@ The forward `0005_asset_repair.sql` migration adds the `asset_repair` job kind,
 durable per-asset admission/backoff state, and job-to-asset links used to
 deduplicate public cache-miss repair work and enforce cluster-wide limits.
 
+The first `AssetBlobStore` boundary is implemented by the PostgreSQL adapter
+without another migration. It maps the existing `asset_blobs.id` UUID to the
+backend-relative `blobs/{id}` key and accepts the bare UUID form for legacy
+callers. Existing binary rows, evicted rows with `data IS NULL`, metadata, and
+article relationships remain readable through the adapter. The repository and
+unit-of-work factories can inject another backend, but PostgreSQL remains the
+authority for metadata and relationships; binary writes are independently
+retryable. A future external backend may add a forward migration for a
+persisted storage key or storage state; it must not rewrite or drop the
+current asset tables in place.
+
 The initial schema provides:
 
 - the active non-failure `deferred` job state;

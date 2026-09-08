@@ -3,12 +3,15 @@
 //! Metadata and binary bytes deliberately have different lifetimes. Eviction
 //! clears `asset_blobs.data` while retaining the URL/version row and the
 //! article relationship, so the stable public asset ID can report a repairable
-//! miss later. All add/attach operations are transaction-scoped and compare
-//! raw bytes after using SHA-256 and size as candidate keys.
+//! miss later. Metadata and article attachment are transaction-scoped; binary
+//! operations go through the injected blob port and compare raw bytes after
+//! using SHA-256 and size as candidate keys.
 
 use std::{
+    any::Any,
     collections::{BTreeSet, HashMap},
     fmt,
+    sync::{Arc, Mutex},
 };
 
 use chrono::Utc;
@@ -19,6 +22,7 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::archive::asset_store::{
+    AssetBlob, AssetBlobKey, AssetBlobMetadata, AssetBlobStore, AssetBlobStoreError,
     AssetCachePolicy, AssetInput, AssetMaintenanceResult, AssetRead, AssetRepairPolicy,
     AssetRepairTarget, StoredAsset,
 };
@@ -83,6 +87,9 @@ pub enum AssetRepositoryError {
     /// The database operation failed.
     #[error("asset repository storage error: {0}")]
     Storage(String),
+    /// The binary storage adapter rejected or could not complete an operation.
+    #[error("asset blob storage error: {0}")]
+    BlobStore(#[from] AssetBlobStoreError),
 }
 
 /// Result of admitting a public cache-miss repair request.
@@ -148,10 +155,315 @@ pub trait AssetTransactionRepository {
     ) -> Result<Vec<StoredAsset>, AssetRepositoryError>;
 }
 
+/// PostgreSQL implementation of the backend-neutral binary storage port.
+///
+/// Existing rows use their `asset_blobs.id` UUID as the legacy storage key.
+/// This adapter deliberately requires no schema migration: a future backend
+/// can use the same opaque `blobs/{uuid}` key convention while old database
+/// rows continue to be readable.
+#[derive(Clone)]
+pub struct PostgresAssetBlobStore {
+    pool: PgPool,
+}
+
+impl fmt::Debug for PostgresAssetBlobStore {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PostgresAssetBlobStore")
+            .field("pool", &"<postgres pool>")
+            .finish()
+    }
+}
+
+impl PostgresAssetBlobStore {
+    /// Creates a database blob adapter over an existing PostgreSQL pool.
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+
+    /// Reads a legacy database blob inside an existing repository transaction.
+    async fn read_in_transaction(
+        transaction: &mut Transaction<'_, Postgres>,
+        key: &AssetBlobKey,
+    ) -> Result<Option<AssetBlob>, AssetBlobStoreError> {
+        let blob_id = legacy_blob_id(key)?;
+        let row = sqlx::query(
+            "SELECT checksum, media_type, byte_size, data
+             FROM asset_blobs
+             WHERE id = $1",
+        )
+        .bind(blob_id)
+        .fetch_optional(&mut **transaction)
+        .await
+        .map_err(blob_backend_error)?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let checksum = row
+            .try_get::<String, _>("checksum")
+            .map_err(blob_backend_error)?;
+        let media_type = row
+            .try_get::<String, _>("media_type")
+            .map_err(blob_backend_error)?;
+        let byte_size = row
+            .try_get::<i64, _>("byte_size")
+            .map_err(blob_backend_error)?;
+        let Some(bytes) = row
+            .try_get::<Option<Vec<u8>>, _>("data")
+            .map_err(blob_backend_error)?
+        else {
+            return Ok(None);
+        };
+        let expected_size =
+            u64::try_from(byte_size).map_err(|_| AssetBlobStoreError::InvalidMetadata)?;
+        if expected_size != bytes.len() as u64 {
+            return Err(AssetBlobStoreError::InvalidMetadata);
+        }
+        Ok(Some(AssetBlob::new(bytes, media_type, checksum)?))
+    }
+
+    /// Reads blob metadata inside an existing repository transaction.
+    async fn stat_in_transaction(
+        transaction: &mut Transaction<'_, Postgres>,
+        key: &AssetBlobKey,
+    ) -> Result<Option<AssetBlobMetadata>, AssetBlobStoreError> {
+        let blob_id = legacy_blob_id(key)?;
+        let row = sqlx::query(
+            "SELECT checksum, media_type, byte_size, data IS NOT NULL AS present
+             FROM asset_blobs
+             WHERE id = $1",
+        )
+        .bind(blob_id)
+        .fetch_optional(&mut **transaction)
+        .await
+        .map_err(blob_backend_error)?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        Ok(Some(blob_metadata_from_row(&row)?))
+    }
+
+    /// Writes a blob inside the caller's existing PostgreSQL transaction.
+    async fn put_in_transaction(
+        transaction: &mut Transaction<'_, Postgres>,
+        key: &AssetBlobKey,
+        blob: &AssetBlob,
+    ) -> Result<(), AssetBlobStoreError> {
+        let blob_id = legacy_blob_id(key)?;
+        let byte_size =
+            i64::try_from(blob.byte_size()).map_err(|_| AssetBlobStoreError::SizeOverflow)?;
+        let inserted = sqlx::query(
+            "INSERT INTO asset_blobs
+                    (id, checksum_algorithm, checksum, byte_size, media_type, data)
+             VALUES ($1, 'sha256', $2, $3, $4, $5)
+             ON CONFLICT (id) DO NOTHING
+             RETURNING id",
+        )
+        .bind(blob_id)
+        .bind(blob.checksum())
+        .bind(byte_size)
+        .bind(blob.media_type())
+        .bind(blob.bytes())
+        .fetch_optional(&mut **transaction)
+        .await
+        .map_err(blob_backend_error)?;
+        if inserted.is_some() {
+            return Ok(());
+        }
+
+        let existing = sqlx::query(
+            "SELECT checksum, media_type, byte_size, data
+             FROM asset_blobs
+             WHERE id = $1
+             FOR UPDATE",
+        )
+        .bind(blob_id)
+        .fetch_optional(&mut **transaction)
+        .await
+        .map_err(blob_backend_error)?;
+
+        if let Some(existing) = existing {
+            let existing_checksum = existing
+                .try_get::<String, _>("checksum")
+                .map_err(blob_backend_error)?;
+            let existing_media_type = existing
+                .try_get::<String, _>("media_type")
+                .map_err(blob_backend_error)?;
+            let existing_size = existing
+                .try_get::<i64, _>("byte_size")
+                .map_err(blob_backend_error)?;
+            let existing_data = existing
+                .try_get::<Option<Vec<u8>>, _>("data")
+                .map_err(blob_backend_error)?;
+            if existing_checksum != blob.checksum()
+                || existing_media_type != blob.media_type()
+                || existing_size != byte_size
+                || existing_data
+                    .as_deref()
+                    .is_some_and(|data| data != blob.bytes())
+            {
+                return Err(AssetBlobStoreError::Conflict);
+            }
+            if existing_data.is_none() {
+                sqlx::query(
+                    "UPDATE asset_blobs
+                     SET data = $2, last_fetched_at = clock_timestamp(),
+                         last_accessed_at = clock_timestamp()
+                     WHERE id = $1",
+                )
+                .bind(blob_id)
+                .bind(blob.bytes())
+                .execute(&mut **transaction)
+                .await
+                .map_err(blob_backend_error)?;
+            }
+            return Ok(());
+        }
+
+        Err(AssetBlobStoreError::Backend(
+            "asset blob disappeared after a conflicting insert".to_owned(),
+        ))
+    }
+
+    /// Clears binary data inside an existing repository transaction while
+    /// retaining the metadata row for repair and legacy compatibility.
+    async fn delete_in_transaction(
+        transaction: &mut Transaction<'_, Postgres>,
+        key: &AssetBlobKey,
+    ) -> Result<(), AssetBlobStoreError> {
+        let blob_id = legacy_blob_id(key)?;
+        sqlx::query("UPDATE asset_blobs SET data = NULL WHERE id = $1")
+            .bind(blob_id)
+            .execute(&mut **transaction)
+            .await
+            .map_err(blob_backend_error)?;
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl AssetBlobStore for PostgresAssetBlobStore {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    async fn read(&self, key: &AssetBlobKey) -> Result<Option<AssetBlob>, AssetBlobStoreError> {
+        let mut transaction = self.pool.begin().await.map_err(blob_backend_error)?;
+        let result = Self::read_in_transaction(&mut transaction, key).await?;
+        transaction.commit().await.map_err(blob_backend_error)?;
+        Ok(result)
+    }
+
+    async fn stat(
+        &self,
+        key: &AssetBlobKey,
+    ) -> Result<Option<AssetBlobMetadata>, AssetBlobStoreError> {
+        let mut transaction = self.pool.begin().await.map_err(blob_backend_error)?;
+        let result = Self::stat_in_transaction(&mut transaction, key).await?;
+        transaction.commit().await.map_err(blob_backend_error)?;
+        Ok(result)
+    }
+
+    async fn put(&self, key: &AssetBlobKey, blob: &AssetBlob) -> Result<(), AssetBlobStoreError> {
+        let mut transaction = self.pool.begin().await.map_err(blob_backend_error)?;
+        Self::put_in_transaction(&mut transaction, key, blob).await?;
+        transaction.commit().await.map_err(blob_backend_error)?;
+        Ok(())
+    }
+
+    async fn delete(&self, key: &AssetBlobKey) -> Result<(), AssetBlobStoreError> {
+        let mut transaction = self.pool.begin().await.map_err(blob_backend_error)?;
+        Self::delete_in_transaction(&mut transaction, key).await?;
+        transaction.commit().await.map_err(blob_backend_error)?;
+        Ok(())
+    }
+}
+
+fn legacy_blob_id(key: &AssetBlobKey) -> Result<Uuid, AssetBlobStoreError> {
+    let value = key.as_str().strip_prefix("blobs/").unwrap_or(key.as_str());
+    Uuid::parse_str(value).map_err(|_| AssetBlobStoreError::InvalidMetadata)
+}
+
+fn blob_metadata_from_row(
+    row: &sqlx::postgres::PgRow,
+) -> Result<AssetBlobMetadata, AssetBlobStoreError> {
+    let checksum = row
+        .try_get::<String, _>("checksum")
+        .map_err(blob_backend_error)?;
+    let media_type = row
+        .try_get::<String, _>("media_type")
+        .map_err(blob_backend_error)?;
+    let byte_size = row
+        .try_get::<i64, _>("byte_size")
+        .map_err(blob_backend_error)?;
+    let byte_size = u64::try_from(byte_size).map_err(|_| AssetBlobStoreError::InvalidMetadata)?;
+    let present = row
+        .try_get::<bool, _>("present")
+        .map_err(blob_backend_error)?;
+    AssetBlobMetadata::new(checksum, media_type, byte_size, present)
+}
+
+fn blob_backend_error(error: impl fmt::Display) -> AssetBlobStoreError {
+    AssetBlobStoreError::Backend(error.to_string())
+}
+
+// The injected port remains backend-neutral, but the built-in PostgreSQL
+// implementation must participate in the repository transaction. Falling
+// back to the port methods keeps filesystem/object-store adapters unchanged.
+async fn blob_read_in_transaction(
+    blob_store: &dyn AssetBlobStore,
+    transaction: &mut Transaction<'_, Postgres>,
+    key: &AssetBlobKey,
+) -> Result<Option<AssetBlob>, AssetRepositoryError> {
+    if blob_store.as_any().is::<PostgresAssetBlobStore>() {
+        return Ok(PostgresAssetBlobStore::read_in_transaction(transaction, key).await?);
+    }
+    Ok(blob_store.read(key).await?)
+}
+
+async fn blob_stat_in_transaction(
+    blob_store: &dyn AssetBlobStore,
+    transaction: &mut Transaction<'_, Postgres>,
+    key: &AssetBlobKey,
+) -> Result<Option<AssetBlobMetadata>, AssetRepositoryError> {
+    if blob_store.as_any().is::<PostgresAssetBlobStore>() {
+        return Ok(PostgresAssetBlobStore::stat_in_transaction(transaction, key).await?);
+    }
+    Ok(blob_store.stat(key).await?)
+}
+
+async fn blob_put_in_transaction(
+    blob_store: &dyn AssetBlobStore,
+    transaction: &mut Transaction<'_, Postgres>,
+    key: &AssetBlobKey,
+    blob: &AssetBlob,
+) -> Result<(), AssetRepositoryError> {
+    if blob_store.as_any().is::<PostgresAssetBlobStore>() {
+        PostgresAssetBlobStore::put_in_transaction(transaction, key, blob).await?;
+        return Ok(());
+    }
+    blob_store.put(key, blob).await?;
+    Ok(())
+}
+
+async fn blob_delete_in_transaction(
+    blob_store: &dyn AssetBlobStore,
+    transaction: &mut Transaction<'_, Postgres>,
+    key: &AssetBlobKey,
+) -> Result<(), AssetRepositoryError> {
+    if blob_store.as_any().is::<PostgresAssetBlobStore>() {
+        PostgresAssetBlobStore::delete_in_transaction(transaction, key).await?;
+    } else {
+        blob_store.delete(key).await?;
+    }
+    Ok(())
+}
+
 /// Pool-backed asset reads and cache maintenance.
 #[derive(Clone)]
 pub struct PostgresAssetStore {
     pool: PgPool,
+    blob_store: Arc<dyn AssetBlobStore>,
     policy: AssetCachePolicy,
     repair_policy: AssetRepairPolicy,
 }
@@ -170,11 +482,35 @@ impl fmt::Debug for PostgresAssetStore {
 impl PostgresAssetStore {
     /// Creates a database-backed asset store.
     pub fn new(pool: PgPool, policy: AssetCachePolicy) -> Self {
+        Self::with_blob_store(
+            pool.clone(),
+            policy,
+            Arc::new(PostgresAssetBlobStore::new(pool)),
+        )
+    }
+
+    /// Creates a PostgreSQL metadata store over an injected binary backend.
+    ///
+    /// The metadata, relationship, deduplication, and lease records remain in
+    /// PostgreSQL. The injected port owns only binary bytes, which lets a
+    /// filesystem or object-store adapter be selected without changing the
+    /// repository's public asset operations.
+    pub fn with_blob_store(
+        pool: PgPool,
+        policy: AssetCachePolicy,
+        blob_store: Arc<dyn AssetBlobStore>,
+    ) -> Self {
         Self {
+            blob_store,
             pool,
             policy,
             repair_policy: AssetRepairPolicy::default(),
         }
+    }
+
+    /// Returns the injected common blob-storage port.
+    pub fn blob_store(&self) -> &dyn AssetBlobStore {
+        self.blob_store.as_ref()
     }
 
     /// Applies the durable admission policy used for public cache misses.
@@ -208,9 +544,12 @@ impl PostgresAssetStore {
         // while the response is being prepared.
         lock_asset_capacity(&mut transaction).await?;
         let row = sqlx::query(
-            "SELECT r.source_url, b.media_type, b.checksum, b.data
+            "SELECT r.source_url, r.blob_id,
+                    EXISTS (
+                        SELECT 1 FROM asset_blob_deletion_queue AS q
+                        WHERE q.blob_id = r.blob_id
+                    ) AS deletion_pending
              FROM asset_records AS r
-             LEFT JOIN asset_blobs AS b ON b.id = r.blob_id
              WHERE r.id = $1
                AND EXISTS (
                    SELECT 1
@@ -232,18 +571,27 @@ impl PostgresAssetStore {
             &row.try_get::<String, _>("source_url")
                 .map_err(storage_error)?,
         )?;
-        let media_type = row
-            .try_get::<Option<String>, _>("media_type")
+        let blob_id = row
+            .try_get::<Option<Uuid>, _>("blob_id")
             .map_err(storage_error)?;
-        let checksum = row
-            .try_get::<Option<String>, _>("checksum")
+        let deletion_pending = row
+            .try_get::<bool, _>("deletion_pending")
             .map_err(storage_error)?;
-        let bytes = row
-            .try_get::<Option<Vec<u8>>, _>("data")
-            .map_err(storage_error)?;
+        let blob = match blob_id {
+            Some(blob_id) if !deletion_pending => {
+                blob_read_in_transaction(
+                    self.blob_store.as_ref(),
+                    &mut transaction,
+                    &AssetBlobKey::for_blob_id(blob_id),
+                )
+                .await?
+            }
+            Some(_) => None,
+            None => None,
+        };
 
-        let result = match (media_type, checksum, bytes) {
-            (Some(media_type), Some(checksum), Some(bytes)) => {
+        let result = match blob {
+            Some(blob) => {
                 sqlx::query(
                     "UPDATE asset_blobs
                      SET last_accessed_at = clock_timestamp()
@@ -256,9 +604,9 @@ impl PostgresAssetStore {
                 .await
                 .map_err(storage_error)?;
                 Some(AssetRead::Available {
-                    media_type,
-                    checksum,
-                    bytes,
+                    media_type: blob.media_type().to_owned(),
+                    checksum: blob.checksum().to_owned(),
+                    bytes: blob.bytes().to_vec(),
                 })
             }
             _ => Some(AssetRead::Missing { source_url }),
@@ -273,14 +621,16 @@ impl PostgresAssetStore {
         asset_id: Uuid,
     ) -> Result<Option<AssetRepairTarget>, AssetRepositoryError> {
         let row = sqlx::query(
-            "SELECT r.source_url, aa.referer_url, aa.origin, aa.user_agent,
+            "SELECT r.source_url, r.blob_id, aa.referer_url, aa.origin, aa.user_agent,
                     ars.next_allowed_at, COALESCE(ars.exhausted, FALSE) AS exhausted
              FROM asset_records AS r
              JOIN article_assets AS aa ON aa.asset_record_id = r.id
-             LEFT JOIN asset_blobs AS b ON b.id = r.blob_id
              LEFT JOIN asset_repair_states AS ars ON ars.asset_record_id = r.id
              WHERE r.id = $1
-               AND (r.blob_id IS NULL OR b.data IS NULL)
+               AND NOT EXISTS (
+                   SELECT 1 FROM asset_blob_deletion_queue AS q
+                   WHERE q.blob_id = r.blob_id
+               )
              ORDER BY aa.source_id, aa.review_id, aa.occurrence
              LIMIT 1",
         )
@@ -291,6 +641,19 @@ impl PostgresAssetStore {
         let Some(row) = row else {
             return Ok(None);
         };
+        if let Some(blob_id) = row
+            .try_get::<Option<Uuid>, _>("blob_id")
+            .map_err(storage_error)?
+        {
+            if self
+                .blob_store
+                .stat(&AssetBlobKey::for_blob_id(blob_id))
+                .await?
+                .is_some_and(|metadata| metadata.is_present())
+            {
+                return Ok(None);
+            }
+        }
         Ok(Some(AssetRepairTarget {
             asset_id,
             source_url: parse_url(
@@ -321,8 +684,13 @@ impl PostgresAssetStore {
         let mut transaction = PostgresJobTransaction::begin(&self.pool)
             .await
             .map_err(storage_error)?;
-        let result =
-            enqueue_repair_in_transaction(&mut transaction, self.repair_policy, asset_id).await?;
+        let result = enqueue_repair_in_transaction(
+            &mut transaction,
+            self.blob_store.as_ref(),
+            self.repair_policy,
+            asset_id,
+        )
+        .await?;
         transaction.commit_inner().await.map_err(storage_error)?;
         Ok(result)
     }
@@ -353,9 +721,8 @@ impl PostgresAssetStore {
             .map_err(storage_error)?;
 
         let record = sqlx::query(
-            "SELECT r.source_url, b.data
+            "SELECT r.source_url, r.blob_id
              FROM asset_records AS r
-             LEFT JOIN asset_blobs AS b ON b.id = r.blob_id
              WHERE r.id = $1
                AND EXISTS (
                    SELECT 1 FROM article_assets AS aa
@@ -382,19 +749,32 @@ impl PostgresAssetStore {
         if record_source_url != source_url {
             return Err(AssetRepositoryError::InvalidMetadata);
         }
-        if record
-            .try_get::<Option<Vec<u8>>, _>("data")
+        if let Some(blob_id) = record
+            .try_get::<Option<Uuid>, _>("blob_id")
             .map_err(storage_error)?
-            .is_some()
         {
-            transaction.commit().await.map_err(storage_error)?;
-            return Ok(AssetRepairRestoreResult::AlreadyAvailable);
+            if !blob_deletion_pending(&mut transaction, blob_id).await?
+                && blob_stat_in_transaction(
+                    self.blob_store.as_ref(),
+                    &mut transaction,
+                    &AssetBlobKey::for_blob_id(blob_id),
+                )
+                .await?
+                .is_some_and(|metadata| metadata.is_present())
+            {
+                transaction.commit().await.map_err(storage_error)?;
+                return Ok(AssetRepairRestoreResult::AlreadyAvailable);
+            }
         }
 
         let candidates = sqlx::query(
-            "SELECT id, media_type, data
+            "SELECT id
              FROM asset_blobs
-             WHERE checksum = $1 AND byte_size = $2 AND data IS NOT NULL
+             WHERE checksum = $1 AND byte_size = $2
+               AND NOT EXISTS (
+                   SELECT 1 FROM asset_blob_deletion_queue AS q
+                   WHERE q.blob_id = asset_blobs.id
+               )
              ORDER BY id
              FOR UPDATE",
         )
@@ -403,55 +783,84 @@ impl PostgresAssetStore {
         .fetch_all(&mut *transaction)
         .await
         .map_err(storage_error)?;
-        let matching = candidates.iter().find_map(|row| {
-            let data = row.try_get::<Vec<u8>, _>("data").ok()?;
-            if data != input.bytes {
-                return None;
-            }
-            Some((
-                row.try_get::<Uuid, _>("id").ok()?,
-                row.try_get::<String, _>("media_type").ok()?,
-            ))
-        });
-        let (blob_id, media_type) = if let Some(matching) = matching {
-            matching
-        } else {
-            insert_blob(
+        let mut matching = None;
+        for row in candidates {
+            let candidate_id = row.try_get::<Uuid, _>("id").map_err(storage_error)?;
+            let Some(candidate) = blob_read_in_transaction(
+                self.blob_store.as_ref(),
                 &mut transaction,
+                &AssetBlobKey::for_blob_id(candidate_id),
+            )
+            .await?
+            else {
+                continue;
+            };
+            if candidate.bytes() == input.bytes {
+                matching = Some(candidate_id);
+                break;
+            }
+        }
+        let (blob_id, newly_written) = if let Some(matching) = matching {
+            (matching, false)
+        } else {
+            let mutation_state = Arc::new(Mutex::new(AssetMutationState::default()));
+            let mut context = AssetWriteContext::new(
+                self.blob_store.as_ref(),
+                self.policy,
+                None,
+                &mutation_state,
+            );
+            let blob_id = insert_blob(
+                &mut transaction,
+                &mut context,
                 input,
                 &checksum,
                 byte_size,
-                self.policy,
                 &[],
             )
             .await?
+            .0;
+            (blob_id, true)
         };
         // Hold the job row lock through commit so lease recovery cannot grant
         // the same job to another worker while this mutation is being fenced.
-        lock_live_repair_lease(&mut transaction, lease).await?;
-        sqlx::query(
-            "UPDATE asset_records
+        let result = async {
+            lock_live_repair_lease(&mut transaction, lease).await?;
+            sqlx::query(
+                "UPDATE asset_records
              SET final_url = $2, blob_id = $3, fetch_status = 'available',
                  last_error = NULL, updated_at = clock_timestamp()
              WHERE id = $1",
-        )
-        .bind(asset_id)
-        .bind(final_url.as_str())
-        .bind(blob_id)
-        .execute(&mut *transaction)
-        .await
-        .map_err(storage_error)?;
-        sqlx::query(
-            "UPDATE asset_blobs
+            )
+            .bind(asset_id)
+            .bind(final_url.as_str())
+            .bind(blob_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(storage_error)?;
+            sqlx::query(
+                "UPDATE asset_blobs
              SET last_fetched_at = clock_timestamp(), last_accessed_at = clock_timestamp()
              WHERE id = $1",
-        )
-        .bind(blob_id)
-        .execute(&mut *transaction)
-        .await
-        .map_err(storage_error)?;
-        transaction.commit().await.map_err(storage_error)?;
-        let _ = media_type;
+            )
+            .bind(blob_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(storage_error)?;
+            Ok::<_, AssetRepositoryError>(())
+        }
+        .await;
+        if let Err(error) = result {
+            if newly_written {
+                cleanup_new_blobs(self.blob_store.as_ref(), &mut transaction, &[blob_id]).await;
+            }
+            return Err(error);
+        }
+        if let Err(error) = transaction.commit().await.map_err(storage_error) {
+            // A commit error is ambiguous: PostgreSQL may have committed the
+            // metadata, so never delete the external object here.
+            return Err(error);
+        }
         Ok(AssetRepairRestoreResult::Restored)
     }
 
@@ -531,45 +940,53 @@ impl PostgresAssetStore {
         // order and prevents a stale-byte update from deadlocking a writer.
         lock_asset_capacity(&mut transaction).await?;
 
-        let stale_blobs = if self.policy.max_age().is_zero() {
-            0
+        let stale_blob_ids = if self.policy.max_age().is_zero() {
+            Vec::new()
         } else {
             let seconds = i64::try_from(self.policy.max_age().as_secs()).map_err(|_| {
                 AssetRepositoryError::Storage("asset max age exceeds PostgreSQL range".to_owned())
             })?;
-            sqlx::query(
-                "UPDATE asset_blobs
-                 SET data = NULL
-                 WHERE data IS NOT NULL
-                   AND last_accessed_at < clock_timestamp()
-                       - make_interval(secs => $1::double precision)",
-            )
-            .bind(seconds)
-            .execute(&mut *transaction)
-            .await
-            .map_err(storage_error)?
-            .rows_affected()
+            evict_stale_blobs(self.blob_store.as_ref(), &mut transaction, seconds).await?
         };
+        let stale_blobs = stale_blob_ids.len() as u64;
 
-        if stale_blobs > 0 {
+        if !stale_blob_ids.is_empty() {
             sqlx::query(
                 "UPDATE asset_records
                  SET fetch_status = 'missing',
                      last_error = 'asset bytes evicted by age policy',
                      updated_at = clock_timestamp()
-                 WHERE blob_id IN (
-                     SELECT id FROM asset_blobs WHERE data IS NULL
-                 )
+                 WHERE blob_id = ANY($1::uuid[])
                    AND fetch_status = 'available'",
             )
+            .bind(&stale_blob_ids)
             .execute(&mut *transaction)
             .await
             .map_err(storage_error)?;
         }
 
-        let size_evicted_blobs =
-            enforce_cache_limit(&mut transaction, self.policy.max_cache_size_bytes(), 0, &[])
-                .await?;
+        let mut deferred_evictions = stale_blob_ids.clone();
+        let size_evicted_blobs = enforce_cache_limit(
+            self.blob_store.as_ref(),
+            &mut transaction,
+            self.policy.max_cache_size_bytes(),
+            0,
+            &[],
+            0,
+            &[],
+            &mut deferred_evictions,
+        )
+        .await?;
+        for blob_id in &deferred_evictions {
+            sqlx::query(
+                "INSERT INTO asset_blob_deletion_queue (blob_id)
+                 VALUES ($1) ON CONFLICT (blob_id) DO NOTHING",
+            )
+            .bind(blob_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(storage_error)?;
+        }
 
         let orphan_records = sqlx::query(
             "DELETE FROM asset_records AS r
@@ -590,19 +1007,42 @@ impl PostgresAssetStore {
         .map_err(storage_error)?
         .rows_affected();
 
-        let orphan_blobs = sqlx::query(
-            "DELETE FROM asset_blobs AS b
+        let orphan_blob_ids = sqlx::query_scalar::<_, Uuid>(
+            "SELECT b.id
+             FROM asset_blobs AS b
              WHERE NOT EXISTS (
                  SELECT 1 FROM asset_records AS r
                  WHERE r.blob_id = b.id
              )",
         )
-        .execute(&mut *transaction)
+        .fetch_all(&mut *transaction)
         .await
-        .map_err(storage_error)?
-        .rows_affected();
+        .map_err(storage_error)?;
+        // External objects must be deleted before their discovery metadata.
+        // If deletion fails, returning here rolls back the transaction and
+        // leaves the orphan row available for the next maintenance pass.
+        for blob_id in &orphan_blob_ids {
+            blob_delete_in_transaction(
+                self.blob_store.as_ref(),
+                &mut transaction,
+                &AssetBlobKey::for_blob_id(*blob_id),
+            )
+            .await?;
+        }
+        let orphan_blobs = if orphan_blob_ids.is_empty() {
+            0
+        } else {
+            sqlx::query("DELETE FROM asset_blobs WHERE id = ANY($1::uuid[])")
+                .bind(&orphan_blob_ids)
+                .execute(&mut *transaction)
+                .await
+                .map_err(storage_error)?
+                .rows_affected()
+        };
 
         transaction.commit().await.map_err(storage_error)?;
+        drain_blob_deletion_queue(&self.pool, self.blob_store.as_ref()).await?;
+        drain_blob_cleanup_queue(&self.pool, self.blob_store.as_ref()).await?;
         Ok(AssetMaintenanceResult {
             stale_blobs,
             size_evicted_blobs,
@@ -612,8 +1052,69 @@ impl PostgresAssetStore {
     }
 }
 
+/// Attempts queued external deletions. Failed rows remain queued for the next
+/// maintenance pass, while successful deletes remove their durable intent.
+pub(crate) async fn drain_blob_deletion_queue(
+    pool: &PgPool,
+    blob_store: &dyn AssetBlobStore,
+) -> Result<(), AssetRepositoryError> {
+    let mut transaction = pool.begin().await.map_err(storage_error)?;
+    lock_asset_capacity(&mut transaction).await?;
+    let rows =
+        sqlx::query("SELECT blob_id FROM asset_blob_deletion_queue ORDER BY created_at, blob_id")
+            .fetch_all(&mut *transaction)
+            .await
+            .map_err(storage_error)?;
+    for row in rows {
+        let blob_id = row.try_get::<Uuid, _>("blob_id").map_err(storage_error)?;
+        blob_delete_in_transaction(
+            blob_store,
+            &mut transaction,
+            &AssetBlobKey::for_blob_id(blob_id),
+        )
+        .await?;
+        sqlx::query("DELETE FROM asset_blob_deletion_queue WHERE blob_id = $1")
+            .bind(blob_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(storage_error)?;
+    }
+    transaction.commit().await.map_err(storage_error)?;
+    Ok(())
+}
+
+pub(crate) async fn drain_blob_cleanup_queue(
+    pool: &PgPool,
+    blob_store: &dyn AssetBlobStore,
+) -> Result<(), AssetRepositoryError> {
+    let mut transaction = pool.begin().await.map_err(storage_error)?;
+    lock_asset_capacity(&mut transaction).await?;
+    let rows =
+        sqlx::query("SELECT blob_id FROM asset_blob_cleanup_queue ORDER BY created_at, blob_id")
+            .fetch_all(&mut *transaction)
+            .await
+            .map_err(storage_error)?;
+    for row in rows {
+        let blob_id = row.try_get::<Uuid, _>("blob_id").map_err(storage_error)?;
+        blob_delete_in_transaction(
+            blob_store,
+            &mut transaction,
+            &AssetBlobKey::for_blob_id(blob_id),
+        )
+        .await?;
+        sqlx::query("DELETE FROM asset_blob_cleanup_queue WHERE blob_id = $1")
+            .bind(blob_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(storage_error)?;
+    }
+    transaction.commit().await.map_err(storage_error)?;
+    Ok(())
+}
+
 async fn enqueue_repair_in_transaction(
     job_transaction: &mut PostgresJobTransaction<'_>,
+    blob_store: &dyn AssetBlobStore,
     policy: AssetRepairPolicy,
     asset_id: Uuid,
 ) -> Result<AssetRepairEnqueueResult, AssetRepositoryError> {
@@ -631,9 +1132,8 @@ async fn enqueue_repair_in_transaction(
         .map_err(storage_error)?;
 
     let target = sqlx::query(
-        "SELECT r.blob_id, b.data
+        "SELECT r.blob_id
          FROM asset_records AS r
-         LEFT JOIN asset_blobs AS b ON b.id = r.blob_id
          WHERE r.id = $1
            AND EXISTS (
                SELECT 1 FROM article_assets AS aa
@@ -648,12 +1148,21 @@ async fn enqueue_repair_in_transaction(
     let Some(target) = target else {
         return Ok(AssetRepairEnqueueResult::NotFound);
     };
-    if target
-        .try_get::<Option<Vec<u8>>, _>("data")
+    if let Some(blob_id) = target
+        .try_get::<Option<Uuid>, _>("blob_id")
         .map_err(storage_error)?
-        .is_some()
     {
-        return Ok(AssetRepairEnqueueResult::AlreadyAvailable);
+        if !blob_deletion_pending(sql_transaction, blob_id).await?
+            && blob_stat_in_transaction(
+                blob_store,
+                sql_transaction,
+                &AssetBlobKey::for_blob_id(blob_id),
+            )
+            .await?
+            .is_some_and(|metadata| metadata.is_present())
+        {
+            return Ok(AssetRepairEnqueueResult::AlreadyAvailable);
+        }
     }
 
     let active = sqlx::query(
@@ -813,6 +1322,7 @@ impl AssetBatchPreparation {
 /// The returned IDs are only hints; the write path verifies that the selected
 /// immutable blob still has data.
 pub(crate) async fn prepare_asset_batch(
+    blob_store: &dyn AssetBlobStore,
     transaction: &mut Transaction<'_, Postgres>,
     inputs: &[AssetInput],
 ) -> Result<AssetBatchPreparation, AssetRepositoryError> {
@@ -859,11 +1369,14 @@ pub(crate) async fn prepare_asset_batch(
 
     for (checksum, byte_size) in keys {
         let candidates = sqlx::query(
-            "SELECT id, data
+            "SELECT id
              FROM asset_blobs
              WHERE checksum = $1
                AND byte_size = $2
-               AND data IS NOT NULL
+               AND NOT EXISTS (
+                   SELECT 1 FROM asset_blob_deletion_queue AS q
+                   WHERE q.blob_id = asset_blobs.id
+               )
              ORDER BY id",
         )
         .bind(&checksum)
@@ -871,15 +1384,27 @@ pub(crate) async fn prepare_asset_batch(
         .fetch_all(&mut **transaction)
         .await
         .map_err(storage_error)?;
+        let mut candidate_blobs = Vec::with_capacity(candidates.len());
+        for row in candidates {
+            let blob_id = row.try_get::<Uuid, _>("id").map_err(storage_error)?;
+            if let Some(blob) = blob_read_in_transaction(
+                blob_store,
+                transaction,
+                &AssetBlobKey::for_blob_id(blob_id),
+            )
+            .await?
+            {
+                candidate_blobs.push((blob_id, blob));
+            }
+        }
 
         for input in inputs.iter().filter(|input| {
             input.checksum() == checksum
                 && input_byte_size(input).is_ok_and(|size| size == byte_size)
         }) {
-            let matching_blob = candidates.iter().find_map(|row| {
-                let data = row.try_get::<Vec<u8>, _>("data").ok()?;
-                (data == input.bytes).then(|| row.try_get::<Uuid, _>("id").ok())?
-            });
+            let matching_blob = candidate_blobs
+                .iter()
+                .find_map(|(blob_id, blob)| (blob.bytes() == input.bytes).then_some(*blob_id));
             matches.insert(input.preparation_id(), matching_blob);
         }
     }
@@ -890,24 +1415,63 @@ pub(crate) async fn prepare_asset_batch(
     })
 }
 
-/// Transaction-scoped PostgreSQL asset view owned by `UnitOfWork`.
+/// Transaction-scoped asset metadata view owned by `UnitOfWork`.
+///
+/// PostgreSQL owns the metadata and relationship transaction. Binary reads and
+/// writes are delegated to the injected [`AssetBlobStore`], whose operations
+/// may have an independent commit boundary.
 pub struct PostgresAssetTransaction<'borrow, 'pool> {
     job_transaction: &'borrow mut PostgresJobTransaction<'pool>,
+    blob_store: Arc<dyn AssetBlobStore>,
     preparation: Option<AssetBatchPreparation>,
     policy: AssetCachePolicy,
+    mutation_state: Arc<Mutex<AssetMutationState>>,
+}
+
+/// Binary changes that must follow the enclosing unit-of-work outcome.
+#[derive(Debug, Default)]
+pub(crate) struct AssetMutationState {
+    pub(crate) newly_written: Vec<Uuid>,
+    pub(crate) deferred_evictions: Vec<Uuid>,
+    pub(crate) pending_bytes: u64,
+}
+
+fn take_newly_written_from(state: &Arc<Mutex<AssetMutationState>>, start: usize) -> Vec<Uuid> {
+    let mut state = state.lock().unwrap();
+    let split_at = start.min(state.newly_written.len());
+    state.newly_written.split_off(split_at)
+}
+
+async fn blob_deletion_pending(
+    transaction: &mut Transaction<'_, Postgres>,
+    blob_id: Uuid,
+) -> Result<bool, AssetRepositoryError> {
+    sqlx::query_scalar(
+        "SELECT EXISTS (
+             SELECT 1 FROM asset_blob_deletion_queue WHERE blob_id = $1
+         )",
+    )
+    .bind(blob_id)
+    .fetch_one(&mut **transaction)
+    .await
+    .map_err(storage_error)
 }
 
 impl<'borrow, 'pool> PostgresAssetTransaction<'borrow, 'pool> {
     /// Creates an asset view over a unit-of-work transaction.
     pub(crate) fn new(
         job_transaction: &'borrow mut PostgresJobTransaction<'pool>,
+        blob_store: Arc<dyn AssetBlobStore>,
         preparation: Option<AssetBatchPreparation>,
         policy: AssetCachePolicy,
+        mutation_state: Arc<Mutex<AssetMutationState>>,
     ) -> Self {
         Self {
             job_transaction,
+            blob_store,
             preparation,
             policy,
+            mutation_state,
         }
     }
 
@@ -939,25 +1503,37 @@ impl AssetTransactionRepository for PostgresAssetTransaction<'_, '_> {
         // partially archived batch.
         let policy = self.policy;
         let preparation = self.preparation.clone();
+        let blob_store = Arc::clone(&self.blob_store);
+        let mutation_state = Arc::clone(&self.mutation_state);
+        let newly_written_start = mutation_state.lock().unwrap().newly_written.len();
+        let deferred_start = mutation_state.lock().unwrap().deferred_evictions.len();
+        let pending_start = mutation_state.lock().unwrap().pending_bytes;
         let transaction = self.transaction()?;
         // A batch can contain several URLs. Acquire the aggregate-capacity
         // lock before the first per-URL lock so two batches cannot hold
         // different URL locks while waiting for each other's capacity turn.
         lock_asset_capacity(transaction).await?;
         let mut savepoint = transaction.begin().await.map_err(storage_error)?;
-        let result = store_inputs(
-            &mut savepoint,
+        let mut context = AssetWriteContext::new(
+            blob_store.as_ref(),
             policy,
-            source_id,
-            review_id,
-            inputs,
             preparation.as_ref(),
-        )
-        .await;
+            &mutation_state,
+        );
+        let result = store_inputs(&mut savepoint, source_id, review_id, inputs, &mut context).await;
         let stored = match result {
             Ok(stored) => stored,
             Err(error) => {
-                return match savepoint.rollback().await {
+                let rollback = savepoint.rollback().await;
+                mutation_state
+                    .lock()
+                    .unwrap()
+                    .deferred_evictions
+                    .truncate(deferred_start);
+                mutation_state.lock().unwrap().pending_bytes = pending_start;
+                let newly_written = take_newly_written_from(&mutation_state, newly_written_start);
+                cleanup_new_blobs(blob_store.as_ref(), transaction, &newly_written).await;
+                return match rollback {
                     Ok(()) => Err(error),
                     Err(rollback_error) => Err(AssetRepositoryError::Storage(format!(
                         "{error}; asset batch rollback failed: {rollback_error}"
@@ -965,7 +1541,17 @@ impl AssetTransactionRepository for PostgresAssetTransaction<'_, '_> {
                 };
             }
         };
-        savepoint.commit().await.map_err(storage_error)?;
+        if let Err(error) = savepoint.commit().await.map_err(storage_error) {
+            mutation_state
+                .lock()
+                .unwrap()
+                .deferred_evictions
+                .truncate(deferred_start);
+            mutation_state.lock().unwrap().pending_bytes = pending_start;
+            let newly_written = take_newly_written_from(&mutation_state, newly_written_start);
+            cleanup_new_blobs(blob_store.as_ref(), transaction, &newly_written).await;
+            return Err(error);
+        }
         Ok(stored)
     }
 
@@ -1003,6 +1589,11 @@ impl AssetTransactionRepository for PostgresAssetTransaction<'_, '_> {
         // an unreferenced asset merely because the replacement failed.
         let policy = self.policy;
         let preparation = self.preparation.clone();
+        let blob_store = Arc::clone(&self.blob_store);
+        let mutation_state = Arc::clone(&self.mutation_state);
+        let newly_written_start = mutation_state.lock().unwrap().newly_written.len();
+        let deferred_start = mutation_state.lock().unwrap().deferred_evictions.len();
+        let pending_start = mutation_state.lock().unwrap().pending_bytes;
         let transaction = self.transaction()?;
         // Non-empty replacements retain the capacity-first lock order used by
         // maintenance. An empty replacement only changes article relationships;
@@ -1023,28 +1614,48 @@ impl AssetTransactionRepository for PostgresAssetTransaction<'_, '_> {
             .await
             .map_err(storage_error)?;
 
-            store_inputs(
-                &mut savepoint,
+            let mut context = AssetWriteContext::new(
+                blob_store.as_ref(),
                 policy,
-                source_id,
-                review_id,
-                inputs,
                 preparation.as_ref(),
-            )
-            .await
+                &mutation_state,
+            );
+            store_inputs(&mut savepoint, source_id, review_id, inputs, &mut context).await
         }
         .await;
         match result {
             Ok(stored) => {
-                savepoint.commit().await.map_err(storage_error)?;
+                if let Err(error) = savepoint.commit().await.map_err(storage_error) {
+                    mutation_state
+                        .lock()
+                        .unwrap()
+                        .deferred_evictions
+                        .truncate(deferred_start);
+                    mutation_state.lock().unwrap().pending_bytes = pending_start;
+                    let newly_written =
+                        take_newly_written_from(&mutation_state, newly_written_start);
+                    cleanup_new_blobs(blob_store.as_ref(), transaction, &newly_written).await;
+                    return Err(error);
+                }
                 Ok(stored)
             }
-            Err(error) => match savepoint.rollback().await {
-                Ok(()) => Err(error),
-                Err(rollback_error) => Err(AssetRepositoryError::Storage(format!(
-                    "{error}; asset replacement rollback failed: {rollback_error}"
-                ))),
-            },
+            Err(error) => {
+                let rollback = savepoint.rollback().await;
+                mutation_state
+                    .lock()
+                    .unwrap()
+                    .deferred_evictions
+                    .truncate(deferred_start);
+                mutation_state.lock().unwrap().pending_bytes = pending_start;
+                let newly_written = take_newly_written_from(&mutation_state, newly_written_start);
+                cleanup_new_blobs(blob_store.as_ref(), transaction, &newly_written).await;
+                match rollback {
+                    Ok(()) => Err(error),
+                    Err(rollback_error) => Err(AssetRepositoryError::Storage(format!(
+                        "{error}; asset replacement rollback failed: {rollback_error}"
+                    ))),
+                }
+            }
         }
     }
 }
@@ -1063,13 +1674,14 @@ fn validate_input_count(
 
 async fn store_inputs(
     transaction: &mut Transaction<'_, Postgres>,
-    policy: AssetCachePolicy,
     source_id: crate::domain::source::SourceId,
     review_id: &str,
     inputs: &[AssetInput],
-    preparation: Option<&AssetBatchPreparation>,
+    context: &mut AssetWriteContext<'_>,
 ) -> Result<Vec<StoredAsset>, AssetRepositoryError> {
-    let preparation = preparation.ok_or(AssetRepositoryError::PreparationRequired)?;
+    context
+        .preparation
+        .ok_or(AssetRepositoryError::PreparationRequired)?;
     let mut stored = Vec::with_capacity(inputs.len());
     // Keep bodies already returned by this batch out of LRU eviction. If a
     // later input cannot fit without evicting one of these bodies, reject the
@@ -1077,12 +1689,11 @@ async fn store_inputs(
     let mut protected_blob_ids = Vec::with_capacity(inputs.len());
     let mut batch_blobs = HashMap::with_capacity(inputs.len());
     for input in inputs {
-        validate_input(input, policy)?;
+        validate_input(input, context.policy)?;
         let asset = store_one(
             transaction,
-            policy,
+            context,
             input,
-            preparation,
             &protected_blob_ids,
             &batch_blobs,
         )
@@ -1097,14 +1708,39 @@ async fn store_inputs(
     Ok(stored)
 }
 
+struct AssetWriteContext<'a> {
+    blob_store: &'a dyn AssetBlobStore,
+    policy: AssetCachePolicy,
+    preparation: Option<&'a AssetBatchPreparation>,
+    mutation_state: &'a Arc<Mutex<AssetMutationState>>,
+}
+
+impl<'a> AssetWriteContext<'a> {
+    fn new(
+        blob_store: &'a dyn AssetBlobStore,
+        policy: AssetCachePolicy,
+        preparation: Option<&'a AssetBatchPreparation>,
+        mutation_state: &'a Arc<Mutex<AssetMutationState>>,
+    ) -> Self {
+        Self {
+            blob_store,
+            policy,
+            preparation,
+            mutation_state,
+        }
+    }
+}
+
 async fn store_one(
     transaction: &mut Transaction<'_, Postgres>,
-    policy: AssetCachePolicy,
+    context: &mut AssetWriteContext<'_>,
     input: &AssetInput,
-    preparation: &AssetBatchPreparation,
     protected_blob_ids: &[Uuid],
     batch_blobs: &HashMap<Uuid, Uuid>,
 ) -> Result<StoredAsset, AssetRepositoryError> {
+    let preparation = context
+        .preparation
+        .ok_or(AssetRepositoryError::PreparationRequired)?;
     let source_url = normalize_url(input.source_url.clone())?;
     let final_url = normalize_url(input.final_url.clone())?;
     let checksum = input.checksum().to_owned();
@@ -1163,12 +1799,15 @@ async fn store_one(
             // declaring the fast path successful.
             lock_asset_capacity(transaction).await?;
             let refreshed_blob = sqlx::query(
-                "SELECT checksum, byte_size, media_type
+                "SELECT id
                  FROM asset_blobs
                  WHERE id = $1
                    AND checksum = $2
                    AND byte_size = $3
-                   AND data IS NOT NULL
+                   AND NOT EXISTS (
+                       SELECT 1 FROM asset_blob_deletion_queue AS q
+                       WHERE q.blob_id = asset_blobs.id
+                   )
                  FOR UPDATE",
             )
             .bind(blob_id)
@@ -1177,17 +1816,19 @@ async fn store_one(
             .fetch_optional(&mut **transaction)
             .await
             .map_err(storage_error)?;
-            if let Some(refreshed_blob) = refreshed_blob {
-                let refreshed_checksum = refreshed_blob
-                    .try_get::<String, _>("checksum")
-                    .map_err(storage_error)?;
-                let refreshed_size = refreshed_blob
-                    .try_get::<i64, _>("byte_size")
-                    .map_err(storage_error)?;
-                if refreshed_checksum == checksum && refreshed_size == byte_size {
-                    let media_type = refreshed_blob
-                        .try_get::<String, _>("media_type")
-                        .map_err(storage_error)?;
+            if refreshed_blob.is_some() {
+                if let Some(metadata) = blob_stat_in_transaction(
+                    context.blob_store,
+                    transaction,
+                    &AssetBlobKey::for_blob_id(blob_id),
+                )
+                .await?
+                .filter(|metadata| {
+                    metadata.is_present()
+                        && metadata.checksum() == checksum
+                        && metadata.byte_size() == byte_size as u64
+                }) {
+                    let media_type = metadata.media_type().to_owned();
                     sqlx::query(
                         "UPDATE asset_records
                          SET final_url = $2,
@@ -1237,12 +1878,15 @@ async fn store_one(
 
     let (blob_id, media_type) = if let Some(blob_id) = matching_blob {
         let row = sqlx::query(
-            "SELECT media_type
+            "SELECT id
              FROM asset_blobs
              WHERE id = $1
                AND checksum = $2
                AND byte_size = $3
-               AND data IS NOT NULL
+               AND NOT EXISTS (
+                   SELECT 1 FROM asset_blob_deletion_queue AS q
+                   WHERE q.blob_id = asset_blobs.id
+               )
              FOR UPDATE",
         )
         .bind(blob_id)
@@ -1251,8 +1895,22 @@ async fn store_one(
         .fetch_optional(&mut **transaction)
         .await
         .map_err(storage_error)?;
-        if let Some(row) = row {
-            let media_type = row.try_get("media_type").map_err(storage_error)?;
+        let metadata = if row.is_some() {
+            blob_stat_in_transaction(
+                context.blob_store,
+                transaction,
+                &AssetBlobKey::for_blob_id(blob_id),
+            )
+            .await?
+            .filter(|metadata| {
+                metadata.is_present()
+                    && metadata.checksum() == checksum
+                    && metadata.byte_size() == byte_size as u64
+            })
+        } else {
+            None
+        };
+        if let Some(metadata) = metadata {
             sqlx::query(
                 "UPDATE asset_blobs
                  SET last_fetched_at = clock_timestamp(),
@@ -1263,14 +1921,14 @@ async fn store_one(
             .execute(&mut **transaction)
             .await
             .map_err(storage_error)?;
-            (blob_id, media_type)
+            (blob_id, metadata.media_type().to_owned())
         } else {
             insert_blob(
                 transaction,
+                context,
                 input,
                 &checksum,
                 byte_size,
-                policy,
                 protected_blob_ids,
             )
             .await?
@@ -1278,10 +1936,10 @@ async fn store_one(
     } else {
         insert_blob(
             transaction,
+            context,
             input,
             &checksum,
             byte_size,
-            policy,
             protected_blob_ids,
         )
         .await?
@@ -1322,33 +1980,72 @@ async fn store_one(
 
 async fn insert_blob(
     transaction: &mut Transaction<'_, Postgres>,
+    context: &mut AssetWriteContext<'_>,
     input: &AssetInput,
     checksum: &str,
     byte_size: i64,
-    policy: AssetCachePolicy,
     protected_blob_ids: &[Uuid],
 ) -> Result<(Uuid, String), AssetRepositoryError> {
+    let mut deferred_evictions = {
+        context
+            .mutation_state
+            .lock()
+            .unwrap()
+            .deferred_evictions
+            .clone()
+    };
+    let (pending_blob_ids, pending_bytes) = {
+        let state = context.mutation_state.lock().unwrap();
+        (state.newly_written.clone(), state.pending_bytes)
+    };
     enforce_cache_limit(
+        context.blob_store,
         transaction,
-        policy.max_cache_size_bytes(),
+        context.policy.max_cache_size_bytes(),
         u64::try_from(byte_size).expect("non-negative asset size"),
         protected_blob_ids,
+        pending_bytes,
+        &pending_blob_ids,
+        &mut deferred_evictions,
     )
     .await?;
+    context.mutation_state.lock().unwrap().deferred_evictions = deferred_evictions;
     let blob_id = Uuid::new_v4();
+    let blob = AssetBlob::new(
+        input.bytes.clone(),
+        input.media_type.clone(),
+        checksum.to_owned(),
+    )?;
+    blob_put_in_transaction(
+        context.blob_store,
+        transaction,
+        &AssetBlobKey::for_blob_id(blob_id),
+        &blob,
+    )
+    .await?;
+    context
+        .mutation_state
+        .lock()
+        .unwrap()
+        .newly_written
+        .push(blob_id);
     sqlx::query(
         "INSERT INTO asset_blobs
                 (id, checksum_algorithm, checksum, byte_size, media_type, data)
-             VALUES ($1, 'sha256', $2, $3, $4, $5)",
+         VALUES ($1, 'sha256', $2, $3, $4, NULL)
+         ON CONFLICT (id) DO NOTHING",
     )
     .bind(blob_id)
-    .bind(checksum)
+    .bind(blob.checksum())
     .bind(byte_size)
-    .bind(&input.media_type)
-    .bind(&input.bytes)
+    .bind(blob.media_type())
     .execute(&mut **transaction)
     .await
     .map_err(storage_error)?;
+    context.mutation_state.lock().unwrap().pending_bytes =
+        pending_bytes.checked_add(blob.byte_size()).ok_or_else(|| {
+            AssetRepositoryError::Storage("asset batch byte count overflow".to_owned())
+        })?;
     Ok((blob_id, input.media_type.clone()))
 }
 
@@ -1384,11 +2081,182 @@ async fn attach(
     Ok(())
 }
 
+async fn cleanup_new_blobs(
+    blob_store: &dyn AssetBlobStore,
+    transaction: &mut Transaction<'_, Postgres>,
+    blob_ids: &[Uuid],
+) {
+    if blob_ids.is_empty() {
+        return;
+    }
+    let mut delete_failed = false;
+    for blob_id in blob_ids {
+        if let Err(error) = if blob_store.as_any().is::<PostgresAssetBlobStore>() {
+            PostgresAssetBlobStore::delete_in_transaction(
+                transaction,
+                &AssetBlobKey::for_blob_id(*blob_id),
+            )
+            .await
+            .map_err(AssetRepositoryError::from)
+        } else {
+            blob_store
+                .delete(&AssetBlobKey::for_blob_id(*blob_id))
+                .await
+                .map_err(AssetRepositoryError::from)
+        } {
+            delete_failed = true;
+            if !blob_store.as_any().is::<PostgresAssetBlobStore>() {
+                if let Err(queue_error) = sqlx::query(
+                    "INSERT INTO asset_blob_cleanup_queue (blob_id)
+                     VALUES ($1) ON CONFLICT (blob_id) DO NOTHING",
+                )
+                .bind(blob_id)
+                .execute(&mut **transaction)
+                .await
+                {
+                    tracing::warn!(error = %queue_error, "unable to retain failed asset blob cleanup");
+                }
+            }
+            tracing::warn!(%blob_id, error = %error, "unable to clean up an uncommitted asset blob");
+        }
+    }
+    if !delete_failed {
+        if let Err(error) = sqlx::query("DELETE FROM asset_blobs WHERE id = ANY($1::uuid[])")
+            .bind(blob_ids.to_vec())
+            .execute(&mut **transaction)
+            .await
+        {
+            tracing::warn!(error = %error, "unable to clean up uncommitted asset blob metadata");
+        }
+    }
+}
+
+async fn evict_stale_blobs(
+    blob_store: &dyn AssetBlobStore,
+    transaction: &mut Transaction<'_, Postgres>,
+    seconds: i64,
+) -> Result<Vec<Uuid>, AssetRepositoryError> {
+    let rows = sqlx::query(
+        "SELECT id
+         FROM asset_blobs
+         WHERE last_accessed_at < clock_timestamp()
+               - make_interval(secs => $1::double precision)
+         ORDER BY last_accessed_at ASC, id ASC",
+    )
+    .bind(seconds)
+    .fetch_all(&mut **transaction)
+    .await
+    .map_err(storage_error)?;
+
+    let mut evicted = Vec::new();
+    for row in rows {
+        let blob_id = row.try_get::<Uuid, _>("id").map_err(storage_error)?;
+        let key = AssetBlobKey::for_blob_id(blob_id);
+        if blob_stat_in_transaction(blob_store, transaction, &key)
+            .await?
+            .is_some_and(|metadata| metadata.is_present())
+        {
+            evicted.push(blob_id);
+        }
+    }
+    Ok(evicted)
+}
+
+async fn cached_byte_size(
+    blob_store: &dyn AssetBlobStore,
+    transaction: &mut Transaction<'_, Postgres>,
+    excluded_blob_ids: &[Uuid],
+) -> Result<i64, AssetRepositoryError> {
+    if blob_store.as_any().is::<PostgresAssetBlobStore>() {
+        return sqlx::query_scalar(
+            "SELECT COALESCE(SUM(byte_size), 0)::BIGINT
+             FROM asset_blobs
+             WHERE data IS NOT NULL
+               AND NOT (id = ANY($1::uuid[]))",
+        )
+        .bind(excluded_blob_ids.to_vec())
+        .fetch_one(&mut **transaction)
+        .await
+        .map_err(storage_error);
+    }
+    let rows = sqlx::query(
+        "SELECT id, byte_size
+         FROM asset_blobs
+         WHERE NOT (id = ANY($1::uuid[]))",
+    )
+    .bind(excluded_blob_ids.to_vec())
+    .fetch_all(&mut **transaction)
+    .await
+    .map_err(storage_error)?;
+    let mut total = 0_i64;
+    for row in rows {
+        let blob_id = row.try_get::<Uuid, _>("id").map_err(storage_error)?;
+        if blob_stat_in_transaction(blob_store, transaction, &AssetBlobKey::for_blob_id(blob_id))
+            .await?
+            .is_some_and(|metadata| metadata.is_present())
+        {
+            let byte_size = row.try_get::<i64, _>("byte_size").map_err(storage_error)?;
+            total = total.checked_add(byte_size).ok_or_else(|| {
+                AssetRepositoryError::Storage("asset byte count overflow".to_owned())
+            })?;
+        }
+    }
+    Ok(total)
+}
+
+async fn oldest_present(
+    blob_store: &dyn AssetBlobStore,
+    transaction: &mut Transaction<'_, Postgres>,
+    protected_blob_ids: &[Uuid],
+) -> Result<Option<(Uuid, i64)>, AssetRepositoryError> {
+    if blob_store.as_any().is::<PostgresAssetBlobStore>() {
+        return sqlx::query_as::<_, (Uuid, i64)>(
+            "SELECT id, byte_size
+             FROM asset_blobs
+             WHERE data IS NOT NULL
+               AND NOT (id = ANY($1::uuid[]))
+             ORDER BY last_accessed_at ASC, id ASC
+             LIMIT 1",
+        )
+        .bind(protected_blob_ids.to_vec())
+        .fetch_optional(&mut **transaction)
+        .await
+        .map_err(storage_error);
+    }
+    let rows = sqlx::query(
+        "SELECT id, byte_size
+         FROM asset_blobs
+         WHERE NOT (id = ANY($1::uuid[]))
+         ORDER BY last_accessed_at ASC, id ASC",
+    )
+    .bind(protected_blob_ids.to_vec())
+    .fetch_all(&mut **transaction)
+    .await
+    .map_err(storage_error)?;
+    for row in rows {
+        let blob_id = row.try_get::<Uuid, _>("id").map_err(storage_error)?;
+        if blob_stat_in_transaction(blob_store, transaction, &AssetBlobKey::for_blob_id(blob_id))
+            .await?
+            .is_some_and(|metadata| metadata.is_present())
+        {
+            return Ok(Some((
+                blob_id,
+                row.try_get::<i64, _>("byte_size").map_err(storage_error)?,
+            )));
+        }
+    }
+    Ok(None)
+}
+
 async fn enforce_cache_limit(
+    blob_store: &dyn AssetBlobStore,
     transaction: &mut Transaction<'_, Postgres>,
     max_bytes: u64,
     additional_bytes: u64,
     protected_blob_ids: &[Uuid],
+    pending_bytes: u64,
+    pending_blob_ids: &[Uuid],
+    deferred_evictions: &mut Vec<Uuid>,
 ) -> Result<u64, AssetRepositoryError> {
     if max_bytes == 0 {
         return Ok(0);
@@ -1414,14 +2282,20 @@ async fn enforce_cache_limit(
     // different URLs to all pass the same stale SUM and exceed the cap.
     lock_asset_capacity(transaction).await?;
 
-    let mut total: i64 = sqlx::query_scalar(
-        "SELECT COALESCE(SUM(byte_size), 0)::bigint
-         FROM asset_blobs
-         WHERE data IS NOT NULL",
-    )
-    .fetch_one(&mut **transaction)
-    .await
-    .map_err(storage_error)?;
+    let pending_i64 =
+        i64::try_from(pending_bytes).map_err(|_| AssetRepositoryError::CapacityExceeded {
+            requested_bytes: additional_bytes,
+            max_bytes,
+        })?;
+    let mut excluded_blob_ids = pending_blob_ids.to_vec();
+    excluded_blob_ids.extend(deferred_evictions.iter().copied());
+    let mut total = cached_byte_size(blob_store, transaction, &excluded_blob_ids)
+        .await?
+        .checked_add(pending_i64)
+        .ok_or(AssetRepositoryError::CapacityExceeded {
+            requested_bytes: additional_bytes,
+            max_bytes,
+        })?;
     let mut evicted = 0;
     loop {
         let exceeds = total
@@ -1431,32 +2305,17 @@ async fn enforce_cache_limit(
             break;
         }
 
-        let row = sqlx::query(
-            "SELECT id, byte_size
-             FROM asset_blobs
-             WHERE data IS NOT NULL
-               AND NOT (id = ANY($1::uuid[]))
-             ORDER BY last_accessed_at ASC, id ASC
-             LIMIT 1
-             FOR UPDATE",
-        )
-        .bind(protected_blob_ids.to_vec())
-        .fetch_optional(&mut **transaction)
-        .await
-        .map_err(storage_error)?;
-        let Some(row) = row else {
+        let mut protected = protected_blob_ids.to_vec();
+        protected.extend(deferred_evictions.iter().copied());
+        let Some((blob_id, byte_size)) =
+            oldest_present(blob_store, transaction, &protected).await?
+        else {
             return Err(AssetRepositoryError::CapacityExceeded {
                 requested_bytes: additional_bytes,
                 max_bytes,
             });
         };
-        let blob_id: Uuid = row.try_get("id").map_err(storage_error)?;
-        let byte_size: i64 = row.try_get("byte_size").map_err(storage_error)?;
-        sqlx::query("UPDATE asset_blobs SET data = NULL WHERE id = $1")
-            .bind(blob_id)
-            .execute(&mut **transaction)
-            .await
-            .map_err(storage_error)?;
+        deferred_evictions.push(blob_id);
         sqlx::query(
             "UPDATE asset_records
              SET fetch_status = 'missing',

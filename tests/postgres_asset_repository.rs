@@ -1,7 +1,9 @@
 //! PostgreSQL integration coverage for the database-backed asset cache.
 
 use std::{
+    collections::HashMap,
     sync::Arc,
+    sync::Mutex,
     time::{Duration, Instant},
 };
 
@@ -9,7 +11,10 @@ use chrono::Utc;
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
 use werrss::{
-    archive::asset_store::{AssetCachePolicy, AssetInput, AssetRead, AssetRepairPolicy},
+    archive::asset_store::{
+        AssetBlob, AssetBlobKey, AssetBlobMetadata, AssetBlobStore, AssetBlobStoreError,
+        AssetCachePolicy, AssetInput, AssetRead, AssetRepairPolicy,
+    },
     domain::{
         article::{ArticleObservationVersion, NewArticle},
         source::{NewSource, SchedulingGate, SourceId, VerifiedWechatArticleUrl},
@@ -30,6 +35,536 @@ use werrss::{
 
 const FIRST_BYTES: &[u8] = b"first-image";
 const SECOND_BYTES: &[u8] = b"second-img";
+
+#[derive(Clone, Default)]
+struct MemoryBlobStore {
+    entries: Arc<Mutex<HashMap<String, MemoryBlobEntry>>>,
+    failed_deletes: Arc<Mutex<usize>>,
+}
+
+impl MemoryBlobStore {
+    fn fail_next_deletes(&self, count: usize) {
+        *self.failed_deletes.lock().unwrap() = count;
+    }
+}
+
+#[derive(Clone)]
+struct MemoryBlobEntry {
+    blob: AssetBlob,
+    present: bool,
+}
+
+#[async_trait::async_trait]
+impl AssetBlobStore for MemoryBlobStore {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    async fn read(&self, key: &AssetBlobKey) -> Result<Option<AssetBlob>, AssetBlobStoreError> {
+        Ok(self
+            .entries
+            .lock()
+            .unwrap()
+            .get(key.as_str())
+            .filter(|entry| entry.present)
+            .map(|entry| entry.blob.clone()))
+    }
+
+    async fn stat(
+        &self,
+        key: &AssetBlobKey,
+    ) -> Result<Option<AssetBlobMetadata>, AssetBlobStoreError> {
+        self.entries
+            .lock()
+            .unwrap()
+            .get(key.as_str())
+            .map(|entry| {
+                AssetBlobMetadata::new(
+                    entry.blob.checksum().to_owned(),
+                    entry.blob.media_type().to_owned(),
+                    entry.blob.byte_size(),
+                    entry.present,
+                )
+            })
+            .transpose()
+    }
+
+    async fn put(&self, key: &AssetBlobKey, blob: &AssetBlob) -> Result<(), AssetBlobStoreError> {
+        let mut entries = self.entries.lock().unwrap();
+        if let Some(entry) = entries.get_mut(key.as_str()) {
+            if entry.blob != *blob {
+                return Err(AssetBlobStoreError::Conflict);
+            }
+            entry.present = true;
+        } else {
+            entries.insert(
+                key.as_str().to_owned(),
+                MemoryBlobEntry {
+                    blob: blob.clone(),
+                    present: true,
+                },
+            );
+        }
+        Ok(())
+    }
+
+    async fn delete(&self, key: &AssetBlobKey) -> Result<(), AssetBlobStoreError> {
+        let mut failed_deletes = self.failed_deletes.lock().unwrap();
+        if *failed_deletes > 0 {
+            *failed_deletes -= 1;
+            return Err(AssetBlobStoreError::Backend(
+                "injected delete failure".to_owned(),
+            ));
+        }
+        if let Some(entry) = self.entries.lock().unwrap().get_mut(key.as_str()) {
+            entry.present = false;
+        }
+        Ok(())
+    }
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn asset_repository_routes_binary_operations_through_an_injected_backend(pool: PgPool) {
+    let source_id = SourceId::from_uuid(Uuid::new_v4());
+    create_source_and_articles(&pool, source_id, &["injected-backend"]).await;
+    let backend = Arc::new(MemoryBlobStore::default());
+    let policy = test_policy(0, Duration::from_secs(30), 1024);
+    let input = asset_input("https://cdn.example/injected-backend.png", FIRST_BYTES, 0);
+
+    let factory = UnitOfWorkFactory::with_blob_store(pool.clone(), backend.clone());
+    let mut unit_of_work = factory
+        .begin_with_assets(std::slice::from_ref(&input))
+        .await
+        .unwrap();
+    let stored = unit_of_work
+        .assets(policy)
+        .store_for_article(source_id, "injected-backend", std::slice::from_ref(&input))
+        .await
+        .unwrap()
+        .remove(0);
+    unit_of_work.commit().await.unwrap();
+
+    let key = AssetBlobKey::for_blob_id(stored.blob_id());
+    assert_eq!(
+        backend.read(&key).await.unwrap().unwrap().bytes(),
+        FIRST_BYTES
+    );
+    assert!(
+        sqlx::query_scalar::<_, bool>("SELECT data IS NULL FROM asset_blobs WHERE id = $1")
+            .bind(stored.blob_id())
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        "an injected backend should own bytes instead of duplicating them in PostgreSQL"
+    );
+
+    let read = PostgresAssetStore::with_blob_store(pool, policy, backend)
+        .read_and_touch(stored.id())
+        .await
+        .unwrap();
+    assert!(matches!(
+        read,
+        Some(AssetRead::Available { ref bytes, .. }) if bytes == FIRST_BYTES
+    ));
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn dropping_external_asset_unit_cleans_implicit_rollback_allocations(pool: PgPool) {
+    let source_id = SourceId::from_uuid(Uuid::new_v4());
+    create_source_and_articles(&pool, source_id, &["implicit-rollback"]).await;
+    let backend = Arc::new(MemoryBlobStore::default());
+    let policy = test_policy(0, Duration::from_secs(30), 1024);
+    let input = asset_input("https://cdn.example/implicit-rollback.png", FIRST_BYTES, 0);
+    let key;
+    {
+        let factory = UnitOfWorkFactory::with_blob_store(pool.clone(), backend.clone());
+        let mut unit_of_work = factory
+            .begin_with_assets(std::slice::from_ref(&input))
+            .await
+            .unwrap();
+        let stored = unit_of_work
+            .assets(policy)
+            .store_for_article(source_id, "implicit-rollback", std::slice::from_ref(&input))
+            .await
+            .unwrap()
+            .remove(0);
+        key = AssetBlobKey::for_blob_id(stored.blob_id());
+        assert!(backend.read(&key).await.unwrap().is_some());
+    }
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(backend.read(&key).await.unwrap().is_none());
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM asset_blobs")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        0
+    );
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn asset_rollback_keeps_evicted_bytes_and_cleans_new_allocations(pool: PgPool) {
+    let source_id = SourceId::from_uuid(Uuid::new_v4());
+    create_source_and_articles(&pool, source_id, &["rollback-first", "rollback-second"]).await;
+    let backend = Arc::new(MemoryBlobStore::default());
+    let policy = test_policy(15, Duration::from_secs(30), 1024);
+    let first = asset_input("https://cdn.example/rollback-first.png", FIRST_BYTES, 0);
+    let second = asset_input("https://cdn.example/rollback-second.png", SECOND_BYTES, 0);
+    let factory = UnitOfWorkFactory::with_blob_store(pool.clone(), backend.clone());
+
+    let mut first_work = factory
+        .begin_with_assets(std::slice::from_ref(&first))
+        .await
+        .unwrap();
+    let first_stored = first_work
+        .assets(policy)
+        .store_for_article(source_id, "rollback-first", std::slice::from_ref(&first))
+        .await
+        .unwrap()
+        .remove(0);
+    first_work.commit().await.unwrap();
+
+    let first_key = AssetBlobKey::for_blob_id(first_stored.blob_id());
+    let mut second_work = factory
+        .begin_with_assets(std::slice::from_ref(&second))
+        .await
+        .unwrap();
+    let second_stored = second_work
+        .assets(policy)
+        .store_for_article(source_id, "rollback-second", std::slice::from_ref(&second))
+        .await
+        .unwrap()
+        .remove(0);
+    backend.fail_next_deletes(1);
+    second_work.rollback().await.unwrap();
+
+    assert_eq!(
+        backend.read(&first_key).await.unwrap().unwrap().bytes(),
+        FIRST_BYTES
+    );
+    assert!(backend
+        .read(&AssetBlobKey::for_blob_id(second_stored.blob_id()))
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        sqlx::query_scalar::<_, bool>(
+            "SELECT fetch_status = 'available' FROM asset_records WHERE id = $1"
+        )
+        .bind(first_stored.id())
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        true
+    );
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn external_backend_capacity_includes_blobs_from_prior_asset_views(pool: PgPool) {
+    let source_id = SourceId::from_uuid(Uuid::new_v4());
+    create_source_and_articles(&pool, source_id, &["capacity-first", "capacity-second"]).await;
+    let backend = Arc::new(MemoryBlobStore::default());
+    let policy = test_policy(15, Duration::from_secs(30), 1024);
+    let first = asset_input("https://cdn.example/capacity-first.png", FIRST_BYTES, 0);
+    let second = asset_input("https://cdn.example/capacity-second.png", SECOND_BYTES, 0);
+    let factory = UnitOfWorkFactory::with_blob_store(pool.clone(), backend.clone());
+    let mut unit_of_work = factory
+        .begin_with_assets(&[first.clone(), second.clone()])
+        .await
+        .unwrap();
+
+    let first_stored = unit_of_work
+        .assets(policy)
+        .replace_for_article(source_id, "capacity-first", std::slice::from_ref(&first))
+        .await
+        .unwrap()
+        .remove(0);
+    let second_stored = unit_of_work
+        .assets(policy)
+        .replace_for_article(source_id, "capacity-second", std::slice::from_ref(&second))
+        .await
+        .unwrap()
+        .remove(0);
+    unit_of_work.commit().await.unwrap();
+
+    assert!(backend
+        .read(&AssetBlobKey::for_blob_id(first_stored.blob_id()))
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        backend
+            .read(&AssetBlobKey::for_blob_id(second_stored.blob_id()))
+            .await
+            .unwrap()
+            .unwrap()
+            .bytes(),
+        SECOND_BYTES
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COALESCE(SUM(byte_size), 0)::BIGINT FROM asset_blobs WHERE data IS NULL"
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        21
+    );
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn queued_external_blob_is_not_reused_by_asset_deduplication(pool: PgPool) {
+    let source_id = SourceId::from_uuid(Uuid::new_v4());
+    create_source_and_articles(&pool, source_id, &["queued-reuse"]).await;
+    let backend = Arc::new(MemoryBlobStore::default());
+    let policy = test_policy(0, Duration::from_secs(30), 1024);
+    let input = asset_input("https://cdn.example/queued-reuse.png", FIRST_BYTES, 0);
+    let old = store_asset_with_backend(
+        &pool,
+        policy,
+        source_id,
+        "queued-reuse",
+        input.clone(),
+        backend.clone(),
+    )
+    .await;
+    sqlx::query(
+        "INSERT INTO asset_blob_deletion_queue (blob_id) VALUES ($1)
+         ON CONFLICT (blob_id) DO NOTHING",
+    )
+    .bind(old.blob_id())
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let factory = UnitOfWorkFactory::with_blob_store(pool.clone(), backend.clone());
+    let mut unit_of_work = factory
+        .begin_with_assets(std::slice::from_ref(&input))
+        .await
+        .unwrap();
+    let replacement = unit_of_work
+        .assets(policy)
+        .replace_for_article(source_id, "queued-reuse", std::slice::from_ref(&input))
+        .await
+        .unwrap()
+        .remove(0);
+    assert_ne!(replacement.blob_id(), old.blob_id());
+    unit_of_work.commit().await.unwrap();
+
+    assert!(backend
+        .read(&AssetBlobKey::for_blob_id(old.blob_id()))
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        backend
+            .read(&AssetBlobKey::for_blob_id(replacement.blob_id()))
+            .await
+            .unwrap()
+            .unwrap()
+            .bytes(),
+        FIRST_BYTES
+    );
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn failed_post_commit_eviction_stays_queued_and_hidden_from_readers(pool: PgPool) {
+    let source_id = SourceId::from_uuid(Uuid::new_v4());
+    create_source_and_articles(&pool, source_id, &["queued-first", "queued-second"]).await;
+    let backend = Arc::new(MemoryBlobStore::default());
+    let policy = test_policy(15, Duration::from_secs(30), 1024);
+    let first = asset_input("https://cdn.example/queued-first.png", FIRST_BYTES, 0);
+    let second = asset_input("https://cdn.example/queued-second.png", SECOND_BYTES, 0);
+    let factory = UnitOfWorkFactory::with_blob_store(pool.clone(), backend.clone());
+    let mut unit_of_work = factory
+        .begin_with_assets(&[first.clone(), second.clone()])
+        .await
+        .unwrap();
+    let first_stored = unit_of_work
+        .assets(policy)
+        .replace_for_article(source_id, "queued-first", std::slice::from_ref(&first))
+        .await
+        .unwrap()
+        .remove(0);
+    let second_stored = unit_of_work
+        .assets(policy)
+        .replace_for_article(source_id, "queued-second", std::slice::from_ref(&second))
+        .await
+        .unwrap()
+        .remove(0);
+    backend.fail_next_deletes(1);
+    assert!(unit_of_work.commit().await.is_err());
+
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM asset_blob_deletion_queue")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        1
+    );
+    assert!(matches!(
+        PostgresAssetStore::with_blob_store(pool.clone(), policy, backend.clone())
+            .read_and_touch(first_stored.id())
+            .await
+            .unwrap(),
+        Some(AssetRead::Missing { .. })
+    ));
+
+    PostgresAssetStore::with_blob_store(
+        pool.clone(),
+        test_policy(0, Duration::from_secs(30), 1024),
+        backend.clone(),
+    )
+    .maintenance()
+    .await
+    .unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM asset_blob_deletion_queue")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        0
+    );
+    assert!(backend
+        .read(&AssetBlobKey::for_blob_id(first_stored.blob_id()))
+        .await
+        .unwrap()
+        .is_none());
+    assert!(backend
+        .read(&AssetBlobKey::for_blob_id(second_stored.blob_id()))
+        .await
+        .unwrap()
+        .is_some());
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn failed_savepoint_cleanup_is_durable_for_external_blobs(pool: PgPool) {
+    let source_id = SourceId::from_uuid(Uuid::new_v4());
+    create_source_and_articles(&pool, source_id, &["cleanup-queue"]).await;
+    let backend = Arc::new(MemoryBlobStore::default());
+    let policy = test_policy(0, Duration::from_secs(30), 1024);
+    let input = asset_input(
+        "https://cdn.example/cleanup-queue.png",
+        FIRST_BYTES,
+        u32::MAX,
+    );
+    let factory = UnitOfWorkFactory::with_blob_store(pool.clone(), backend.clone());
+    let mut unit_of_work = factory
+        .begin_with_assets(std::slice::from_ref(&input))
+        .await
+        .unwrap();
+    backend.fail_next_deletes(2);
+
+    let result = unit_of_work
+        .assets(policy)
+        .store_for_article(source_id, "cleanup-queue", std::slice::from_ref(&input))
+        .await;
+    assert!(result.is_err());
+    assert!(unit_of_work.commit().await.is_err());
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM asset_blob_cleanup_queue")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        1
+    );
+
+    PostgresAssetStore::with_blob_store(pool.clone(), policy, backend.clone())
+        .maintenance()
+        .await
+        .unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM asset_blob_cleanup_queue")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        0
+    );
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn failed_later_asset_view_does_not_clean_prior_allocations(pool: PgPool) {
+    let source_id = SourceId::from_uuid(Uuid::new_v4());
+    create_source_and_articles(&pool, source_id, &["prior-allocation", "failed-allocation"]).await;
+    let backend = Arc::new(MemoryBlobStore::default());
+    let policy = test_policy(0, Duration::from_secs(30), 1024);
+    let first = asset_input("https://cdn.example/prior-allocation.png", FIRST_BYTES, 0);
+    let failed = asset_input(
+        "https://cdn.example/failed-allocation.png",
+        SECOND_BYTES,
+        u32::MAX,
+    );
+    let factory = UnitOfWorkFactory::with_blob_store(pool.clone(), backend.clone());
+    let mut unit_of_work = factory
+        .begin_with_assets(&[first.clone(), failed.clone()])
+        .await
+        .unwrap();
+    let first_stored = unit_of_work
+        .assets(policy)
+        .store_for_article(source_id, "prior-allocation", std::slice::from_ref(&first))
+        .await
+        .unwrap()
+        .remove(0);
+    assert!(unit_of_work
+        .assets(policy)
+        .store_for_article(
+            source_id,
+            "failed-allocation",
+            std::slice::from_ref(&failed)
+        )
+        .await
+        .is_err());
+    unit_of_work.commit().await.unwrap();
+
+    assert!(backend
+        .read(&AssetBlobKey::for_blob_id(first_stored.blob_id()))
+        .await
+        .unwrap()
+        .is_some());
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn maintenance_retains_orphan_metadata_when_external_delete_fails(pool: PgPool) {
+    let source_id = SourceId::from_uuid(Uuid::new_v4());
+    create_source_and_articles(&pool, source_id, &["orphan-delete-retry"]).await;
+    let backend = Arc::new(MemoryBlobStore::default());
+    let policy = test_policy(0, Duration::from_secs(30), 1024);
+    let stored = store_asset_with_backend(
+        &pool,
+        policy,
+        source_id,
+        "orphan-delete-retry",
+        asset_input(
+            "https://cdn.example/orphan-delete-retry.png",
+            FIRST_BYTES,
+            0,
+        ),
+        backend.clone(),
+    )
+    .await;
+    let key = AssetBlobKey::for_blob_id(stored.blob_id());
+    sqlx::query("DELETE FROM article_assets WHERE asset_record_id = $1")
+        .bind(stored.id())
+        .execute(&pool)
+        .await
+        .unwrap();
+    backend.fail_next_deletes(1);
+
+    let store = PostgresAssetStore::with_blob_store(pool.clone(), policy, backend.clone());
+    assert!(store.maintenance().await.is_err());
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM asset_blobs WHERE id = $1")
+            .bind(stored.blob_id())
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        1
+    );
+    assert!(backend.read(&key).await.unwrap().is_some());
+    assert_eq!(store.maintenance().await.unwrap().orphan_blobs, 1);
+    assert!(backend.read(&key).await.unwrap().is_none());
+}
 
 #[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
 async fn stores_asset_bytes_and_updates_last_accessed_on_read(pool: PgPool) {
@@ -527,6 +1062,20 @@ async fn repair_restores_bytes_without_changing_the_stable_asset_id(pool: PgPool
             .unwrap(),
         AssetRepairRestoreResult::Restored
     );
+    let restored_blob_id =
+        sqlx::query_scalar::<_, Uuid>("SELECT blob_id FROM asset_records WHERE id = $1")
+            .bind(stored.id())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let metadata = store
+        .blob_store()
+        .stat(&AssetBlobKey::for_blob_id(restored_blob_id))
+        .await
+        .unwrap()
+        .expect("repair restoration should retain the blob metadata");
+    assert!(metadata.is_present());
+    assert_eq!(metadata.byte_size(), FIRST_BYTES.len() as u64);
     finish_repair_job(&pool, job_id).await;
     assert!(matches!(
         store.read_and_touch(stored.id()).await.unwrap(),
@@ -1249,21 +1798,24 @@ async fn maintenance_evicts_idle_bytes_but_retains_the_repair_record(pool: PgPoo
         .await
         .unwrap();
 
-    let result = PostgresAssetStore::new(pool.clone(), policy)
-        .maintenance()
-        .await
-        .unwrap();
+    let store = PostgresAssetStore::new(pool.clone(), policy);
+    let result = store.maintenance().await.unwrap();
 
     assert_eq!(result.stale_blobs, 1);
     assert_eq!(
-        PostgresAssetStore::new(pool.clone(), policy)
-            .read_and_touch(stored.id())
-            .await
-            .unwrap(),
+        store.read_and_touch(stored.id()).await.unwrap(),
         Some(AssetRead::Missing {
             source_url: "https://cdn.example/stale.png".parse().unwrap(),
         })
     );
+    let metadata = store
+        .blob_store()
+        .stat(&AssetBlobKey::for_blob_id(stored.blob_id()))
+        .await
+        .unwrap()
+        .expect("age eviction should retain blob metadata");
+    assert!(!metadata.is_present());
+    assert_eq!(metadata.byte_size(), FIRST_BYTES.len() as u64);
     assert_eq!(
         sqlx::query_scalar::<_, String>("SELECT fetch_status FROM asset_records WHERE id = $1",)
             .bind(stored.id())
@@ -1646,6 +2198,28 @@ async fn store_asset(
     input: AssetInput,
 ) -> werrss::archive::asset_store::StoredAsset {
     let factory = UnitOfWorkFactory::new(pool.clone());
+    let mut unit_of_work = factory
+        .begin_with_assets(std::slice::from_ref(&input))
+        .await
+        .unwrap();
+    let stored = unit_of_work
+        .assets(policy)
+        .store_for_article(source_id, review_id, &[input])
+        .await
+        .unwrap();
+    unit_of_work.commit().await.unwrap();
+    stored.into_iter().next().unwrap()
+}
+
+async fn store_asset_with_backend(
+    pool: &PgPool,
+    policy: AssetCachePolicy,
+    source_id: SourceId,
+    review_id: &str,
+    input: AssetInput,
+    backend: Arc<MemoryBlobStore>,
+) -> werrss::archive::asset_store::StoredAsset {
+    let factory = UnitOfWorkFactory::with_blob_store(pool.clone(), backend);
     let mut unit_of_work = factory
         .begin_with_assets(std::slice::from_ref(&input))
         .await

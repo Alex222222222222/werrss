@@ -2,11 +2,28 @@
 
 Status: the disabled/database first slice is implemented. The current runtime
 accepts the database policy, fetches approved public image assets before the
-article persistence transaction, stores them in PostgreSQL, rewrites successful
-references to `/assets/{asset_record_id}`, serves stable asset responses,
+article persistence transaction, stores them in PostgreSQL by default, rewrites
+successful references to `/assets/{asset_record_id}`, serves stable asset responses,
 admits durable missing-asset repair jobs, and runs hourly best-effort
 maintenance. The default `disabled` mode performs no asset network or database
 writes and keeps approved external image URLs.
+
+The first storage-boundary step is also implemented. `AssetBlobStore` is the
+backend-neutral binary port, and `PostgresAssetBlobStore` adapts the existing
+`asset_blobs` table without changing its schema. Existing rows are addressed
+through the stable `blobs/{asset_blob_id}` key convention, and the adapter also
+accepts the legacy bare UUID form. No migration is required for this step;
+metadata, article relationships, deduplication, leases, and eviction remain in
+the PostgreSQL asset repository.
+
+`PostgresAssetStore::with_blob_store` and
+`UnitOfWorkFactory::with_blob_store` are the backend selection points. Their
+`new` constructors select `PostgresAssetBlobStore` by default. The outer
+PostgreSQL transaction remains authoritative for blob metadata and article
+relationships, while the injected port owns binary bytes and may commit them
+independently. A backend implementation must therefore tolerate retries and
+best-effort cleanup when a metadata transaction fails; it must not assume that
+binary writes participate in a distributed transaction with PostgreSQL.
 
 Automatic repair of a missing database-backed asset is implemented. Local
 directory storage, S3 storage, and signed-URL refresh lineages remain future
@@ -43,42 +60,54 @@ operations needed by the asset repository and deliberately does not expose an
 OpenDAL `Operator` or provider-specific options to domain code:
 
 ```rust
-#[async_trait]
+#[async_trait::async_trait]
 pub trait AssetBlobStore: Send + Sync {
+    async fn read(
+        &self,
+        key: &AssetBlobKey,
+    ) -> Result<Option<AssetBlob>, AssetBlobStoreError>;
+    async fn stat(
+        &self,
+        key: &AssetBlobKey,
+    ) -> Result<Option<AssetBlobMetadata>, AssetBlobStoreError>;
     async fn put(
         &self,
-        key: &str,
-        bytes: Bytes,
-        media_type: Option<&str>,
-    ) -> Result<(), BlobStoreError>;
-
-    async fn read(&self, key: &str) -> Result<Option<Bytes>, BlobStoreError>;
-    async fn delete(&self, key: &str) -> Result<(), BlobStoreError>;
-    async fn stat(&self, key: &str) -> Result<Option<u64>, BlobStoreError>;
+        key: &AssetBlobKey,
+        blob: &AssetBlob,
+    ) -> Result<(), AssetBlobStoreError>;
+    async fn delete(&self, key: &AssetBlobKey) -> Result<(), AssetBlobStoreError>;
 }
 ```
 
-The trait uses `#[async_trait]` to match the repository's async boundary. The
-`put` operation is idempotent rather than requiring every backend to provide an
-atomic `put-if-absent`: keys identify one allocated blob and are never reused
-for a different byte sequence, so repeated writes of the same validated bytes
-are safe. A backend must either verify an existing object's bytes before
-accepting a repeated write or report a conflict. `delete` must be retryable
-and `read`/`stat` must distinguish a missing object from a backend failure.
+The trait uses `#[async_trait]` to match the repository's async boundary.
+`AssetBlob` carries the validated bytes, media type, and SHA-256 checksum;
+`AssetBlobMetadata` lets a backend report presence without loading the body.
+The `put` operation is idempotent rather than requiring every backend to
+provide an atomic `put-if-absent`: keys identify one allocated blob and are
+never reused for a different byte sequence, so repeated writes of the same
+validated bytes are safe. A backend must either verify an existing object's
+bytes before accepting a repeated write or report a conflict. `delete` must be
+retryable and `read`/`stat` must distinguish a missing object from a backend
+failure.
 
 The implementations are adapters only:
 
-- `DatabaseBlobStore` keeps the current PostgreSQL binary behavior;
-- `OpenDalFsBlobStore` uses OpenDAL's filesystem service for a local directory;
-- `OpenDalS3BlobStore` uses OpenDAL's S3 service for S3-compatible providers;
+- `PostgresAssetBlobStore` keeps the current PostgreSQL binary behavior and
+  implements the common port; PostgreSQL remains authoritative for metadata
+  and relationships, while blob operations are routed through the injected
+  port and may commit independently of the repository transaction;
+- `OpenDalFsBlobStore` will use OpenDAL's filesystem service for a local
+  directory;
+- `OpenDalS3BlobStore` will use OpenDAL's S3 service for S3-compatible
+  providers;
 - later adapters may use OpenDAL's GCS, Azure Blob, OSS, FTP, SFTP, WebDAV, or
   PostgreSQL services after the common contract is stable.
 
-OpenDAL service features should be enabled selectively. The initial OpenDAL
-integration must enable only filesystem and S3 support rather than compiling
-every service into the application. The async OpenDAL operator is required in
-this Tokio application; its blocking wrapper must not be called from async
-request or worker paths.
+OpenDAL service features should be enabled selectively when those adapters are
+implemented. The initial OpenDAL integration must enable only filesystem and
+S3 support rather than compiling every service into the application. The async
+OpenDAL operator is required in this Tokio application; its blocking wrapper
+must not be called from async request or worker paths.
 
 OpenDAL simplifies object I/O, but it does not replace PostgreSQL's relational
 responsibilities. PostgreSQL remains authoritative for asset IDs, source URL
@@ -89,15 +118,17 @@ application's SQLx schema or transaction boundaries.
 
 ### Object keys and metadata
 
-External backends use generated immutable per-blob keys such as
+External backends will use generated immutable per-blob keys such as
 `blobs/{blob_id}`. A source URL or checksum alone must never become an object
 path: the checksum is only a candidate-deduplication index, and two different
 raw byte sequences must be able to receive different keys even if they share a
-checksum and size. The database retains the stable opaque asset ID and the
-`storage_key`; provider metadata is not used as the source of truth for media
-type, checksum, or accounting. The stable `/assets/{id}` route continues to
-proxy through the application so access timestamps, repair admission, and
-public URL behavior remain unchanged.
+checksum and size. In the current database slice, the UUID in `asset_blobs.id`
+is the authoritative key and no `storage_key` migration is performed. A future
+external-backend migration may add a persisted storage-key/state mapping;
+provider metadata must not become the source of truth for media type, checksum,
+or accounting. The stable `/assets/{id}` route continues to proxy through the
+application so access timestamps, repair admission, and public URL behavior
+remain unchanged.
 
 ### Planned backend configuration
 
@@ -585,14 +616,16 @@ HTML and JavaScript content.
 
 Network fetches and hashing happen before the final persistence transaction.
 The asset preflight uses ordered checksum coordination locks before making an
-authoritative deduplication decision. For the database backend, raw-byte
-comparisons happen inside the short transaction. For an external backend, the
-candidate object is read and compared while a dedicated coordination lock is
-held, then that lock remains held until the metadata transaction commits. No
-external network operation may run while source, article, or feed row locks are
-held. The final transaction rechecks the locked decision and atomically records
-the blob candidate, URL/version record, article relationship, rewritten HTML,
-and any feed revision invalidation.
+authoritative deduplication decision. Raw-byte comparisons and all binary
+reads/writes go through the injected `AssetBlobStore` port. For an external
+backend, the candidate object is read and compared while a dedicated
+coordination lock is held, then that lock remains held until the metadata
+transaction commits. No external network operation may run while source,
+article, or feed row locks are held. The final PostgreSQL transaction
+rechecks the locked decision and atomically records the blob metadata,
+URL/version record, article relationship, rewritten HTML, and any feed
+revision invalidation; binary object writes are not part of a distributed
+transaction.
 
 Blob writes and asset attachment are independently retryable. A worker crash
 can leave an unreferenced blob or a missing-data URL record, but cannot leave a
@@ -616,9 +649,11 @@ distributed transaction. The workflow is therefore:
    reuse the blob metadata, attach the asset record to the article, and publish
    the rewritten article/feed state. Release the coordination lock only after
    this transaction commits.
-5. If the PostgreSQL transaction fails, leave the unreferenced object for
-   orphan cleanup. Do not rely on a compensating delete, which can race with a
-   successful concurrent reference or fail independently.
+5. If the PostgreSQL transaction fails, the object is either removed by the
+   savepoint cleanup path or left unreferenced for orphan cleanup. Cleanup is
+   best effort and must be idempotent; the metadata transaction remains the
+   authority for whether the object is referenced, so a failed delete must not
+   remove a referenced object.
 
 External eviction uses a durable intent so a crash cannot lose the deletion
 state:

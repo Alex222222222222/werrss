@@ -5,7 +5,7 @@
 //! here makes the disabled default explicit and gives the application and
 //! repository the same byte/age/count limits.
 
-use std::time::Duration;
+use std::{any::Any, time::Duration};
 
 use sha2::{Digest, Sha256};
 use url::Url;
@@ -329,6 +329,228 @@ impl AssetInput {
     }
 }
 
+/// A validated, backend-neutral key for one stored blob.
+///
+/// The database backend accepts both the current legacy UUID form and the
+/// future `blobs/{uuid}` form. Keeping the key opaque here prevents a future
+/// filesystem or object-store adapter from treating an upstream URL as a path.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct AssetBlobKey(String);
+
+impl AssetBlobKey {
+    /// Creates a relative backend key and rejects path traversal or absolute
+    /// paths before any adapter receives it.
+    pub fn new(value: impl Into<String>) -> Result<Self, AssetBlobKeyError> {
+        let value = value.into();
+        if value.trim().is_empty() {
+            return Err(AssetBlobKeyError::Empty);
+        }
+        if value.starts_with('/')
+            || value.starts_with('\\')
+            || value.contains('\0')
+            || (value
+                .as_bytes()
+                .first()
+                .is_some_and(|byte| byte.is_ascii_alphabetic())
+                && value.as_bytes().get(1) == Some(&b':'))
+        {
+            return Err(AssetBlobKeyError::AbsoluteOrInvalid);
+        }
+        if value
+            .split('/')
+            .any(|component| component.is_empty() || component == "." || component == "..")
+        {
+            return Err(AssetBlobKeyError::Traversal);
+        }
+        if value.contains('\\') {
+            return Err(AssetBlobKeyError::Backslash);
+        }
+        Ok(Self(value))
+    }
+
+    /// Returns the stable key used for a blob identified by its existing UUID.
+    pub fn for_blob_id(blob_id: Uuid) -> Self {
+        Self(format!("blobs/{blob_id}"))
+    }
+
+    /// Returns the backend-relative key text.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Invalid or unsafe object-key input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum AssetBlobKeyError {
+    /// The key was empty or whitespace-only.
+    #[error("asset blob key must not be empty")]
+    Empty,
+    /// The key was absolute, drive-qualified, or contained a NUL byte.
+    #[error("asset blob key must be relative and contain no NUL byte")]
+    AbsoluteOrInvalid,
+    /// The key contained a traversal component or an empty path component.
+    #[error("asset blob key contains an invalid path component")]
+    Traversal,
+    /// Backslashes are rejected so keys have one path interpretation across
+    /// Unix, Windows, and object-store adapters.
+    #[error("asset blob key must not contain backslashes")]
+    Backslash,
+}
+
+/// Binary data and validated metadata exchanged with a blob backend.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssetBlob {
+    bytes: Vec<u8>,
+    media_type: String,
+    checksum: String,
+}
+
+impl AssetBlob {
+    /// Creates a blob and verifies that its checksum describes its bytes.
+    pub fn new(
+        bytes: Vec<u8>,
+        media_type: String,
+        checksum: String,
+    ) -> Result<Self, AssetBlobStoreError> {
+        if media_type.trim().is_empty() {
+            return Err(AssetBlobStoreError::InvalidMetadata);
+        }
+        let expected = format!("{:x}", Sha256::digest(&bytes));
+        if checksum != expected {
+            return Err(AssetBlobStoreError::ChecksumMismatch);
+        }
+        Ok(Self {
+            bytes,
+            media_type,
+            checksum,
+        })
+    }
+
+    /// Returns the raw bytes.
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Returns the validated response media type.
+    pub fn media_type(&self) -> &str {
+        &self.media_type
+    }
+
+    /// Returns the lowercase SHA-256 checksum.
+    pub fn checksum(&self) -> &str {
+        &self.checksum
+    }
+
+    /// Returns the raw byte count.
+    pub const fn byte_size(&self) -> u64 {
+        self.bytes.len() as u64
+    }
+}
+
+/// Metadata returned by a backend without loading the binary body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssetBlobMetadata {
+    checksum: String,
+    media_type: String,
+    byte_size: u64,
+    present: bool,
+}
+
+impl AssetBlobMetadata {
+    /// Creates validated metadata returned by a backend adapter.
+    ///
+    /// This constructor is public because third-party storage adapters must be
+    /// able to implement [`AssetBlobStore::stat`]. The checksum and media type
+    /// are immutable metadata owned by the application, while `present` only
+    /// describes whether the backend currently retains the binary bytes.
+    pub fn new(
+        checksum: String,
+        media_type: String,
+        byte_size: u64,
+        present: bool,
+    ) -> Result<Self, AssetBlobStoreError> {
+        if media_type.trim().is_empty()
+            || checksum.len() != 64
+            || !checksum.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(AssetBlobStoreError::InvalidMetadata);
+        }
+        Ok(Self {
+            checksum,
+            media_type,
+            byte_size,
+            present,
+        })
+    }
+
+    /// Returns the checksum recorded for the blob.
+    pub fn checksum(&self) -> &str {
+        &self.checksum
+    }
+
+    /// Returns the media type recorded for the blob.
+    pub fn media_type(&self) -> &str {
+        &self.media_type
+    }
+
+    /// Returns the raw byte count recorded for the blob.
+    pub const fn byte_size(&self) -> u64 {
+        self.byte_size
+    }
+
+    /// Returns whether the backend currently has binary data for the key.
+    pub const fn is_present(&self) -> bool {
+        self.present
+    }
+}
+
+/// Backend failures and invariant violations for binary asset storage.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum AssetBlobStoreError {
+    /// A stored row or backend object has invalid metadata.
+    #[error("asset blob metadata is invalid")]
+    InvalidMetadata,
+    /// The checksum does not describe the supplied bytes.
+    #[error("asset blob checksum does not match its bytes")]
+    ChecksumMismatch,
+    /// A key already contains different bytes or immutable metadata.
+    #[error("asset blob key already contains different data")]
+    Conflict,
+    /// A byte count cannot be represented by the database backend.
+    #[error("asset blob size is outside the backend range")]
+    SizeOverflow,
+    /// The underlying backend failed.
+    #[error("asset blob backend error: {0}")]
+    Backend(String),
+}
+
+/// Common asynchronous protocol for asset binary storage.
+///
+/// Metadata, article relationships, deduplication decisions, leases, and
+/// eviction policy remain PostgreSQL responsibilities. Implementations own
+/// only the bytes addressed by an opaque `AssetBlobKey`.
+#[async_trait::async_trait]
+pub trait AssetBlobStore: Send + Sync {
+    /// Identifies the built-in backend so repository transactions can avoid
+    /// acquiring a second connection from the same pool.
+    fn as_any(&self) -> &dyn Any;
+    /// Reads bytes, returning `None` when the key is absent or evicted.
+    async fn read(&self, key: &AssetBlobKey) -> Result<Option<AssetBlob>, AssetBlobStoreError>;
+
+    /// Reads metadata without loading the binary body.
+    async fn stat(
+        &self,
+        key: &AssetBlobKey,
+    ) -> Result<Option<AssetBlobMetadata>, AssetBlobStoreError>;
+
+    /// Writes one immutable blob or verifies an idempotent repeated write.
+    async fn put(&self, key: &AssetBlobKey, blob: &AssetBlob) -> Result<(), AssetBlobStoreError>;
+
+    /// Deletes binary data while retaining backend-specific metadata where
+    /// possible. Repeating a delete for a missing key is successful.
+    async fn delete(&self, key: &AssetBlobKey) -> Result<(), AssetBlobStoreError>;
+}
+
 /// One persisted URL/version and its shared binary blob.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredAsset {
@@ -483,6 +705,88 @@ mod tests {
         input.bytes = b"changed-bytes".to_vec();
 
         assert!(!input.checksum_matches_bytes());
+    }
+
+    #[test]
+    fn blob_key_for_uuid_uses_a_stable_relative_namespace() {
+        let id = Uuid::nil();
+
+        assert_eq!(
+            AssetBlobKey::for_blob_id(id).as_str(),
+            format!("blobs/{id}")
+        );
+        assert_eq!(
+            AssetBlobKey::new(id.to_string()).unwrap().as_str(),
+            id.to_string()
+        );
+    }
+
+    #[test]
+    fn blob_key_rejects_path_traversal_and_absolute_paths() {
+        for value in [
+            "",
+            "/absolute",
+            "../escape",
+            "blobs/../escape",
+            "blobs\\escape",
+            "C:/outside",
+            "d:relative",
+        ] {
+            assert!(
+                AssetBlobKey::new(value).is_err(),
+                "key should be rejected: {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn blob_validates_checksum_and_exposes_metadata() {
+        let blob = AssetBlob::new(
+            b"asset-bytes".to_vec(),
+            "image/png".to_owned(),
+            "c092df87ad240efa9f032f792b57f5d3812a833b47de33172f59cf70ee2f01c4".to_owned(),
+        )
+        .unwrap();
+
+        assert_eq!(blob.bytes(), b"asset-bytes");
+        assert_eq!(blob.media_type(), "image/png");
+        assert_eq!(blob.byte_size(), 11);
+    }
+
+    #[test]
+    fn blob_rejects_a_checksum_that_does_not_match_the_body() {
+        assert_eq!(
+            AssetBlob::new(
+                b"asset-bytes".to_vec(),
+                "image/png".to_owned(),
+                "not-the-checksum".to_owned(),
+            ),
+            Err(AssetBlobStoreError::ChecksumMismatch)
+        );
+    }
+
+    #[test]
+    fn blob_metadata_constructor_accepts_values_from_an_external_backend() {
+        let metadata = AssetBlobMetadata::new(
+            "c092df87ad240efa9f032f792b57f5d3812a833b47de33172f59cf70ee2f01c4".to_owned(),
+            "image/png".to_owned(),
+            11,
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(metadata.checksum().len(), 64);
+        assert_eq!(metadata.media_type(), "image/png");
+        assert_eq!(metadata.byte_size(), 11);
+        assert!(metadata.is_present());
+    }
+
+    #[test]
+    fn blob_metadata_constructor_rejects_invalid_values() {
+        assert_eq!(
+            AssetBlobMetadata::new("not-a-checksum".to_owned(), "image/png".to_owned(), 1, true),
+            Err(AssetBlobStoreError::InvalidMetadata)
+        );
     }
 
     #[test]

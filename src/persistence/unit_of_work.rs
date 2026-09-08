@@ -26,8 +26,10 @@
 //! - `commit(self)` is the only successful exit for a completed unit of work;
 //! - `rollback(self)` is available for explicit cleanup in tests or callers
 //!   that need to await rollback; and
-//! - archive acquisition and URL rewriting use `assets(policy)` while
-//!   borrowing this same transaction; and
+//! - archive metadata acquisition and URL rewriting use `assets(policy)` while
+//!   borrowing this same transaction; PostgreSQL blob operations share it,
+//!   while external allocations and evictions are finalized at the unit
+//!   commit boundary; and
 //! - article upserts return feed-visible change information so the caller can
 //!   decide whether to bump the source revision in this same transaction.
 //!
@@ -67,20 +69,29 @@
 //! publishing writes from a stale worker. Cache compare-and-swap and feed-build
 //! fencing checks happen inside this transaction through the feed-cache view.
 
-use std::fmt;
+use std::{
+    fmt,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
+};
 
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use thiserror::Error;
 
 use crate::{
-    archive::asset_store::{AssetCachePolicy, AssetInput},
+    archive::asset_store::{AssetBlobStore, AssetCachePolicy, AssetInput},
     domain::job::{Job, NewJob},
 };
 
 use super::repositories::{
     article_repository::PostgresArticleTransaction,
-    asset_repository::{prepare_asset_batch, AssetRepositoryError, PostgresAssetTransaction},
+    asset_repository::{
+        drain_blob_cleanup_queue, drain_blob_deletion_queue, prepare_asset_batch,
+        AssetRepositoryError, PostgresAssetBlobStore, PostgresAssetTransaction,
+    },
     feed_cache_repository::PostgresFeedCacheTransaction,
     job_repository::PostgresJobTransaction,
     job_repository::{
@@ -99,6 +110,9 @@ pub enum UnitOfWorkError {
     /// Asset digest/collision preflight could not complete before persistence.
     #[error("asset preflight error: {0}")]
     AssetPreparation(#[source] AssetRepositoryError),
+    /// Binary cleanup after a failed unit-of-work boundary.
+    #[error("asset blob cleanup error: {0}")]
+    AssetCleanup(String),
     /// SQLx could not sample the authoritative PostgreSQL clock.
     #[error("unit of work database clock error: {0}")]
     DatabaseClock(#[source] sqlx::Error),
@@ -108,6 +122,7 @@ pub enum UnitOfWorkError {
 #[derive(Clone)]
 pub struct UnitOfWorkFactory {
     pool: PgPool,
+    blob_store: Arc<dyn AssetBlobStore>,
 }
 
 impl fmt::Debug for UnitOfWorkFactory {
@@ -122,7 +137,12 @@ impl fmt::Debug for UnitOfWorkFactory {
 impl UnitOfWorkFactory {
     /// Creates a factory backed by the configured PostgreSQL pool.
     pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+        Self::with_blob_store(pool.clone(), Arc::new(PostgresAssetBlobStore::new(pool)))
+    }
+
+    /// Creates a factory with an injected binary asset backend.
+    pub fn with_blob_store(pool: PgPool, blob_store: Arc<dyn AssetBlobStore>) -> Self {
+        Self { pool, blob_store }
     }
 
     /// Begins a transaction whose repository views share one commit boundary.
@@ -142,6 +162,7 @@ impl UnitOfWorkFactory {
             .await
             .map_err(UnitOfWorkError::Transaction)?;
         let asset_preparation = prepare_asset_batch(
+            self.blob_store.as_ref(),
             jobs.transaction_mut().map_err(|error| {
                 UnitOfWorkError::AssetPreparation(AssetRepositoryError::Storage(error.to_string()))
             })?,
@@ -150,8 +171,12 @@ impl UnitOfWorkFactory {
         .await
         .map_err(UnitOfWorkError::AssetPreparation)?;
         let result = Ok(UnitOfWork {
-            jobs,
+            jobs: Some(jobs),
             asset_preparation: Some(asset_preparation),
+            blob_store: Arc::clone(&self.blob_store),
+            pool: self.pool.clone(),
+            mutation_state: Arc::new(Mutex::new(Default::default())),
+            finished: Arc::new(AtomicBool::new(false)),
         });
         if let Err(error) = &result {
             tracing::warn!(error = %error, "unable to begin PostgreSQL unit of work");
@@ -178,8 +203,12 @@ impl UnitOfWorkFactory {
 
 /// A short-lived transaction-scoped persistence unit.
 pub struct UnitOfWork<'a> {
-    jobs: PostgresJobTransaction<'a>,
+    jobs: Option<PostgresJobTransaction<'a>>,
     asset_preparation: Option<super::repositories::asset_repository::AssetBatchPreparation>,
+    blob_store: Arc<dyn AssetBlobStore>,
+    pool: PgPool,
+    mutation_state: Arc<Mutex<super::repositories::asset_repository::AssetMutationState>>,
+    finished: Arc<AtomicBool>,
 }
 
 /// Outcome-only view over the job transaction owned by [`UnitOfWork`].
@@ -224,7 +253,9 @@ impl JobOutcomeTransaction for UnitOfWork<'_> {
 impl<'a> UnitOfWork<'a> {
     /// Borrows the job repository view without exposing an independent commit.
     pub fn jobs(&mut self) -> &mut PostgresJobTransaction<'a> {
-        &mut self.jobs
+        self.jobs
+            .as_mut()
+            .expect("unit-of-work transaction is closed")
     }
 
     /// Borrows the outcome-only job view without exposing a commit operation.
@@ -234,49 +265,115 @@ impl<'a> UnitOfWork<'a> {
     /// changes through the other views and then call [`Self::commit`] once.
     pub fn job_outcomes(&mut self) -> JobOutcomeView<'_, 'a> {
         JobOutcomeView {
-            transaction: &mut self.jobs,
+            transaction: self
+                .jobs
+                .as_mut()
+                .expect("unit-of-work transaction is closed"),
         }
     }
 
     /// Borrows the enqueue-only job view without exposing a commit operation.
     pub fn job_enqueue(&mut self) -> JobEnqueueView<'_, 'a> {
         JobEnqueueView {
-            transaction: &mut self.jobs,
+            transaction: self
+                .jobs
+                .as_mut()
+                .expect("unit-of-work transaction is closed"),
         }
     }
 
     /// Borrows the transaction-scoped article mutation view.
     pub fn articles(&mut self) -> PostgresArticleTransaction<'_, 'a> {
-        PostgresArticleTransaction::new(&mut self.jobs)
+        PostgresArticleTransaction::new(
+            self.jobs
+                .as_mut()
+                .expect("unit-of-work transaction is closed"),
+        )
     }
 
     /// Borrows the transaction-scoped binary asset mutation view.
     pub fn assets(&mut self, policy: AssetCachePolicy) -> PostgresAssetTransaction<'_, 'a> {
-        PostgresAssetTransaction::new(&mut self.jobs, self.asset_preparation.clone(), policy)
+        PostgresAssetTransaction::new(
+            self.jobs
+                .as_mut()
+                .expect("unit-of-work transaction is closed"),
+            Arc::clone(&self.blob_store),
+            self.asset_preparation.clone(),
+            policy,
+            Arc::clone(&self.mutation_state),
+        )
     }
 
     /// Borrows the transaction-scoped feed-cache publication view.
     pub fn feed_cache(&mut self) -> PostgresFeedCacheTransaction<'_, 'a> {
-        PostgresFeedCacheTransaction::new(&mut self.jobs)
+        PostgresFeedCacheTransaction::new(
+            self.jobs
+                .as_mut()
+                .expect("unit-of-work transaction is closed"),
+        )
     }
 
     /// Borrows the transaction-scoped source mutation view.
     pub fn source(&mut self) -> PostgresSourceTransaction<'_, 'a> {
-        PostgresSourceTransaction::new(&mut self.jobs)
+        PostgresSourceTransaction::new(
+            self.jobs
+                .as_mut()
+                .expect("unit-of-work transaction is closed"),
+        )
     }
 
     /// Borrows the transaction-scoped synchronization-run view.
     pub fn sync_runs(&mut self) -> PostgresSyncRunTransaction<'_, 'a> {
-        PostgresSyncRunTransaction::new(&mut self.jobs)
+        PostgresSyncRunTransaction::new(
+            self.jobs
+                .as_mut()
+                .expect("unit-of-work transaction is closed"),
+        )
     }
 
     /// Commits all mutations made through this unit of work.
     pub async fn commit(self) -> Result<(), UnitOfWorkError> {
-        let result = self
+        let mut this = self;
+        let mut jobs = this
             .jobs
+            .take()
+            .expect("unit-of-work transaction is closed");
+        let evictions = this
+            .mutation_state
+            .lock()
+            .unwrap()
+            .deferred_evictions
+            .clone();
+        if !evictions.is_empty() {
+            let transaction = jobs
+                .transaction_mut()
+                .map_err(|error| UnitOfWorkError::AssetCleanup(error.to_string()))?;
+            for blob_id in evictions {
+                sqlx::query(
+                    "INSERT INTO asset_blob_deletion_queue (blob_id)
+                     VALUES ($1) ON CONFLICT (blob_id) DO NOTHING",
+                )
+                .bind(blob_id)
+                .execute(&mut **transaction)
+                .await
+                .map_err(UnitOfWorkError::Transaction)?;
+            }
+        }
+        // From this point PostgreSQL may have committed even when the client
+        // receives an error, so Drop must not attempt destructive cleanup.
+        this.finished.store(true, Ordering::Release);
+        let result = jobs
             .commit_inner()
             .await
             .map_err(UnitOfWorkError::Transaction);
+        if result.is_ok() {
+            drain_blob_deletion_queue(&this.pool, this.blob_store.as_ref())
+                .await
+                .map_err(|error| UnitOfWorkError::AssetCleanup(error.to_string()))?;
+            drain_blob_cleanup_queue(&this.pool, this.blob_store.as_ref())
+                .await
+                .map_err(|error| UnitOfWorkError::AssetCleanup(error.to_string()))?;
+        }
         match &result {
             Ok(()) => tracing::trace!("committed PostgreSQL unit of work"),
             Err(error) => {
@@ -288,11 +385,17 @@ impl<'a> UnitOfWork<'a> {
 
     /// Explicitly rolls back all mutations made through this unit of work.
     pub async fn rollback(self) -> Result<(), UnitOfWorkError> {
-        let result = self
+        self.finished.store(true, Ordering::Release);
+        let mut this = self;
+        let jobs = this
             .jobs
+            .take()
+            .expect("unit-of-work transaction is closed");
+        let result = jobs
             .rollback_inner()
             .await
             .map_err(UnitOfWorkError::Transaction);
+        cleanup_external_blobs(&this.pool, &this.blob_store, &this.mutation_state).await?;
         match &result {
             Ok(()) => tracing::trace!("rolled back PostgreSQL unit of work"),
             Err(error) => {
@@ -303,12 +406,82 @@ impl<'a> UnitOfWork<'a> {
     }
 }
 
+async fn cleanup_external_blobs(
+    pool: &PgPool,
+    blob_store: &Arc<dyn AssetBlobStore>,
+    mutation_state: &Arc<Mutex<super::repositories::asset_repository::AssetMutationState>>,
+) -> Result<(), UnitOfWorkError> {
+    let mut remaining = std::mem::take(&mut mutation_state.lock().unwrap().newly_written);
+    let mut first_error = None;
+    // Retry transient object-store failures while the rollback boundary is
+    // still active; retain any persistent failures in the shared state.
+    for _ in 0..2 {
+        let mut failed = Vec::new();
+        for blob_id in remaining {
+            if let Err(error) = blob_store
+                .delete(&crate::archive::asset_store::AssetBlobKey::for_blob_id(
+                    blob_id,
+                ))
+                .await
+            {
+                first_error.get_or_insert_with(|| error.to_string());
+                failed.push(blob_id);
+            }
+        }
+        if failed.is_empty() {
+            return Ok(());
+        }
+        remaining = failed;
+    }
+    mutation_state.lock().unwrap().newly_written = remaining;
+    let queued = mutation_state.lock().unwrap().newly_written.clone();
+    for blob_id in queued {
+        sqlx::query(
+            "INSERT INTO asset_blob_cleanup_queue (blob_id)
+             VALUES ($1) ON CONFLICT (blob_id) DO NOTHING",
+        )
+        .bind(blob_id)
+        .execute(pool)
+        .await
+        .map_err(UnitOfWorkError::Transaction)?;
+    }
+    Err(UnitOfWorkError::AssetCleanup(
+        first_error.unwrap_or_else(|| "asset blob cleanup failed".to_owned()),
+    ))
+}
+
 impl fmt::Debug for UnitOfWork<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("UnitOfWork")
             .field("jobs", &self.jobs)
             .finish()
+    }
+}
+
+impl Drop for UnitOfWork<'_> {
+    fn drop(&mut self) {
+        if self.finished.load(Ordering::Acquire)
+            || self.blob_store.as_any().is::<PostgresAssetBlobStore>()
+            || self.mutation_state.lock().unwrap().newly_written.is_empty()
+        {
+            return;
+        }
+
+        let pool = self.pool.clone();
+        let blob_store = Arc::clone(&self.blob_store);
+        let mutation_state = Arc::clone(&self.mutation_state);
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                if let Err(error) = cleanup_external_blobs(&pool, &blob_store, &mutation_state).await {
+                    tracing::warn!(error = %error, "unable to clean up blobs from implicitly rolled back unit of work");
+                }
+            });
+        } else {
+            tracing::warn!(
+                "implicitly rolled back unit of work with external blobs outside an async runtime"
+            );
+        }
     }
 }
 
