@@ -29,7 +29,7 @@
 //! RSS_CACHE_MISS_WAIT_MS / SERVER_ROOT_URL
 //! FEED_BUILD_LEASE_SECONDS / FEED_BUILD_HEARTBEAT_SECONDS
 //! PACING_* / SCROLL_*
-//! ASSET_ARCHIVE_BACKEND / ASSET_CACHE_MAX_SIZE_MB /
+//! ASSET_ARCHIVE_BACKEND / ASSET_LOCAL_ROOT / ASSET_CACHE_MAX_SIZE_MB /
 //! ASSET_CACHE_MAX_AGE_DAYS / ASSET_MAX_SIZE_MB /
 //! ASSET_USE_ABSOLUTE_URLS /
 //! ASSET_MAX_COUNT_PER_ARTICLE / ASSET_MAX_FETCH_BYTES_PER_ARTICLE_MB /
@@ -153,6 +153,7 @@ const KNOWN_ENVIRONMENT_VARIABLES: &[&str] = &[
     "SCROLL_MAX_PIXELS",
     "SCROLL_MAX_OPERATION_SECONDS",
     "ASSET_ARCHIVE_BACKEND",
+    "ASSET_LOCAL_ROOT",
     "ASSET_CACHE_MAX_SIZE_MB",
     "ASSET_CACHE_MAX_AGE_DAYS",
     "ASSET_USE_ABSOLUTE_URLS",
@@ -291,6 +292,15 @@ pub enum AssetArchiveConfig {
         /// Cluster-wide admission and retry limits for public cache misses.
         repair_policy: AssetRepairPolicy,
     },
+    /// Store binary assets through OpenDAL's local filesystem service.
+    Local {
+        /// Root directory used by the filesystem backend.
+        root: String,
+        /// Limits applied to acquisition, storage, and maintenance.
+        policy: AssetCachePolicy,
+        /// Cluster-wide admission and retry limits for public cache misses.
+        repair_policy: AssetRepairPolicy,
+    },
 }
 
 impl AssetArchiveConfig {
@@ -298,7 +308,7 @@ impl AssetArchiveConfig {
     pub const fn database_policy(&self) -> Option<AssetCachePolicy> {
         match self {
             Self::Disabled => None,
-            Self::Database { policy, .. } => Some(*policy),
+            Self::Database { policy, .. } | Self::Local { policy, .. } => Some(*policy),
         }
     }
 
@@ -306,7 +316,17 @@ impl AssetArchiveConfig {
     pub const fn database_repair_policy(&self) -> Option<AssetRepairPolicy> {
         match self {
             Self::Disabled => None,
-            Self::Database { repair_policy, .. } => Some(*repair_policy),
+            Self::Database { repair_policy, .. } | Self::Local { repair_policy, .. } => {
+                Some(*repair_policy)
+            }
+        }
+    }
+
+    /// Returns the configured local filesystem root, when the local backend is enabled.
+    pub fn local_root(&self) -> Option<&str> {
+        match self {
+            Self::Local { root, .. } => Some(root),
+            _ => None,
         }
     }
 }
@@ -674,7 +694,10 @@ impl AppConfig {
             "ASSET_USE_ABSOLUTE_URLS",
         )?;
         if asset_use_absolute_urls
-            && matches!(&asset_archive, AssetArchiveConfig::Database { .. })
+            && matches!(
+                &asset_archive,
+                AssetArchiveConfig::Database { .. } | AssetArchiveConfig::Local { .. }
+            )
             && server_root_url.is_none()
         {
             return Err(ConfigError::Missing {
@@ -886,6 +909,7 @@ struct RawConfig {
     scroll_max_pixels: Option<u32>,
     scroll_max_operation_seconds: Option<u64>,
     asset_archive_backend: Option<String>,
+    asset_local_root: Option<String>,
     asset_cache_max_size_mb: Option<u64>,
     asset_cache_max_age_days: Option<u64>,
     asset_use_absolute_urls: Option<String>,
@@ -1114,9 +1138,24 @@ fn asset_archive_config(raw: &RawConfig) -> Result<AssetArchiveConfig, ConfigErr
             policy,
             repair_policy: asset_repair_policy(raw)?,
         }),
+        "local" => {
+            let root = raw
+                .asset_local_root
+                .as_deref()
+                .map(str::trim)
+                .filter(|root| !root.is_empty())
+                .ok_or(ConfigError::Missing {
+                    variable: "ASSET_LOCAL_ROOT",
+                })?;
+            Ok(AssetArchiveConfig::Local {
+                root: root.to_owned(),
+                policy,
+                repair_policy: asset_repair_policy(raw)?,
+            })
+        }
         _ => Err(ConfigError::InvalidValue {
             variable: "ASSET_ARCHIVE_BACKEND",
-            reason: "expected disabled or database (postgres is an alias)",
+            reason: "expected disabled, database, or local (postgres is an alias)",
         }),
     }
 }
@@ -1661,7 +1700,7 @@ mod tests {
     #[test]
     fn rejects_unimplemented_asset_backends() {
         let mut environment = valid_environment();
-        environment.push(("ASSET_ARCHIVE_BACKEND".to_owned(), "local".to_owned()));
+        environment.push(("ASSET_ARCHIVE_BACKEND".to_owned(), "s3".to_owned()));
 
         assert!(matches!(
             AppConfig::from_env_iter(environment),
@@ -1974,6 +2013,50 @@ mod tests {
         let config = AppConfig::from_env_iter(environment).unwrap();
 
         assert!(!config.asset_use_absolute_urls);
+    }
+
+    #[test]
+    fn parses_local_asset_mode_and_requires_a_root() {
+        let mut environment =
+            replace_environment(valid_environment(), "ASSET_ARCHIVE_BACKEND", "local");
+        environment.extend([
+            (
+                "ASSET_LOCAL_ROOT".to_owned(),
+                "/var/lib/werrss/assets".to_owned(),
+            ),
+            ("ASSET_USE_ABSOLUTE_URLS".to_owned(), "false".to_owned()),
+        ]);
+        let config = AppConfig::from_env_iter(environment).unwrap();
+        assert_eq!(
+            config.asset_archive.local_root(),
+            Some("/var/lib/werrss/assets")
+        );
+
+        let environment =
+            replace_environment(valid_environment(), "ASSET_ARCHIVE_BACKEND", "local");
+        assert!(matches!(
+            AppConfig::from_env_iter(environment),
+            Err(ConfigError::Missing {
+                variable: "ASSET_LOCAL_ROOT"
+            })
+        ));
+    }
+
+    #[test]
+    fn local_asset_mode_requires_server_root_for_absolute_urls() {
+        let mut environment =
+            replace_environment(valid_environment(), "ASSET_ARCHIVE_BACKEND", "local");
+        environment.push((
+            "ASSET_LOCAL_ROOT".to_owned(),
+            "/var/lib/werrss/assets".to_owned(),
+        ));
+
+        assert!(matches!(
+            AppConfig::from_env_iter(environment),
+            Err(ConfigError::Missing {
+                variable: "SERVER_ROOT_URL"
+            })
+        ));
     }
 
     #[test]

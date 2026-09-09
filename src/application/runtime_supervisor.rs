@@ -41,13 +41,14 @@ use crate::{
         repositories::{
             account_lease_repository::PostgresAccountLeaseRepository,
             article_repository::PostgresArticleRepository,
-            asset_repository::PostgresAssetStore,
+            asset_repository::{PostgresAssetBlobStore, PostgresAssetStore},
             credential_repository::PostgresCredentialRepository,
             feed_cache_repository::{
                 PostgresFeedBuildLeaseRepository, PostgresFeedCacheRepository,
             },
             feed_token_repository::PostgresFeedTokenRepository,
             job_repository::PostgresJobRepository,
+            opendal_blob_store::OpenDalFsBlobStore,
             scheduler_repository::PostgresSchedulerRepository,
             source_repository::PostgresSourceRepository,
             sync_run_repository::PostgresSyncRunRepository,
@@ -97,6 +98,7 @@ use super::{
     sync_service::SyncService,
     worker::{JobHandler, Worker},
 };
+use crate::archive::asset_store::{AssetBlobStore, AssetBlobStoreError};
 
 type FeedRebuildHandler = FeedRebuildJobHandler<
     PostgresSourceRepository,
@@ -297,6 +299,35 @@ pub struct RuntimeSupervisor {
 }
 
 impl RuntimeSupervisor {
+    fn blob_store(&self) -> Result<Arc<dyn AssetBlobStore>, RuntimeSupervisorError> {
+        match self.config.asset_archive.local_root() {
+            Some(root) => Ok(Arc::new(OpenDalFsBlobStore::new(root)?)),
+            None => Ok(Arc::new(PostgresAssetBlobStore::new(self.pool.clone()))),
+        }
+    }
+
+    fn build_asset_store(
+        &self,
+        policy: crate::archive::asset_store::AssetCachePolicy,
+    ) -> Result<PostgresAssetStore, RuntimeSupervisorError> {
+        let repair_policy = self
+            .config
+            .asset_archive
+            .database_repair_policy()
+            .expect("enabled asset archive has repair policy");
+        Ok(
+            PostgresAssetStore::with_blob_store(self.pool.clone(), policy, self.blob_store()?)
+                .with_repair_policy(repair_policy),
+        )
+    }
+
+    fn unit_of_work_factory(&self) -> Result<UnitOfWorkFactory, RuntimeSupervisorError> {
+        Ok(UnitOfWorkFactory::with_blob_store(
+            self.pool.clone(),
+            self.blob_store()?,
+        ))
+    }
+
     /// Opens the configured PostgreSQL pool, applies pending migrations, and
     /// prepares the selected runtime roles.
     #[tracing::instrument(skip_all, level = "debug")]
@@ -432,12 +463,7 @@ impl RuntimeSupervisor {
         let mut tasks = JoinSet::new();
 
         if let Some(policy) = self.config.asset_archive.database_policy() {
-            let store = PostgresAssetStore::new(self.pool.clone(), policy).with_repair_policy(
-                self.config
-                    .asset_archive
-                    .database_repair_policy()
-                    .expect("database asset policy has repair policy"),
-            );
+            let store = self.build_asset_store(policy)?;
             let role_shutdown = role_shutdown_rx.clone();
             tracing::info!("database asset-cache maintenance started");
             tasks.spawn(async move {
@@ -598,14 +624,12 @@ impl RuntimeSupervisor {
             feed_config,
         )
         .with_asset_url_policy(self.feed_asset_url_policy());
-        let asset_store = self.config.asset_archive.database_policy().map(|policy| {
-            PostgresAssetStore::new(self.pool.clone(), policy).with_repair_policy(
-                self.config
-                    .asset_archive
-                    .database_repair_policy()
-                    .expect("database asset policy has repair policy"),
-            )
-        });
+        let asset_store = self
+            .config
+            .asset_archive
+            .database_policy()
+            .map(|policy| self.build_asset_store(policy))
+            .transpose()?;
         let mut router = feed_router_with_browser_health_and_assets(
             FeedTokenService::new(PostgresFeedTokenRepository::new(self.pool.clone())),
             feed_service,
@@ -633,7 +657,7 @@ impl RuntimeSupervisor {
             let weread_auth = self.build_auth_service()?;
             let sources = SourceService::new(
                 PostgresSourceRepository::new(self.pool.clone()),
-                UnitOfWorkFactory::new(self.pool.clone()),
+                self.unit_of_work_factory()?,
             );
             let feed_tokens =
                 FeedTokenService::new(PostgresFeedTokenRepository::new(self.pool.clone()));
@@ -699,17 +723,11 @@ impl RuntimeSupervisor {
                 .asset_archive
                 .database_policy()
                 .ok_or(RuntimeSupervisorError::AssetArchiveNotConfigured)?;
-            let repair_policy = self
-                .config
-                .asset_archive
-                .database_repair_policy()
-                .ok_or(RuntimeSupervisorError::AssetArchiveNotConfigured)?;
             let archiver = asset_archiver
                 .clone()
                 .ok_or(RuntimeSupervisorError::AssetArchiveNotConfigured)?;
             Some(AssetRepairJobHandler::new(
-                PostgresAssetStore::new(self.pool.clone(), policy)
-                    .with_repair_policy(repair_policy),
+                self.build_asset_store(policy)?,
                 archiver,
                 retry_after,
             ))
@@ -744,7 +762,7 @@ impl RuntimeSupervisor {
                 PostgresJobRepository::new(self.pool.clone()),
                 plan.job_service_config().clone(),
             ),
-            UnitOfWorkFactory::new(self.pool.clone()),
+            self.unit_of_work_factory()?,
             handler,
             plan.worker_config().clone(),
         )
@@ -808,7 +826,7 @@ impl RuntimeSupervisor {
             SourceSyncJobHandlerDependencies {
                 sources: PostgresSourceRepository::new(self.pool.clone()),
                 articles: PostgresArticleRepository::new(self.pool.clone()),
-                unit_of_work: UnitOfWorkFactory::new(self.pool.clone()),
+                unit_of_work: self.unit_of_work_factory()?,
                 acquirer,
                 sync_service: SyncService::new(),
                 asset_archiver,
@@ -833,7 +851,7 @@ impl RuntimeSupervisor {
             ArticleBackfillJobHandlerDependencies {
                 sources: PostgresSourceRepository::new(self.pool.clone()),
                 articles: PostgresArticleRepository::new(self.pool.clone()),
-                unit_of_work: UnitOfWorkFactory::new(self.pool.clone()),
+                unit_of_work: self.unit_of_work_factory()?,
                 acquirer,
                 sync_service: SyncService::new(),
                 asset_archiver,
@@ -971,7 +989,7 @@ impl RuntimeSupervisor {
                 PostgresSourceRepository::new(self.pool.clone()),
                 PostgresArticleRepository::new(self.pool.clone()),
                 PostgresFeedBuildLeaseRepository::new(self.pool.clone()),
-                UnitOfWorkFactory::new(self.pool.clone()),
+                self.unit_of_work_factory()?,
             ),
             rebuild_config,
             owner,
@@ -1175,6 +1193,9 @@ pub enum RuntimeSupervisorError {
     /// The optional database asset HTTP client could not be constructed.
     #[error(transparent)]
     AssetArchive(#[from] AssetArchiveServiceError),
+    /// The configured asset binary backend could not be constructed.
+    #[error(transparent)]
+    AssetBlobStore(#[from] AssetBlobStoreError),
     /// An asset-repair worker was planned without database asset settings.
     #[error("database asset archive configuration is required for asset repair")]
     AssetArchiveNotConfigured,
