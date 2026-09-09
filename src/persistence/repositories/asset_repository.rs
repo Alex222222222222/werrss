@@ -800,17 +800,17 @@ impl PostgresAssetStore {
                 break;
             }
         }
+        let mutation_state = Arc::new(Mutex::new(AssetMutationState::default()));
         let (blob_id, newly_written) = if let Some(matching) = matching {
             (matching, false)
         } else {
-            let mutation_state = Arc::new(Mutex::new(AssetMutationState::default()));
             let mut context = AssetWriteContext::new(
                 self.blob_store.as_ref(),
                 self.policy,
                 None,
                 &mutation_state,
             );
-            let blob_id = insert_blob(
+            let inserted = insert_blob(
                 &mut transaction,
                 &mut context,
                 input,
@@ -818,8 +818,31 @@ impl PostgresAssetStore {
                 byte_size,
                 &[],
             )
-            .await?
-            .0;
+            .await;
+            let blob_id = match inserted {
+                Ok((blob_id, _)) => blob_id,
+                Err(error) => {
+                    let blob_ids = mutation_state.lock().unwrap().newly_written.clone();
+                    let rollback = transaction.rollback().await;
+                    let cleanup = cleanup_blob_ids_after_rollback(
+                        &self.pool,
+                        self.blob_store.as_ref(),
+                        &blob_ids,
+                    )
+                    .await;
+                    if let Err(cleanup_error) = cleanup {
+                        return Err(AssetRepositoryError::Storage(format!(
+                            "{error}; external blob cleanup failed: {cleanup_error}"
+                        )));
+                    }
+                    if let Err(rollback_error) = rollback {
+                        return Err(AssetRepositoryError::Storage(format!(
+                            "{error}; restore transaction rollback failed: {rollback_error}"
+                        )));
+                    }
+                    return Err(error);
+                }
+            };
             (blob_id, true)
         };
         // Hold the job row lock through commit so lease recovery cannot grant
@@ -851,8 +874,24 @@ impl PostgresAssetStore {
         }
         .await;
         if let Err(error) = result {
-            if newly_written {
-                cleanup_new_blobs(self.blob_store.as_ref(), &mut transaction, &[blob_id]).await;
+            let blob_ids = if newly_written {
+                vec![blob_id]
+            } else {
+                Vec::new()
+            };
+            let rollback = transaction.rollback().await;
+            let cleanup =
+                cleanup_blob_ids_after_rollback(&self.pool, self.blob_store.as_ref(), &blob_ids)
+                    .await;
+            if let Err(cleanup_error) = cleanup {
+                return Err(AssetRepositoryError::Storage(format!(
+                    "{error}; external blob cleanup failed: {cleanup_error}"
+                )));
+            }
+            if let Err(rollback_error) = rollback {
+                return Err(AssetRepositoryError::Storage(format!(
+                    "{error}; restore transaction rollback failed: {rollback_error}"
+                )));
             }
             return Err(error);
         }
@@ -2016,19 +2055,39 @@ async fn insert_blob(
         input.media_type.clone(),
         checksum.to_owned(),
     )?;
-    blob_put_in_transaction(
+    let externally_owned = !context.blob_store.as_any().is::<PostgresAssetBlobStore>();
+    // Record the key before an external write. A backend may accept the
+    // write and lose its response, so returning an error does not prove that
+    // the key is absent. Keeping it in the mutation state lets the enclosing
+    // savepoint or unit of work retry cleanup for that exact key. PostgreSQL
+    // writes stay untracked until success because cleanup there updates the
+    // existing metadata row in the caller's transaction.
+    if externally_owned {
+        context
+            .mutation_state
+            .lock()
+            .unwrap()
+            .newly_written
+            .push(blob_id);
+    }
+    let put_result = blob_put_in_transaction(
         context.blob_store,
         transaction,
         &AssetBlobKey::for_blob_id(blob_id),
         &blob,
     )
-    .await?;
-    context
-        .mutation_state
-        .lock()
-        .unwrap()
-        .newly_written
-        .push(blob_id);
+    .await;
+    if let Err(error) = put_result {
+        return Err(error);
+    }
+    if !externally_owned {
+        context
+            .mutation_state
+            .lock()
+            .unwrap()
+            .newly_written
+            .push(blob_id);
+    }
     sqlx::query(
         "INSERT INTO asset_blobs
                 (id, checksum_algorithm, checksum, byte_size, media_type, data)
@@ -2129,6 +2188,42 @@ async fn cleanup_new_blobs(
             tracing::warn!(error = %error, "unable to clean up uncommitted asset blob metadata");
         }
     }
+}
+
+async fn cleanup_blob_ids_after_rollback(
+    pool: &PgPool,
+    blob_store: &dyn AssetBlobStore,
+    blob_ids: &[Uuid],
+) -> Result<(), AssetRepositoryError> {
+    if blob_ids.is_empty() {
+        return Ok(());
+    }
+    let mut failed = Vec::new();
+    for blob_id in blob_ids {
+        if let Err(error) = blob_store
+            .delete(&AssetBlobKey::for_blob_id(*blob_id))
+            .await
+        {
+            tracing::warn!(%blob_id, error = %error, "unable to clean up a restored asset blob after rollback");
+            failed.push(*blob_id);
+        }
+    }
+    if failed.is_empty() {
+        return Ok(());
+    }
+
+    let mut transaction = pool.begin().await.map_err(storage_error)?;
+    for blob_id in failed {
+        sqlx::query(
+            "INSERT INTO asset_blob_cleanup_queue (blob_id)
+             VALUES ($1) ON CONFLICT (blob_id) DO NOTHING",
+        )
+        .bind(blob_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+    }
+    transaction.commit().await.map_err(storage_error)
 }
 
 async fn evict_stale_blobs(

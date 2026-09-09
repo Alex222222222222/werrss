@@ -1,6 +1,6 @@
 # Asset caching design
 
-Status: the disabled/database/local slice is implemented. The current runtime
+Status: the disabled/database/local/S3 slice is implemented. The current runtime
 accepts the database policy, fetches approved public image assets before the
 article persistence transaction, stores them in PostgreSQL by default, rewrites
 successful references to `/assets/{asset_record_id}`, serves stable asset responses,
@@ -25,8 +25,8 @@ independently. A backend implementation must therefore tolerate retries and
 best-effort cleanup when a metadata transaction fails; it must not assume that
 binary writes participate in a distributed transaction with PostgreSQL.
 
-Automatic repair of a missing asset is implemented. S3 storage and signed-URL
-refresh lineages remain future work. The repair implementation covers only the public, anonymous re-fetch
+Automatic repair of a missing asset is implemented. Signed-URL refresh
+lineages remain future work. The repair implementation covers only the public, anonymous re-fetch
 path and does not infer that an HTTP error means a signed URL should be
 refreshed.
 
@@ -96,8 +96,7 @@ The implementations are adapters only:
   and relationships, while blob operations are routed through the injected
   port and may commit independently of the repository transaction;
 - `OpenDalFsBlobStore` uses OpenDAL's filesystem service for a local directory;
-- `OpenDalS3BlobStore` will use OpenDAL's S3 service for S3-compatible
-  providers;
+- `OpenDalS3BlobStore` uses OpenDAL's S3 service for S3-compatible providers;
 - later adapters may use OpenDAL's GCS, Azure Blob, OSS, FTP, SFTP, WebDAV, or
   PostgreSQL services after the common contract is stable.
 
@@ -154,12 +153,18 @@ accepted as silently ignored configuration in earlier releases.
 The canonical backend name is `database`. It means that binary data is stored
 in PostgreSQL. `postgres` is accepted as a compatibility alias for the same
 backend, not as a second behavior. `local` selects the OpenDAL filesystem
-adapter and requires `ASSET_LOCAL_ROOT`; `s3` remains future work.
+adapter and requires `ASSET_LOCAL_ROOT`. `s3` selects the OpenDAL S3 adapter
+and requires its bucket, region, and credentials.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `ASSET_ARCHIVE_BACKEND` | `disabled` | `disabled` leaves external URLs unchanged; `database` stores bytes in PostgreSQL; `local` stores bytes through OpenDAL in `ASSET_LOCAL_ROOT`. |
 | `ASSET_LOCAL_ROOT` | — | Local OpenDAL filesystem root; required for `local`. |
+| `ASSET_S3_BUCKET` | — | S3-compatible bucket; required for `s3`. |
+| `ASSET_S3_ENDPOINT` | — | Optional S3-compatible endpoint. |
+| `ASSET_S3_REGION` | — | S3 signing region; required for `s3`. |
+| `ASSET_S3_ACCESS_KEY_ID` | — | Secret-backed S3 access key; required for `s3`. |
+| `ASSET_S3_SECRET_ACCESS_KEY` | — | Secret-backed S3 secret key; required for `s3`. |
 | `ASSET_USE_ABSOLUTE_URLS` | `true` | When database caching is enabled, feed rendering converts stable `/assets/{id}` links to full URLs rooted at `SERVER_ROOT_URL`. Set to `false` to keep relative links; the default requires `SERVER_ROOT_URL`. |
 | `ASSET_CACHE_MAX_SIZE_MB` | `5000` | Maximum aggregate size of cached binary bytes. `0` disables size-based eviction. The value is decimal megabytes: `5000` means 5,000,000,000 bytes. |
 | `ASSET_CACHE_MAX_AGE_DAYS` | `30` | Maximum age since the last successful access before cached bytes are evicted. `0` disables age-based eviction. |

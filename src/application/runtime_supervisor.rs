@@ -48,7 +48,7 @@ use crate::{
             },
             feed_token_repository::PostgresFeedTokenRepository,
             job_repository::PostgresJobRepository,
-            opendal_blob_store::OpenDalFsBlobStore,
+            opendal_blob_store::{OpenDalFsBlobStore, OpenDalS3BlobStore},
             scheduler_repository::PostgresSchedulerRepository,
             source_repository::PostgresSourceRepository,
             sync_run_repository::PostgresSyncRunRepository,
@@ -302,7 +302,16 @@ impl RuntimeSupervisor {
     fn blob_store(&self) -> Result<Arc<dyn AssetBlobStore>, RuntimeSupervisorError> {
         match self.config.asset_archive.local_root() {
             Some(root) => Ok(Arc::new(OpenDalFsBlobStore::new(root)?)),
-            None => Ok(Arc::new(PostgresAssetBlobStore::new(self.pool.clone()))),
+            None => match self.config.asset_archive.s3_storage() {
+                Some(storage) => Ok(Arc::new(OpenDalS3BlobStore::new(
+                    storage.bucket(),
+                    storage.endpoint(),
+                    storage.region(),
+                    storage.access_key_id(),
+                    storage.secret_access_key(),
+                )?)),
+                None => Ok(Arc::new(PostgresAssetBlobStore::new(self.pool.clone()))),
+            },
         }
     }
 

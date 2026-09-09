@@ -40,11 +40,16 @@ const SECOND_BYTES: &[u8] = b"second-img";
 struct MemoryBlobStore {
     entries: Arc<Mutex<HashMap<String, MemoryBlobEntry>>>,
     failed_deletes: Arc<Mutex<usize>>,
+    failed_puts_after_write: Arc<Mutex<usize>>,
 }
 
 impl MemoryBlobStore {
     fn fail_next_deletes(&self, count: usize) {
         *self.failed_deletes.lock().unwrap() = count;
+    }
+
+    fn fail_next_puts_after_write(&self, count: usize) {
+        *self.failed_puts_after_write.lock().unwrap() = count;
     }
 }
 
@@ -104,6 +109,14 @@ impl AssetBlobStore for MemoryBlobStore {
                     present: true,
                 },
             );
+        }
+        drop(entries);
+        let mut failed_puts = self.failed_puts_after_write.lock().unwrap();
+        if *failed_puts > 0 {
+            *failed_puts -= 1;
+            return Err(AssetBlobStoreError::Backend(
+                "injected ambiguous put failure".to_owned(),
+            ));
         }
         Ok(())
     }
@@ -481,6 +494,99 @@ async fn failed_savepoint_cleanup_is_durable_for_external_blobs(pool: PgPool) {
             .unwrap(),
         0
     );
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn ambiguous_external_put_is_tracked_and_cleaned_by_the_savepoint(pool: PgPool) {
+    let source_id = SourceId::from_uuid(Uuid::new_v4());
+    create_source_and_articles(&pool, source_id, &["ambiguous-put"]).await;
+    let backend = Arc::new(MemoryBlobStore::default());
+    backend.fail_next_puts_after_write(1);
+    let policy = test_policy(0, Duration::from_secs(30), 1024);
+    let input = asset_input(
+        "https://cdn.example/ambiguous-put.png",
+        FIRST_BYTES,
+        u32::MAX,
+    );
+    let factory = UnitOfWorkFactory::with_blob_store(pool.clone(), backend.clone());
+    let mut unit_of_work = factory
+        .begin_with_assets(std::slice::from_ref(&input))
+        .await
+        .unwrap();
+
+    assert!(unit_of_work
+        .assets(policy)
+        .store_for_article(source_id, "ambiguous-put", std::slice::from_ref(&input))
+        .await
+        .is_err());
+    unit_of_work.commit().await.unwrap();
+
+    assert!(backend
+        .entries
+        .lock()
+        .unwrap()
+        .values()
+        .all(|entry| !entry.present));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM asset_blobs")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        0
+    );
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn ambiguous_external_repair_put_is_cleaned_after_transaction_rollback(pool: PgPool) {
+    let source_id = SourceId::from_uuid(Uuid::new_v4());
+    create_source_and_articles(&pool, source_id, &["ambiguous-repair-put"]).await;
+    let backend = Arc::new(MemoryBlobStore::default());
+    let policy = test_policy(0, Duration::from_secs(30), 1024);
+    let input = asset_input(
+        "https://cdn.example/ambiguous-repair-put.png",
+        FIRST_BYTES,
+        0,
+    );
+    let stored = store_asset_with_backend(
+        &pool,
+        policy,
+        source_id,
+        "ambiguous-repair-put",
+        input.clone(),
+        backend.clone(),
+    )
+    .await;
+    backend
+        .delete(&AssetBlobKey::for_blob_id(stored.blob_id()))
+        .await
+        .unwrap();
+
+    let store = PostgresAssetStore::with_blob_store(pool.clone(), policy, backend.clone());
+    let job_id = match store.enqueue_repair(stored.id()).await.unwrap() {
+        AssetRepairEnqueueResult::Enqueued { job_id } => job_id,
+        other => panic!("repair should be admitted, got {other:?}"),
+    };
+    let lease = claim_repair_job(&pool).await;
+    backend.fail_next_puts_after_write(1);
+
+    assert!(store
+        .restore_missing_asset(&lease, stored.id(), &input)
+        .await
+        .is_err());
+    assert!(backend
+        .entries
+        .lock()
+        .unwrap()
+        .values()
+        .all(|entry| !entry.present));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM asset_blob_cleanup_queue")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        0
+    );
+    finish_repair_job(&pool, job_id).await;
 }
 
 #[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]

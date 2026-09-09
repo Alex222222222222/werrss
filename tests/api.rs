@@ -10,6 +10,7 @@ use axum::{
 use chrono::{Duration, Utc};
 use chrono_tz::UTC;
 use secrecy::SecretString;
+use sha2::{Digest, Sha256};
 use sqlx::{postgres::PgPoolOptions, PgPool};
 use std::sync::{Arc, Mutex};
 use tower::ServiceExt;
@@ -1940,9 +1941,12 @@ async fn asset_route_serves_cached_bytes_and_honors_etag(pool: PgPool) {
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(response.headers()[header::CONTENT_TYPE], "image/png");
     assert_eq!(response.headers()[header::CONTENT_LENGTH], "15");
+    let expected_checksum = format!("{:x}", Sha256::digest(b"\x89PNG\r\n\x1a\nfixture"));
     assert_eq!(
-        response.headers()[header::ETAG],
-        "\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\""
+        response.headers()[header::ETAG]
+            .to_str()
+            .expect("asset ETag should be valid"),
+        format!("\"sha256:{expected_checksum}\"")
     );
     assert_eq!(response.headers()["x-content-type-options"], "nosniff");
     let etag = response.headers()[header::ETAG]
@@ -2369,12 +2373,16 @@ async fn insert_asset_fixture(pool: &PgPool) -> Uuid {
 
     let asset_id = Uuid::new_v4();
     let blob_id = Uuid::new_v4();
+    let fixture_bytes = b"\x89PNG\r\n\x1a\nfixture".to_vec();
+    let fixture_checksum = format!("{:x}", Sha256::digest(&fixture_bytes));
     sqlx::query(
         "INSERT INTO asset_blobs (id, checksum_algorithm, checksum, byte_size, media_type, data)
-         VALUES ($1, 'sha256', repeat('a', 64), 15, 'image/png', $2)",
+         VALUES ($1, 'sha256', $2, $3, 'image/png', $4)",
     )
     .bind(blob_id)
-    .bind(b"\x89PNG\r\n\x1a\nfixture".as_slice())
+    .bind(fixture_checksum)
+    .bind(fixture_bytes.len() as i64)
+    .bind(fixture_bytes)
     .execute(pool)
     .await
     .expect("asset blob should be insertable");

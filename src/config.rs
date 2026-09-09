@@ -30,6 +30,8 @@
 //! FEED_BUILD_LEASE_SECONDS / FEED_BUILD_HEARTBEAT_SECONDS
 //! PACING_* / SCROLL_*
 //! ASSET_ARCHIVE_BACKEND / ASSET_LOCAL_ROOT / ASSET_CACHE_MAX_SIZE_MB /
+//! ASSET_S3_BUCKET / ASSET_S3_ENDPOINT / ASSET_S3_REGION /
+//! ASSET_S3_ACCESS_KEY_ID / ASSET_S3_SECRET_ACCESS_KEY /
 //! ASSET_CACHE_MAX_AGE_DAYS / ASSET_MAX_SIZE_MB /
 //! ASSET_USE_ABSOLUTE_URLS /
 //! ASSET_MAX_COUNT_PER_ARTICLE / ASSET_MAX_FETCH_BYTES_PER_ARTICLE_MB /
@@ -154,6 +156,11 @@ const KNOWN_ENVIRONMENT_VARIABLES: &[&str] = &[
     "SCROLL_MAX_OPERATION_SECONDS",
     "ASSET_ARCHIVE_BACKEND",
     "ASSET_LOCAL_ROOT",
+    "ASSET_S3_BUCKET",
+    "ASSET_S3_ENDPOINT",
+    "ASSET_S3_REGION",
+    "ASSET_S3_ACCESS_KEY_ID",
+    "ASSET_S3_SECRET_ACCESS_KEY",
     "ASSET_CACHE_MAX_SIZE_MB",
     "ASSET_CACHE_MAX_AGE_DAYS",
     "ASSET_USE_ABSOLUTE_URLS",
@@ -301,6 +308,79 @@ pub enum AssetArchiveConfig {
         /// Cluster-wide admission and retry limits for public cache misses.
         repair_policy: AssetRepairPolicy,
     },
+    /// Store binary assets through an OpenDAL S3-compatible service.
+    S3 {
+        /// S3-compatible connection settings.
+        storage: AssetS3Config,
+        /// Limits applied to acquisition, storage, and maintenance.
+        policy: AssetCachePolicy,
+        /// Cluster-wide admission and retry limits for public cache misses.
+        repair_policy: AssetRepairPolicy,
+    },
+}
+
+/// Credentials and endpoint settings for an S3-compatible asset backend.
+#[derive(Clone)]
+pub struct AssetS3Config {
+    bucket: String,
+    endpoint: Option<String>,
+    region: String,
+    access_key_id: secrecy::SecretString,
+    secret_access_key: secrecy::SecretString,
+}
+
+impl PartialEq for AssetS3Config {
+    fn eq(&self, other: &Self) -> bool {
+        self.bucket == other.bucket
+            && self.endpoint == other.endpoint
+            && self.region == other.region
+            && secrecy::ExposeSecret::expose_secret(&self.access_key_id)
+                == secrecy::ExposeSecret::expose_secret(&other.access_key_id)
+            && secrecy::ExposeSecret::expose_secret(&self.secret_access_key)
+                == secrecy::ExposeSecret::expose_secret(&other.secret_access_key)
+    }
+}
+
+impl Eq for AssetS3Config {}
+
+impl std::fmt::Debug for AssetS3Config {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AssetS3Config")
+            .field("bucket", &self.bucket)
+            .field("endpoint", &self.endpoint)
+            .field("region", &self.region)
+            .field("access_key_id", &"<redacted>")
+            .field("secret_access_key", &"<redacted>")
+            .finish()
+    }
+}
+
+impl AssetS3Config {
+    /// Returns the configured bucket.
+    pub fn bucket(&self) -> &str {
+        &self.bucket
+    }
+
+    /// Returns the optional provider endpoint.
+    pub fn endpoint(&self) -> Option<&str> {
+        self.endpoint.as_deref()
+    }
+
+    /// Returns the signing region.
+    pub fn region(&self) -> &str {
+        &self.region
+    }
+
+    /// Returns the access key for backend construction.
+    pub fn access_key_id(&self) -> &str {
+        secrecy::ExposeSecret::expose_secret(&self.access_key_id)
+    }
+
+    /// Returns the secret key for backend construction.
+    pub fn secret_access_key(&self) -> &str {
+        secrecy::ExposeSecret::expose_secret(&self.secret_access_key)
+    }
 }
 
 impl AssetArchiveConfig {
@@ -308,7 +388,9 @@ impl AssetArchiveConfig {
     pub const fn database_policy(&self) -> Option<AssetCachePolicy> {
         match self {
             Self::Disabled => None,
-            Self::Database { policy, .. } | Self::Local { policy, .. } => Some(*policy),
+            Self::Database { policy, .. }
+            | Self::Local { policy, .. }
+            | Self::S3 { policy, .. } => Some(*policy),
         }
     }
 
@@ -316,9 +398,9 @@ impl AssetArchiveConfig {
     pub const fn database_repair_policy(&self) -> Option<AssetRepairPolicy> {
         match self {
             Self::Disabled => None,
-            Self::Database { repair_policy, .. } | Self::Local { repair_policy, .. } => {
-                Some(*repair_policy)
-            }
+            Self::Database { repair_policy, .. }
+            | Self::Local { repair_policy, .. }
+            | Self::S3 { repair_policy, .. } => Some(*repair_policy),
         }
     }
 
@@ -326,6 +408,14 @@ impl AssetArchiveConfig {
     pub fn local_root(&self) -> Option<&str> {
         match self {
             Self::Local { root, .. } => Some(root),
+            _ => None,
+        }
+    }
+
+    /// Returns the configured S3-compatible storage settings.
+    pub fn s3_storage(&self) -> Option<&AssetS3Config> {
+        match self {
+            Self::S3 { storage, .. } => Some(storage),
             _ => None,
         }
     }
@@ -696,7 +786,9 @@ impl AppConfig {
         if asset_use_absolute_urls
             && matches!(
                 &asset_archive,
-                AssetArchiveConfig::Database { .. } | AssetArchiveConfig::Local { .. }
+                AssetArchiveConfig::Database { .. }
+                    | AssetArchiveConfig::Local { .. }
+                    | AssetArchiveConfig::S3 { .. }
             )
             && server_root_url.is_none()
         {
@@ -910,6 +1002,11 @@ struct RawConfig {
     scroll_max_operation_seconds: Option<u64>,
     asset_archive_backend: Option<String>,
     asset_local_root: Option<String>,
+    asset_s3_bucket: Option<String>,
+    asset_s3_endpoint: Option<String>,
+    asset_s3_region: Option<String>,
+    asset_s3_access_key_id: Option<String>,
+    asset_s3_secret_access_key: Option<String>,
     asset_cache_max_size_mb: Option<u64>,
     asset_cache_max_age_days: Option<u64>,
     asset_use_absolute_urls: Option<String>,
@@ -1153,9 +1250,38 @@ fn asset_archive_config(raw: &RawConfig) -> Result<AssetArchiveConfig, ConfigErr
                 repair_policy: asset_repair_policy(raw)?,
             })
         }
+        "s3" => {
+            let bucket = required(raw.asset_s3_bucket.clone(), "ASSET_S3_BUCKET")?;
+            let region = required(raw.asset_s3_region.clone(), "ASSET_S3_REGION")?;
+            let access_key_id =
+                required(raw.asset_s3_access_key_id.clone(), "ASSET_S3_ACCESS_KEY_ID")?;
+            let secret_access_key = required(
+                raw.asset_s3_secret_access_key.clone(),
+                "ASSET_S3_SECRET_ACCESS_KEY",
+            )?;
+            let endpoint = raw
+                .asset_s3_endpoint
+                .as_deref()
+                .map(str::trim)
+                .filter(|endpoint| !endpoint.is_empty())
+                .map(str::to_owned);
+            Ok(AssetArchiveConfig::S3 {
+                storage: AssetS3Config {
+                    bucket,
+                    endpoint,
+                    region,
+                    access_key_id: secrecy::SecretString::new(access_key_id.into_boxed_str()),
+                    secret_access_key: secrecy::SecretString::new(
+                        secret_access_key.into_boxed_str(),
+                    ),
+                },
+                policy,
+                repair_policy: asset_repair_policy(raw)?,
+            })
+        }
         _ => Err(ConfigError::InvalidValue {
             variable: "ASSET_ARCHIVE_BACKEND",
-            reason: "expected disabled, database, or local (postgres is an alias)",
+            reason: "expected disabled, database, local, or s3 (postgres is an alias)",
         }),
     }
 }
@@ -1700,7 +1826,7 @@ mod tests {
     #[test]
     fn rejects_unimplemented_asset_backends() {
         let mut environment = valid_environment();
-        environment.push(("ASSET_ARCHIVE_BACKEND".to_owned(), "s3".to_owned()));
+        environment.push(("ASSET_ARCHIVE_BACKEND".to_owned(), "gcs".to_owned()));
 
         assert!(matches!(
             AppConfig::from_env_iter(environment),
@@ -2055,6 +2181,53 @@ mod tests {
             AppConfig::from_env_iter(environment),
             Err(ConfigError::Missing {
                 variable: "SERVER_ROOT_URL"
+            })
+        ));
+    }
+
+    #[test]
+    fn parses_s3_asset_mode_without_exposing_credentials_in_debug() {
+        let mut environment =
+            replace_environment(valid_environment(), "ASSET_ARCHIVE_BACKEND", "s3");
+        environment.extend([
+            (
+                "SERVER_ROOT_URL".to_owned(),
+                "https://rss.example.test".to_owned(),
+            ),
+            ("ASSET_S3_BUCKET".to_owned(), "werrss-assets".to_owned()),
+            (
+                "ASSET_S3_ENDPOINT".to_owned(),
+                "http://minio.example.test:9000".to_owned(),
+            ),
+            ("ASSET_S3_REGION".to_owned(), "us-east-1".to_owned()),
+            (
+                "ASSET_S3_ACCESS_KEY_ID".to_owned(),
+                "access-secret".to_owned(),
+            ),
+            (
+                "ASSET_S3_SECRET_ACCESS_KEY".to_owned(),
+                "secret-secret".to_owned(),
+            ),
+        ]);
+        let config = AppConfig::from_env_iter(environment).unwrap();
+        let storage = config.asset_archive.s3_storage().unwrap();
+        assert_eq!(storage.bucket(), "werrss-assets");
+        assert_eq!(storage.endpoint(), Some("http://minio.example.test:9000"));
+        assert_eq!(storage.region(), "us-east-1");
+        assert_eq!(storage.access_key_id(), "access-secret");
+        assert_eq!(storage.secret_access_key(), "secret-secret");
+        let debug = format!("{config:?}");
+        assert!(!debug.contains("access-secret"));
+        assert!(!debug.contains("secret-secret"));
+    }
+
+    #[test]
+    fn s3_asset_mode_requires_all_connection_settings() {
+        let environment = replace_environment(valid_environment(), "ASSET_ARCHIVE_BACKEND", "s3");
+        assert!(matches!(
+            AppConfig::from_env_iter(environment),
+            Err(ConfigError::Missing {
+                variable: "ASSET_S3_BUCKET"
             })
         ));
     }

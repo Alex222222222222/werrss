@@ -236,8 +236,8 @@ cookies are never sent to asset hosts. Feed delivery detects an existing cache
 with the wrong asset URL form and rebuilds it before serving. Missing cached
 bytes enqueue a deduplicated anonymous repair job and retain the same asset URL
 while the worker restores the data.
-The local-directory backend uses a shared `AssetBlobStore` boundary backed by
-Apache OpenDAL. PostgreSQL will
+The local-directory and S3-compatible backends use a shared `AssetBlobStore`
+boundary backed by Apache OpenDAL. PostgreSQL will
 continue to own asset metadata, relationships, deduplication, leases, repair
 jobs, and eviction state.
 
@@ -245,6 +245,11 @@ jobs, and eviction state.
 | --- | --- | --- |
 | `ASSET_ARCHIVE_BACKEND` | `disabled` | `disabled` keeps approved external URLs. `database` (or `postgres`) stores bytes and URL/version metadata in PostgreSQL. `local` stores bytes in `ASSET_LOCAL_ROOT`. |
 | `ASSET_LOCAL_ROOT` | — | Root directory for the local OpenDAL filesystem backend; required when the backend is `local`. |
+| `ASSET_S3_BUCKET` | — | S3-compatible bucket; required when the backend is `s3`. |
+| `ASSET_S3_ENDPOINT` | — | Optional S3-compatible endpoint, such as MinIO. |
+| `ASSET_S3_REGION` | — | S3 signing region; required when the backend is `s3`. |
+| `ASSET_S3_ACCESS_KEY_ID` | — | Secret-backed S3 access key; required when the backend is `s3`. |
+| `ASSET_S3_SECRET_ACCESS_KEY` | — | Secret-backed S3 secret key; required when the backend is `s3`. |
 | `ASSET_USE_ABSOLUTE_URLS` | `true` | When database asset caching is enabled, emits cached image links as full URLs rooted at `SERVER_ROOT_URL` in generated feeds. Set to `false` to keep `/assets/{id}` links relative; the default requires `SERVER_ROOT_URL`. |
 | `ASSET_CACHE_MAX_SIZE_MB` | `5000` | Aggregate limit for cached raw binary bytes, in decimal megabytes. `0` disables size-based eviction. |
 | `ASSET_CACHE_MAX_AGE_DAYS` | `30` | Maximum idle age since the last successful asset read before bytes are evicted. `0` disables age-based eviction. |
@@ -321,13 +326,10 @@ adapts the existing PostgreSQL binary table without a migration. Both
 `Arc<dyn AssetBlobStore>`; their default constructors continue to use the
 database backend. The remaining roadmap items are future work:
 
-1. **Add the OpenDAL S3-compatible backend.** Support configurable buckets,
-   endpoints, regions, and secret-backed credentials without exposing provider
-   URLs in feeds.
-3. **Add GCS, Azure, OSS, FTP, SFTP, and WebDAV only after the common contract
+1. **Add GCS, Azure, OSS, FTP, SFTP, and WebDAV only after the common contract
    is stable.** Each backend must pass the shared contract and provider-
    appropriate integration tests before its configuration is accepted.
-4. **Evaluate PGMQ as a queue transport optimization.** The current custom
+2. **Evaluate PGMQ as a queue transport optimization.** The current custom
    `jobs` table remains the version-one transport; PGMQ can be evaluated later
    if queue throughput or operational overhead becomes a demonstrated
    bottleneck.
