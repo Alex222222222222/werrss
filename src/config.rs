@@ -34,6 +34,9 @@
 //! ASSET_S3_ACCESS_KEY_ID / ASSET_S3_SECRET_ACCESS_KEY /
 //! ASSET_GCS_BUCKET / ASSET_GCS_ENDPOINT / ASSET_GCS_CREDENTIAL /
 //! ASSET_GCS_SKIP_SIGNATURE /
+//! ASSET_AZURE_CONTAINER / ASSET_AZURE_ENDPOINT /
+//! ASSET_AZURE_ACCOUNT_NAME / ASSET_AZURE_ACCOUNT_KEY /
+//! ASSET_AZURE_SKIP_SIGNATURE /
 //! ASSET_CACHE_MAX_AGE_DAYS / ASSET_MAX_SIZE_MB /
 //! ASSET_USE_ABSOLUTE_URLS /
 //! ASSET_MAX_COUNT_PER_ARTICLE / ASSET_MAX_FETCH_BYTES_PER_ARTICLE_MB /
@@ -168,6 +171,11 @@ const KNOWN_ENVIRONMENT_VARIABLES: &[&str] = &[
     "ASSET_GCS_ENDPOINT",
     "ASSET_GCS_CREDENTIAL",
     "ASSET_GCS_SKIP_SIGNATURE",
+    "ASSET_AZURE_CONTAINER",
+    "ASSET_AZURE_ENDPOINT",
+    "ASSET_AZURE_ACCOUNT_NAME",
+    "ASSET_AZURE_ACCOUNT_KEY",
+    "ASSET_AZURE_SKIP_SIGNATURE",
     "ASSET_CACHE_MAX_SIZE_MB",
     "ASSET_CACHE_MAX_AGE_DAYS",
     "ASSET_USE_ABSOLUTE_URLS",
@@ -333,6 +341,15 @@ pub enum AssetArchiveConfig {
         /// Cluster-wide admission and retry limits for public cache misses.
         repair_policy: AssetRepairPolicy,
     },
+    /// Store binary assets through an OpenDAL Azure Blob service.
+    Azure {
+        /// Azure Blob connection settings.
+        storage: AssetAzureConfig,
+        /// Limits applied to acquisition, storage, and maintenance.
+        policy: AssetCachePolicy,
+        /// Cluster-wide admission and retry limits for public cache misses.
+        repair_policy: AssetRepairPolicy,
+    },
 }
 
 /// Credentials and endpoint settings for an S3-compatible asset backend.
@@ -461,6 +478,86 @@ impl AssetGcsConfig {
     }
 }
 
+/// Credentials and endpoint settings for an Azure Blob asset backend.
+#[derive(Clone)]
+pub struct AssetAzureConfig {
+    container: String,
+    endpoint: String,
+    account_name: Option<secrecy::SecretString>,
+    account_key: Option<secrecy::SecretString>,
+    skip_signature: bool,
+}
+
+impl PartialEq for AssetAzureConfig {
+    fn eq(&self, other: &Self) -> bool {
+        self.container == other.container
+            && self.endpoint == other.endpoint
+            && self.skip_signature == other.skip_signature
+            && match (&self.account_name, &other.account_name) {
+                (Some(left), Some(right)) => {
+                    secrecy::ExposeSecret::expose_secret(left)
+                        == secrecy::ExposeSecret::expose_secret(right)
+                }
+                (None, None) => true,
+                _ => false,
+            }
+            && match (&self.account_key, &other.account_key) {
+                (Some(left), Some(right)) => {
+                    secrecy::ExposeSecret::expose_secret(left)
+                        == secrecy::ExposeSecret::expose_secret(right)
+                }
+                (None, None) => true,
+                _ => false,
+            }
+    }
+}
+
+impl Eq for AssetAzureConfig {}
+
+impl std::fmt::Debug for AssetAzureConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AssetAzureConfig")
+            .field("container", &self.container)
+            .field("endpoint", &self.endpoint)
+            .field("account_name", &"<redacted>")
+            .field("account_key", &"<redacted>")
+            .field("skip_signature", &self.skip_signature)
+            .finish()
+    }
+}
+
+impl AssetAzureConfig {
+    /// Returns the configured container.
+    pub fn container(&self) -> &str {
+        &self.container
+    }
+
+    /// Returns the configured service endpoint.
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
+    /// Returns the account name used to sign requests, when configured.
+    pub fn account_name(&self) -> Option<&str> {
+        self.account_name
+            .as_ref()
+            .map(secrecy::ExposeSecret::expose_secret)
+    }
+
+    /// Returns the account key used to sign requests, when configured.
+    pub fn account_key(&self) -> Option<&str> {
+        self.account_key
+            .as_ref()
+            .map(secrecy::ExposeSecret::expose_secret)
+    }
+
+    /// Returns whether OpenDAL should send unsigned requests.
+    pub const fn skip_signature(&self) -> bool {
+        self.skip_signature
+    }
+}
+
 impl AssetArchiveConfig {
     /// Returns the database policy when binary caching is enabled.
     pub const fn database_policy(&self) -> Option<AssetCachePolicy> {
@@ -469,7 +566,8 @@ impl AssetArchiveConfig {
             Self::Database { policy, .. }
             | Self::Local { policy, .. }
             | Self::S3 { policy, .. }
-            | Self::Gcs { policy, .. } => Some(*policy),
+            | Self::Gcs { policy, .. }
+            | Self::Azure { policy, .. } => Some(*policy),
         }
     }
 
@@ -480,7 +578,8 @@ impl AssetArchiveConfig {
             Self::Database { repair_policy, .. }
             | Self::Local { repair_policy, .. }
             | Self::S3 { repair_policy, .. }
-            | Self::Gcs { repair_policy, .. } => Some(*repair_policy),
+            | Self::Gcs { repair_policy, .. }
+            | Self::Azure { repair_policy, .. } => Some(*repair_policy),
         }
     }
 
@@ -504,6 +603,14 @@ impl AssetArchiveConfig {
     pub fn gcs_storage(&self) -> Option<&AssetGcsConfig> {
         match self {
             Self::Gcs { storage, .. } => Some(storage),
+            _ => None,
+        }
+    }
+
+    /// Returns the configured Azure Blob storage settings.
+    pub fn azure_storage(&self) -> Option<&AssetAzureConfig> {
+        match self {
+            Self::Azure { storage, .. } => Some(storage),
             _ => None,
         }
     }
@@ -878,6 +985,7 @@ impl AppConfig {
                     | AssetArchiveConfig::Local { .. }
                     | AssetArchiveConfig::S3 { .. }
                     | AssetArchiveConfig::Gcs { .. }
+                    | AssetArchiveConfig::Azure { .. }
             )
             && server_root_url.is_none()
         {
@@ -1100,6 +1208,11 @@ struct RawConfig {
     asset_gcs_endpoint: Option<String>,
     asset_gcs_credential: Option<String>,
     asset_gcs_skip_signature: Option<String>,
+    asset_azure_container: Option<String>,
+    asset_azure_endpoint: Option<String>,
+    asset_azure_account_name: Option<String>,
+    asset_azure_account_key: Option<String>,
+    asset_azure_skip_signature: Option<String>,
     asset_cache_max_size_mb: Option<u64>,
     asset_cache_max_age_days: Option<u64>,
     asset_use_absolute_urls: Option<String>,
@@ -1412,9 +1525,66 @@ fn asset_archive_config(raw: &RawConfig) -> Result<AssetArchiveConfig, ConfigErr
                 repair_policy: asset_repair_policy(raw)?,
             })
         }
+        "azure" | "azblob" => {
+            let container = required(
+                raw.asset_azure_container.clone(),
+                "ASSET_AZURE_CONTAINER",
+            )?;
+            let endpoint = required(
+                raw.asset_azure_endpoint.clone(),
+                "ASSET_AZURE_ENDPOINT",
+            )?
+            .trim()
+            .trim_end_matches('/')
+            .to_owned();
+            if endpoint.is_empty() {
+                return Err(ConfigError::Missing {
+                    variable: "ASSET_AZURE_ENDPOINT",
+                });
+            }
+            let skip_signature = parse_bool(
+                raw.asset_azure_skip_signature.as_deref().unwrap_or("false"),
+                "ASSET_AZURE_SKIP_SIGNATURE",
+            )?;
+            let account_name = if skip_signature {
+                raw.asset_azure_account_name
+                    .clone()
+                    .filter(|value| !value.trim().is_empty())
+            } else {
+                Some(required(
+                    raw.asset_azure_account_name.clone(),
+                    "ASSET_AZURE_ACCOUNT_NAME",
+                )?)
+            };
+            let account_key = if skip_signature {
+                raw.asset_azure_account_key
+                    .clone()
+                    .filter(|value| !value.trim().is_empty())
+            } else {
+                Some(validate_azure_account_key(required(
+                    raw.asset_azure_account_key.clone(),
+                    "ASSET_AZURE_ACCOUNT_KEY",
+                )?)?)
+            };
+            Ok(AssetArchiveConfig::Azure {
+                storage: AssetAzureConfig {
+                    container,
+                    endpoint,
+                    account_name: account_name.map(|value| {
+                        secrecy::SecretString::new(value.into_boxed_str())
+                    }),
+                    account_key: account_key.map(|value| {
+                        secrecy::SecretString::new(value.into_boxed_str())
+                    }),
+                    skip_signature,
+                },
+                policy,
+                repair_policy: asset_repair_policy(raw)?,
+            })
+        }
         _ => Err(ConfigError::InvalidValue {
             variable: "ASSET_ARCHIVE_BACKEND",
-            reason: "expected disabled, database, local, s3, or gcs (postgres is an alias)",
+            reason: "expected disabled, database, local, s3, gcs, or azure (postgres and azblob are aliases)",
         }),
     }
 }
@@ -1565,6 +1735,16 @@ fn validate_gcs_credential(credential: String) -> Result<String, ConfigError> {
         });
     }
     Ok(credential)
+}
+
+fn validate_azure_account_key(account_key: String) -> Result<String, ConfigError> {
+    base64::engine::general_purpose::STANDARD
+        .decode(account_key.as_bytes())
+        .map_err(|_| ConfigError::InvalidValue {
+            variable: "ASSET_AZURE_ACCOUNT_KEY",
+            reason: "must be standard-base64-encoded Azure account key",
+        })?;
+    Ok(account_key)
 }
 
 fn parse_optional_http_url(
@@ -1749,6 +1929,10 @@ mod tests {
         base64::engine::general_purpose::STANDARD.encode(
             br#"{"type":"service_account","client_email":"test@example.test","private_key":"test"}"#,
         )
+    }
+
+    fn valid_azure_account_key() -> String {
+        base64::engine::general_purpose::STANDARD.encode(b"azure-account-key")
     }
 
     fn replace_environment(
@@ -1997,7 +2181,7 @@ mod tests {
     #[test]
     fn rejects_unimplemented_asset_backends() {
         let mut environment = valid_environment();
-        environment.push(("ASSET_ARCHIVE_BACKEND".to_owned(), "azure".to_owned()));
+        environment.push(("ASSET_ARCHIVE_BACKEND".to_owned(), "ftp".to_owned()));
 
         assert!(matches!(
             AppConfig::from_env_iter(environment),
@@ -2494,6 +2678,147 @@ mod tests {
         let storage = config.asset_archive.gcs_storage().unwrap();
         assert_eq!(storage.credential(), None);
         assert!(storage.skip_signature());
+    }
+
+    #[test]
+    fn parses_azure_asset_mode_without_exposing_account_credentials() {
+        let mut environment =
+            replace_environment(valid_environment(), "ASSET_ARCHIVE_BACKEND", "azure");
+        let account_key = valid_azure_account_key();
+        environment.extend([
+            (
+                "SERVER_ROOT_URL".to_owned(),
+                "https://rss.example.test".to_owned(),
+            ),
+            (
+                "ASSET_AZURE_CONTAINER".to_owned(),
+                "werrss-assets".to_owned(),
+            ),
+            (
+                "ASSET_AZURE_ENDPOINT".to_owned(),
+                " https://storage.example.test/// ".to_owned(),
+            ),
+            (
+                "ASSET_AZURE_ACCOUNT_NAME".to_owned(),
+                "devstoreaccount1".to_owned(),
+            ),
+            ("ASSET_AZURE_ACCOUNT_KEY".to_owned(), account_key.clone()),
+        ]);
+
+        let config = AppConfig::from_env_iter(environment).unwrap();
+        let storage = config.asset_archive.azure_storage().unwrap();
+        assert_eq!(storage.container(), "werrss-assets");
+        assert_eq!(storage.endpoint(), "https://storage.example.test");
+        assert_eq!(storage.account_name(), Some("devstoreaccount1"));
+        assert_eq!(storage.account_key(), Some(account_key.as_str()));
+        assert!(!storage.skip_signature());
+        let debug = format!("{config:?}");
+        assert!(!debug.contains("devstoreaccount1"));
+        assert!(!debug.contains(&account_key));
+    }
+
+    #[test]
+    fn parses_unsigned_azure_asset_mode_without_account_credentials() {
+        let mut environment =
+            replace_environment(valid_environment(), "ASSET_ARCHIVE_BACKEND", "azblob");
+        environment.extend([
+            (
+                "SERVER_ROOT_URL".to_owned(),
+                "https://rss.example.test".to_owned(),
+            ),
+            (
+                "ASSET_AZURE_CONTAINER".to_owned(),
+                "werrss-assets".to_owned(),
+            ),
+            (
+                "ASSET_AZURE_ENDPOINT".to_owned(),
+                "http://azurite.example.test:10000/devstoreaccount1".to_owned(),
+            ),
+            ("ASSET_AZURE_SKIP_SIGNATURE".to_owned(), "true".to_owned()),
+        ]);
+
+        let config = AppConfig::from_env_iter(environment).unwrap();
+        let storage = config.asset_archive.azure_storage().unwrap();
+        assert_eq!(storage.account_name(), None);
+        assert_eq!(storage.account_key(), None);
+        assert!(storage.skip_signature());
+    }
+
+    #[test]
+    fn azure_asset_mode_requires_signed_account_settings() {
+        let mut environment =
+            replace_environment(valid_environment(), "ASSET_ARCHIVE_BACKEND", "azure");
+        environment.extend([
+            (
+                "ASSET_AZURE_CONTAINER".to_owned(),
+                "werrss-assets".to_owned(),
+            ),
+            (
+                "ASSET_AZURE_ENDPOINT".to_owned(),
+                "http://azurite.example.test:10000/devstoreaccount1".to_owned(),
+            ),
+        ]);
+        assert!(matches!(
+            AppConfig::from_env_iter(environment),
+            Err(ConfigError::Missing {
+                variable: "ASSET_AZURE_ACCOUNT_NAME"
+            })
+        ));
+
+        let mut environment =
+            replace_environment(valid_environment(), "ASSET_ARCHIVE_BACKEND", "azure");
+        environment.extend([
+            (
+                "ASSET_AZURE_CONTAINER".to_owned(),
+                "werrss-assets".to_owned(),
+            ),
+            (
+                "ASSET_AZURE_ENDPOINT".to_owned(),
+                "http://azurite.example.test:10000/devstoreaccount1".to_owned(),
+            ),
+            (
+                "ASSET_AZURE_ACCOUNT_NAME".to_owned(),
+                "devstoreaccount1".to_owned(),
+            ),
+        ]);
+        assert!(matches!(
+            AppConfig::from_env_iter(environment),
+            Err(ConfigError::Missing {
+                variable: "ASSET_AZURE_ACCOUNT_KEY"
+            })
+        ));
+    }
+
+    #[test]
+    fn rejects_malformed_azure_account_keys() {
+        let mut environment =
+            replace_environment(valid_environment(), "ASSET_ARCHIVE_BACKEND", "azure");
+        environment.extend([
+            (
+                "ASSET_AZURE_CONTAINER".to_owned(),
+                "werrss-assets".to_owned(),
+            ),
+            (
+                "ASSET_AZURE_ENDPOINT".to_owned(),
+                "http://azurite.example.test:10000/devstoreaccount1".to_owned(),
+            ),
+            (
+                "ASSET_AZURE_ACCOUNT_NAME".to_owned(),
+                "devstoreaccount1".to_owned(),
+            ),
+            (
+                "ASSET_AZURE_ACCOUNT_KEY".to_owned(),
+                "not-base64".to_owned(),
+            ),
+        ]);
+
+        assert!(matches!(
+            AppConfig::from_env_iter(environment),
+            Err(ConfigError::InvalidValue {
+                variable: "ASSET_AZURE_ACCOUNT_KEY",
+                ..
+            })
+        ));
     }
 
     #[test]

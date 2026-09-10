@@ -895,11 +895,9 @@ impl PostgresAssetStore {
             }
             return Err(error);
         }
-        if let Err(error) = transaction.commit().await.map_err(storage_error) {
-            // A commit error is ambiguous: PostgreSQL may have committed the
-            // metadata, so never delete the external object here.
-            return Err(error);
-        }
+        // A commit error is ambiguous: PostgreSQL may have committed the
+        // metadata, so never delete the external object here.
+        transaction.commit().await.map_err(storage_error)?;
         Ok(AssetRepairRestoreResult::Restored)
     }
 
@@ -2077,9 +2075,7 @@ async fn insert_blob(
         &blob,
     )
     .await;
-    if let Err(error) = put_result {
-        return Err(error);
-    }
+    put_result?;
     if !externally_owned {
         context
             .mutation_state

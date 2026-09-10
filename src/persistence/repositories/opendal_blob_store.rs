@@ -1,4 +1,4 @@
-//! OpenDAL filesystem adapter for immutable asset blobs.
+//! OpenDAL-backed adapters for immutable asset blobs.
 
 use std::{any::Any, future::IntoFuture, path::PathBuf, time::Duration};
 
@@ -38,6 +38,12 @@ pub struct OpenDalS3BlobStore {
 /// Stores raw asset bytes in Google Cloud Storage through OpenDAL.
 #[derive(Clone)]
 pub struct OpenDalGcsBlobStore {
+    core: OpenDalBlobStoreCore,
+}
+
+/// Stores raw asset bytes in Azure Blob Storage through OpenDAL.
+#[derive(Clone)]
+pub struct OpenDalAzureBlobStore {
     core: OpenDalBlobStoreCore,
 }
 
@@ -149,6 +155,57 @@ impl OpenDalGcsBlobStore {
         }
         if let Some(endpoint) = endpoint {
             builder = builder.endpoint(endpoint);
+        }
+        let operator = Operator::new(builder).map_err(backend_error)?;
+        Ok(Self {
+            core: OpenDalBlobStoreCore {
+                operator,
+                root: None,
+                operation_timeout: Some(REMOTE_OPERATION_TIMEOUT),
+            },
+        })
+    }
+}
+
+impl OpenDalAzureBlobStore {
+    /// Creates an Azure Blob backend with explicit connection settings.
+    pub fn new(
+        container: &str,
+        endpoint: &str,
+        account_name: &str,
+        account_key: &str,
+    ) -> Result<Self, AssetBlobStoreError> {
+        Self::new_with_options(
+            container,
+            endpoint,
+            Some(account_name),
+            Some(account_key),
+            false,
+        )
+    }
+
+    /// Creates an Azure Blob backend with explicit authentication options.
+    ///
+    /// `account_name` and `account_key` may be omitted when `skip_signature`
+    /// is enabled for an unauthenticated emulator.
+    pub fn new_with_options(
+        container: &str,
+        endpoint: &str,
+        account_name: Option<&str>,
+        account_key: Option<&str>,
+        skip_signature: bool,
+    ) -> Result<Self, AssetBlobStoreError> {
+        let mut builder = services::Azblob::default()
+            .container(container)
+            .endpoint(endpoint);
+        if let Some(account_name) = account_name {
+            builder = builder.account_name(account_name);
+        }
+        if let Some(account_key) = account_key {
+            builder = builder.account_key(account_key);
+        }
+        if skip_signature {
+            builder = builder.skip_signature();
         }
         let operator = Operator::new(builder).map_err(backend_error)?;
         Ok(Self {
@@ -514,6 +571,7 @@ macro_rules! impl_blob_store_for_open_dal {
 impl_blob_store_for_open_dal!(OpenDalFsBlobStore);
 impl_blob_store_for_open_dal!(OpenDalS3BlobStore);
 impl_blob_store_for_open_dal!(OpenDalGcsBlobStore);
+impl_blob_store_for_open_dal!(OpenDalAzureBlobStore);
 
 fn backend_error(error: impl std::fmt::Display) -> AssetBlobStoreError {
     AssetBlobStoreError::Backend(error.to_string())
@@ -539,7 +597,7 @@ mod tests {
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::{TcpListener, TcpStream},
-        sync::Notify,
+        sync::{Mutex as TokioMutex, Notify},
     };
     use uuid::Uuid;
 
@@ -555,7 +613,7 @@ mod tests {
         AssetBlob::new(bytes, "image/jpeg".to_owned(), checksum).unwrap()
     }
 
-    static AWS_ENDPOINT_ENV_LOCK: Mutex<()> = Mutex::new(());
+    static AWS_ENDPOINT_ENV_LOCK: TokioMutex<()> = TokioMutex::const_new(());
     const AWS_ENDPOINT_ENV_NAMES: [&str; 3] =
         ["AWS_ENDPOINT_URL", "AWS_ENDPOINT", "AWS_S3_ENDPOINT"];
 
@@ -643,8 +701,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn azure_backend_operations_have_a_bounded_timeout() {
+        let store = OpenDalAzureBlobStore::new(
+            "werrss-assets",
+            "http://127.0.0.1:10000/devstoreaccount1",
+            "devstoreaccount1",
+            "ZHVtbXktYWNjb3VudC1rZXk=",
+        )
+        .unwrap();
+        let core = OpenDalBlobStoreCore {
+            operator: store.core.operator.clone(),
+            root: None,
+            operation_timeout: Some(std::time::Duration::from_millis(10)),
+        };
+        let result = core
+            .run_backend_operation(std::future::pending::<Result<(), opendal::Error>>())
+            .await;
+
+        let error = result.expect_err("a stalled backend operation should time out");
+        assert_eq!(error.kind(), ErrorKind::Unexpected);
+        assert!(error.to_string().contains("timed out"));
+        assert_eq!(store.core.operation_timeout, Some(REMOTE_OPERATION_TIMEOUT));
+    }
+
+    #[tokio::test]
     async fn s3_store_ignores_ambient_endpoint_overrides() {
-        let _environment_lock = AWS_ENDPOINT_ENV_LOCK.lock().unwrap();
+        let _environment_lock = AWS_ENDPOINT_ENV_LOCK.lock().await;
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let request_seen = Arc::new(Notify::new());
@@ -1056,12 +1138,10 @@ mod tests {
         .await
         .expect("the first metadata request should be accepted");
 
-        let retry =
-            tokio::time::timeout(std::time::Duration::from_secs(1), second.put(&key, &value))
-                .await
-                .expect("the retry should not wait for the ambiguous first request")
-                .expect("the retry should reuse the committed object");
-        assert_eq!(retry, ());
+        tokio::time::timeout(std::time::Duration::from_secs(1), second.put(&key, &value))
+            .await
+            .expect("the retry should not wait for the ambiguous first request")
+            .expect("the retry should reuse the committed object");
 
         let first_result = tokio::time::timeout(std::time::Duration::from_secs(1), first_task)
             .await
@@ -1069,13 +1149,15 @@ mod tests {
             .expect("the first task should not panic");
         assert_eq!(first_result, Ok(()));
 
-        let state = state.lock().unwrap();
-        assert!(state.body_present);
-        assert!(state.metadata_present);
-        assert!(state
-            .requests
-            .iter()
-            .all(|request| !request.starts_with("DELETE ")));
+        {
+            let state = state.lock().unwrap();
+            assert!(state.body_present);
+            assert!(state.metadata_present);
+            assert!(state
+                .requests
+                .iter()
+                .all(|request| !request.starts_with("DELETE ")));
+        }
 
         server.abort();
         let _ = server.await;
@@ -1174,6 +1256,57 @@ mod tests {
         .await;
     }
 
+    #[derive(Default)]
+    struct MockAzureState {
+        objects: HashMap<String, Vec<u8>>,
+        targets: Vec<String>,
+    }
+
+    fn azure_object_name(target: &str) -> Option<String> {
+        let path = target.split('?').next().unwrap_or_default();
+        let encoded_name = path.split("/werrss-assets/").nth(1)?;
+        percent_encoding::percent_decode_str(encoded_name)
+            .decode_utf8()
+            .ok()
+            .map(|name| name.into_owned())
+    }
+
+    async fn serve_mock_azure_connection(mut stream: TcpStream, state: Arc<Mutex<MockAzureState>>) {
+        let Some((method, target, body)) = read_mock_http_request_with_body(&mut stream).await
+        else {
+            return;
+        };
+        let object_name = azure_object_name(&target);
+        let (status, response_body) = {
+            let mut state = state.lock().unwrap();
+            state.targets.push(target);
+            match method.as_str() {
+                "GET" | "HEAD" => {
+                    match object_name.and_then(|name| state.objects.get(&name).cloned()) {
+                        Some(body) if method == "GET" => ("200 OK", body),
+                        Some(_) => ("200 OK", Vec::new()),
+                        None => ("404 Not Found", Vec::new()),
+                    }
+                }
+                "PUT" => {
+                    let Some(object_name) = object_name else {
+                        return;
+                    };
+                    state.objects.insert(object_name, body);
+                    ("201 Created", Vec::new())
+                }
+                "DELETE" => {
+                    if let Some(object_name) = object_name {
+                        state.objects.remove(&object_name);
+                    }
+                    ("202 Accepted", Vec::new())
+                }
+                _ => ("404 Not Found", Vec::new()),
+            }
+        };
+        let _ = write_mock_http_response(&mut stream, status, &response_body).await;
+    }
+
     #[tokio::test]
     async fn gcs_unsigned_store_round_trips_nested_asset_keys_without_double_encoding() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1203,13 +1336,58 @@ mod tests {
         store.put(&key, &value).await.unwrap();
         assert_eq!(store.read(&key).await.unwrap(), Some(value));
 
-        let state = state.lock().unwrap();
-        assert!(state.targets.iter().any(|target| target.contains("%2F")));
-        assert!(state.targets.iter().all(|target| !target.contains("%252F")));
-        assert!(state.objects.contains_key(key.as_str()));
-        assert!(state
-            .objects
-            .contains_key(&format!("{}{METADATA_SUFFIX}", key.as_str())));
+        {
+            let state = state.lock().unwrap();
+            assert!(state.targets.iter().any(|target| target.contains("%2F")));
+            assert!(state.targets.iter().all(|target| !target.contains("%252F")));
+            assert!(state.objects.contains_key(key.as_str()));
+            assert!(state
+                .objects
+                .contains_key(&format!("{}{METADATA_SUFFIX}", key.as_str())));
+        }
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn azure_unsigned_store_round_trips_asset_blobs() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let state = Arc::new(Mutex::new(MockAzureState::default()));
+        let server_state = state.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(serve_mock_azure_connection(stream, server_state.clone()));
+            }
+        });
+
+        let store =
+            OpenDalAzureBlobStore::new_with_options("werrss-assets", &endpoint, None, None, true)
+                .unwrap();
+        let key = AssetBlobKey::for_blob_id(Uuid::new_v4());
+        let value = blob();
+
+        store.put(&key, &value).await.unwrap();
+        assert_eq!(store.read(&key).await.unwrap(), Some(value.clone()));
+        assert_eq!(
+            store.stat(&key).await.unwrap().unwrap().byte_size(),
+            value.byte_size()
+        );
+        store.delete(&key).await.unwrap();
+        assert!(store.read(&key).await.unwrap().is_none());
+
+        {
+            let state = state.lock().unwrap();
+            assert!(state.targets.iter().all(|target| !target.contains("%252F")));
+            assert!(!state.objects.contains_key(key.as_str()));
+            assert!(!state
+                .objects
+                .contains_key(&format!("{}{METADATA_SUFFIX}", key.as_str())));
+        }
 
         server.abort();
         let _ = server.await;
@@ -1242,6 +1420,29 @@ mod tests {
         let store = OpenDalGcsBlobStore::new_with_options(
             "werrss-assets",
             Some("http://127.0.0.1:9000"),
+            None,
+            true,
+        );
+        assert!(store.is_ok());
+    }
+
+    #[test]
+    fn azure_store_accepts_an_explicit_endpoint_and_account_key() {
+        let store = OpenDalAzureBlobStore::new(
+            "werrss-assets",
+            "http://127.0.0.1:10000/devstoreaccount1",
+            "devstoreaccount1",
+            "ZHVtbXktYWNjb3VudC1rZXk=",
+        );
+        assert!(store.is_ok());
+    }
+
+    #[test]
+    fn azure_store_accepts_unsigned_emulator_options_without_credentials() {
+        let store = OpenDalAzureBlobStore::new_with_options(
+            "werrss-assets",
+            "http://127.0.0.1:10000/devstoreaccount1",
+            None,
             None,
             true,
         );

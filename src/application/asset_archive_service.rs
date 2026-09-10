@@ -681,10 +681,11 @@ mod tests {
                 .await
                 .expect("asset target should receive a request");
             let mut request = [0_u8; 4096];
-            stream
+            let bytes_read = stream
                 .read(&mut request)
                 .await
                 .expect("asset target request should be readable");
+            assert!(bytes_read > 0, "asset target request should not be empty");
             let body = b"target";
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",

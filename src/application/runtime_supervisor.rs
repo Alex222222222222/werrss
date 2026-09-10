@@ -48,7 +48,9 @@ use crate::{
             },
             feed_token_repository::PostgresFeedTokenRepository,
             job_repository::PostgresJobRepository,
-            opendal_blob_store::{OpenDalFsBlobStore, OpenDalGcsBlobStore, OpenDalS3BlobStore},
+            opendal_blob_store::{
+                OpenDalAzureBlobStore, OpenDalFsBlobStore, OpenDalGcsBlobStore, OpenDalS3BlobStore,
+            },
             scheduler_repository::PostgresSchedulerRepository,
             source_repository::PostgresSourceRepository,
             sync_run_repository::PostgresSyncRunRepository,
@@ -317,7 +319,16 @@ impl RuntimeSupervisor {
                         storage.credential(),
                         storage.skip_signature(),
                     )?)),
-                    None => Ok(Arc::new(PostgresAssetBlobStore::new(self.pool.clone()))),
+                    None => match self.config.asset_archive.azure_storage() {
+                        Some(storage) => Ok(Arc::new(OpenDalAzureBlobStore::new_with_options(
+                            storage.container(),
+                            storage.endpoint(),
+                            storage.account_name(),
+                            storage.account_key(),
+                            storage.skip_signature(),
+                        )?)),
+                        None => Ok(Arc::new(PostgresAssetBlobStore::new(self.pool.clone()))),
+                    },
                 },
             },
         }
