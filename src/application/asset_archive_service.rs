@@ -680,6 +680,11 @@ mod tests {
                 .accept()
                 .await
                 .expect("asset target should receive a request");
+            let mut request = [0_u8; 4096];
+            stream
+                .read(&mut request)
+                .await
+                .expect("asset target request should be readable");
             let body = b"target";
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -693,6 +698,10 @@ mod tests {
                 .write_all(body)
                 .await
                 .expect("asset target response body should be writable");
+            stream
+                .shutdown()
+                .await
+                .expect("asset target connection should shut down cleanly");
         });
         let proxy = tokio::spawn(async move {
             match tokio::time::timeout(Duration::from_millis(500), proxy_listener.accept()).await {

@@ -48,7 +48,7 @@ use crate::{
             },
             feed_token_repository::PostgresFeedTokenRepository,
             job_repository::PostgresJobRepository,
-            opendal_blob_store::{OpenDalFsBlobStore, OpenDalS3BlobStore},
+            opendal_blob_store::{OpenDalFsBlobStore, OpenDalGcsBlobStore, OpenDalS3BlobStore},
             scheduler_repository::PostgresSchedulerRepository,
             source_repository::PostgresSourceRepository,
             sync_run_repository::PostgresSyncRunRepository,
@@ -310,7 +310,15 @@ impl RuntimeSupervisor {
                     storage.access_key_id(),
                     storage.secret_access_key(),
                 )?)),
-                None => Ok(Arc::new(PostgresAssetBlobStore::new(self.pool.clone()))),
+                None => match self.config.asset_archive.gcs_storage() {
+                    Some(storage) => Ok(Arc::new(OpenDalGcsBlobStore::new_with_options(
+                        storage.bucket(),
+                        storage.endpoint(),
+                        storage.credential(),
+                        storage.skip_signature(),
+                    )?)),
+                    None => Ok(Arc::new(PostgresAssetBlobStore::new(self.pool.clone()))),
+                },
             },
         }
     }

@@ -35,7 +35,8 @@
 //! When the database asset backend is enabled, the application persists
 //! checksum-deduplicated binary rows and article relationships in the same
 //! unit of work, then rewrites successfully archived URLs without changing
-//! article identity. Local and S3 backends remain future implementations.
+//! article identity. Local, S3, and GCS backends use the same repository
+//! contract.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};

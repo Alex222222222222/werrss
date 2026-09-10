@@ -66,7 +66,7 @@ The current and target contracts must not be confused:
 | Configuration | Environment-only `AppConfig` with role, lease, cache, public RSS URL, admin, and optional-asset validation; unknown owned settings are rejected and legacy archive names fail with a migration hint; the supervisor consumes the parsed role and policy values | QR-attempt policy is currently bounded in the application manager; durable multi-replica attempt storage remains future work |
 | Persistence | Job/source-scheduling/article/sync-run/feed-cache/feed-token tables, their PostgreSQL repositories, shared job/source/article/sync-run/feed-cache transaction boundary, account leases, feed-build leases, and encrypted WeRead account credential records with optimistic versions | QR attempts are intentionally process-local; durable encrypted attempt storage and remaining transaction-scoped views are future work |
 | Acquisition/web/RSS | Public WeChat identity resolution, a validated public article URL, capability-typed browser sessions, concrete public Thirtyfour navigation/extraction with bounded pacing/scroll and expected-timezone validation, authenticated WeRead article-list transport through an admin-enrolled cookie and account lease, source-sync finalization through an injected acquisition port, feed rebuild orchestration plus its atomic worker handler, pure RSS renderer, public tokenized feed route, API liveness/readiness and browser-worker readiness routes, single-admin source/panel routes, and the WeRead QR login transport | Login/QR exchange is executable; durable multi-replica QR attempt storage remains future work |
-| Archive | Conservative HTML allowlist sanitizer, deterministic content hashing, bounded anonymous image acquisition with article `Referer`/`Origin`/User-Agent, PostgreSQL metadata and default binary persistence, the backend-neutral `AssetBlobStore` contract with injectable repository/unit-of-work wiring, add-time checksum/raw-byte deduplication, stable URL rewriting, asset serving, and age/size/orphan maintenance | Automatic missing-asset repair, refresh-lineage controls, and OpenDAL-backed local-directory/S3 backends remain future work; the target follow-up contract is documented in [docs/ASSET_CACHING.md](docs/ASSET_CACHING.md) |
+| Archive | Conservative HTML allowlist sanitizer, deterministic content hashing, bounded anonymous image acquisition with article `Referer`/`Origin`/User-Agent, PostgreSQL metadata and default binary persistence, the backend-neutral `AssetBlobStore` contract with injectable repository/unit-of-work wiring, add-time checksum/raw-byte deduplication, stable URL rewriting, asset serving, missing-asset repair, and age/size/orphan maintenance; OpenDAL-backed local-directory, S3, and GCS backends are also available | Signed-URL refresh lineages and later OpenDAL providers remain future work; the storage contract is documented in [docs/ASSET_CACHING.md](docs/ASSET_CACHING.md) |
 
 Environment variables in this document are parsed into `AppConfig`, and
 `application::runtime::RuntimePlan` is the side-effect-free boundary that
@@ -858,8 +858,8 @@ RSS_CACHE_TTL_SECONDS / RSS_STALE_WHILE_REVALIDATE_SECONDS /
 RSS_CACHE_MISS_WAIT_MS / SERVER_ROOT_URL
 FEED_BUILD_LEASE_SECONDS / FEED_BUILD_HEARTBEAT_SECONDS
 PACING_* / SCROLL_*
-ASSET_ARCHIVE_BACKEND / ASSET_CACHE_MAX_SIZE_MB /
-ASSET_CACHE_MAX_AGE_DAYS / ASSET_MAX_SIZE_MB /
+ASSET_ARCHIVE_BACKEND / ASSET_LOCAL_ROOT / ASSET_S3_* / ASSET_GCS_* /
+ASSET_CACHE_MAX_SIZE_MB / ASSET_CACHE_MAX_AGE_DAYS / ASSET_MAX_SIZE_MB /
 ASSET_USE_ABSOLUTE_URLS /
 ASSET_MAX_COUNT_PER_ARTICLE / ASSET_MAX_FETCH_BYTES_PER_ARTICLE_MB /
 ASSET_MAX_FETCH_TIME_PER_ARTICLE_SECONDS / ASSET_FETCH_TIMEOUT_SECONDS /
@@ -868,10 +868,11 @@ ADMIN_ENABLED / ADMIN_USERNAME / ADMIN_PASSWORD / SESSION_SIGNING_KEY /
 CREDENTIAL_ENCRYPTION_KEY
 ```
 
-`ASSET_ARCHIVE_BACKEND` accepts `disabled`, `database`, and the compatible
-`postgres` alias. Local-directory and S3 storage, automatic asset repair, and
-asset refresh settings are roadmap items and are not accepted environment
-variables in the current runtime.
+`ASSET_ARCHIVE_BACKEND` accepts `disabled`, `database`, `local`, `s3`, and
+`gcs`, plus the compatible `postgres` alias. `ASSET_GCS_SKIP_SIGNATURE` is an
+explicit opt-in for unauthenticated emulators. Automatic missing-asset repair is
+implemented; signed-URL refresh settings remain roadmap items and are not
+accepted environment variables in the current runtime.
 
 `APP_TIMEZONE` is an IANA timezone name and defaults to `UTC`. `APP_ROLES`
 defaults to `api`; API and worker startup additionally require
@@ -955,11 +956,10 @@ when database asset caching is enabled it also requires `SERVER_ROOT_URL` and
 makes feed image links full URLs rooted there. Set it to `false` to retain
 root-relative `/assets/{id}` links. Feed delivery rebuilds persisted caches
 whose asset URL form does not match the configured mode. The current asset-cache
-implementation accepts only `disabled | database` and defaults to `disabled`;
-`database` is the
-canonical PostgreSQL-backed value. `local` and `s3` are reserved for future
-implementations. Local paths or object-store credentials are not part of the
-first implementation; the target cache limits and fetch settings are defined in
+implementation accepts `disabled | database | local | s3 | gcs` and defaults to
+`disabled`; `database` is the canonical PostgreSQL-backed value. Local paths
+and object-store credentials are validated only for their selected backend; the
+target cache limits and fetch settings are defined in
 [`docs/ASSET_CACHING.md`](docs/ASSET_CACHING.md).
 
 The target asset-recovery admission limit is cluster-wide: all replicas must
@@ -1173,9 +1173,10 @@ failure summaries. The sync-run repository's transaction-scoped `UnitOfWork`
 view is also included in that implementation. `SourceService` and
 `JobService` provide source lifecycle and worker queue orchestration, while
 `ArchiveService` provides pure content normalization and hashing. The
-database asset repository, anonymous asset fetcher, stable asset route, and
-maintenance loop are executable when enabled; local/S3 storage, automatic
-repair, and other repository views remain future work. The pure RSS renderer in
+database asset repository, anonymous asset fetcher, stable asset route,
+maintenance loop, automatic repair, and OpenDAL local/S3/GCS storage adapters
+are executable when enabled; other repository views remain future work. The pure
+RSS renderer in
 `src/rss/renderer.rs` is executable and produces revision-tagged cache
 candidates. The cache-first `FeedService` in
 `src/application/feed_service.rs` is also executable: it serves fresh rows,
@@ -1216,8 +1217,7 @@ while returning only non-secret status metadata. Active
 accounts can be scheduled for refresh when a transport is injected. Concrete
 source-sync acquisition/runtime composition uses an admin-enrolled encrypted
 cookie header. Binary asset persistence and URL rewriting use the optional
-database backend; local/S3 storage and automatic repair remain
-documentation-only. The pure archive sanitizer and `ArchiveService` are
+database, local, S3, or GCS backend. The pure archive sanitizer and `ArchiveService` are
 executable. Acquisition now
 contains executable identity resolution, capability/session ports, local
 capacity/lease ownership, public WebDriver navigation, common article

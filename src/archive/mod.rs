@@ -6,9 +6,8 @@
 //! remain independent of HTTP routes and scheduling.
 //!
 //! PostgreSQL stores archive metadata and content references. When optional
-//! asset archiving is enabled, the first implementation uses the PostgreSQL
-//! database backend. Local-directory and S3-compatible backends are future
-//! implementations behind the same storage abstraction. The default path keeps
+//! asset archiving is enabled, the database, local-directory, S3-compatible,
+//! and GCS backends share the same storage abstraction. The default path keeps
 //! approved external asset URLs in sanitized HTML.
 
 pub mod asset_store;

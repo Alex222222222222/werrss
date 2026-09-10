@@ -1,6 +1,6 @@
 # Asset caching design
 
-Status: the disabled/database/local/S3 slice is implemented. The current runtime
+Status: the disabled/database/local/S3/GCS slice is implemented. The current runtime
 accepts the database policy, fetches approved public image assets before the
 article persistence transaction, stores them in PostgreSQL by default, rewrites
 successful references to `/assets/{asset_record_id}`, serves stable asset responses,
@@ -43,8 +43,8 @@ unavailable, or later replaced. It has four separate responsibilities:
    metadata.
 
 The first enabled storage implementation is PostgreSQL. The storage interface
-must remain independent of PostgreSQL so a local-directory or S3-compatible
-backend can be added without changing asset-domain behavior. Apache OpenDAL
+must remain independent of PostgreSQL so the local-directory, S3-compatible,
+and GCS backends can operate without changing asset-domain behavior. Apache OpenDAL
 will provide the infrastructure adapter for those object backends; it must not
 become the domain or transaction abstraction.
 
@@ -97,12 +97,13 @@ The implementations are adapters only:
   port and may commit independently of the repository transaction;
 - `OpenDalFsBlobStore` uses OpenDAL's filesystem service for a local directory;
 - `OpenDalS3BlobStore` uses OpenDAL's S3 service for S3-compatible providers;
-- later adapters may use OpenDAL's GCS, Azure Blob, OSS, FTP, SFTP, WebDAV, or
+- `OpenDalGcsBlobStore` uses OpenDAL's GCS service for Google Cloud Storage;
+- later adapters may use OpenDAL's Azure Blob, OSS, FTP, SFTP, WebDAV, or
   PostgreSQL services after the common contract is stable.
 
 OpenDAL service features should be enabled selectively when those adapters are
-implemented. The initial OpenDAL integration must enable only filesystem and
-S3 support rather than compiling every service into the application. The async
+implemented. The current integration enables only filesystem, GCS, and S3
+support rather than compiling every service into the application. The async
 OpenDAL operator is required in this Tokio application; its blocking wrapper
 must not be called from async request or worker paths.
 
@@ -127,24 +128,28 @@ or accounting. The stable `/assets/{id}` route continues to proxy through the
 application so access timestamps, repair admission, and public URL behavior
 remain unchanged.
 
-### Planned backend configuration
+### Backend configuration
 
 The existing `disabled` and `database` modes remain unchanged and
-`disabled` remains the default. Once implemented, `local` and `s3` will be
-explicit backend values rather than a generic provider string:
+`disabled` remains the default. `local`, `s3`, and `gcs` are explicit
+backend values rather than a generic provider string:
 
 | Variable | Meaning |
 | --- | --- |
-| `ASSET_ARCHIVE_BACKEND` | `disabled`, `database`, `local`, or `s3`; `postgres` remains an alias for `database`. |
+| `ASSET_ARCHIVE_BACKEND` | `disabled`, `database`, `local`, `s3`, or `gcs`; `postgres` remains an alias for `database`. |
 | `ASSET_LOCAL_ROOT` | Root directory for the local OpenDAL filesystem backend. |
 | `ASSET_S3_BUCKET` | Bucket used by the S3-compatible backend. |
 | `ASSET_S3_ENDPOINT` | Optional provider endpoint, including MinIO or another S3-compatible service. |
 | `ASSET_S3_REGION` | S3 signing region. |
 | `ASSET_S3_ACCESS_KEY_ID` | Secret-backed S3 access key. |
 | `ASSET_S3_SECRET_ACCESS_KEY` | Secret-backed S3 secret key. |
+| `ASSET_GCS_BUCKET` | Bucket used by the Google Cloud Storage backend. |
+| `ASSET_GCS_ENDPOINT` | Optional for signed requests; required when unsigned requests target an emulator. |
+| `ASSET_GCS_CREDENTIAL` | Base64-encoded service-account or external-account JSON for signed requests. |
+| `ASSET_GCS_SKIP_SIGNATURE` | Set to `true` only for an explicitly configured unauthenticated GCS emulator; the credential is then optional. |
 
 Credentials must be loaded as secrets and must never be logged. Provider
-specific settings for GCS, Azure Blob, OSS, FTP, SFTP, and WebDAV should be
+specific settings for Azure Blob, OSS, FTP, SFTP, and WebDAV should be
 added only when those services are implemented and tested; they should not be
 accepted as silently ignored configuration in earlier releases.
 
@@ -154,17 +159,24 @@ The canonical backend name is `database`. It means that binary data is stored
 in PostgreSQL. `postgres` is accepted as a compatibility alias for the same
 backend, not as a second behavior. `local` selects the OpenDAL filesystem
 adapter and requires `ASSET_LOCAL_ROOT`. `s3` selects the OpenDAL S3 adapter
-and requires its bucket, region, and credentials.
+and requires its bucket, region, and credentials. `gcs` selects the OpenDAL
+GCS adapter and requires its bucket and base64-encoded credential JSON unless
+`ASSET_GCS_SKIP_SIGNATURE=true` is explicitly selected for an unauthenticated
+emulator.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `ASSET_ARCHIVE_BACKEND` | `disabled` | `disabled` leaves external URLs unchanged; `database` stores bytes in PostgreSQL; `local` stores bytes through OpenDAL in `ASSET_LOCAL_ROOT`. |
+| `ASSET_ARCHIVE_BACKEND` | `disabled` | `disabled` leaves external URLs unchanged; `database` stores bytes in PostgreSQL; `local` stores bytes through OpenDAL in `ASSET_LOCAL_ROOT`; `s3` and `gcs` use their configured OpenDAL object stores. |
 | `ASSET_LOCAL_ROOT` | — | Local OpenDAL filesystem root; required for `local`. |
 | `ASSET_S3_BUCKET` | — | S3-compatible bucket; required for `s3`. |
 | `ASSET_S3_ENDPOINT` | — | Optional S3-compatible endpoint. |
 | `ASSET_S3_REGION` | — | S3 signing region; required for `s3`. |
 | `ASSET_S3_ACCESS_KEY_ID` | — | Secret-backed S3 access key; required for `s3`. |
 | `ASSET_S3_SECRET_ACCESS_KEY` | — | Secret-backed S3 secret key; required for `s3`. |
+| `ASSET_GCS_BUCKET` | — | Google Cloud Storage bucket; required for `gcs`. |
+| `ASSET_GCS_ENDPOINT` | — | Optional for signed requests; required for unsigned emulator requests. |
+| `ASSET_GCS_CREDENTIAL` | — | Base64-encoded service-account or external-account JSON; required for signed `gcs` requests. |
+| `ASSET_GCS_SKIP_SIGNATURE` | `false` | Sends unsigned requests for an explicitly configured unauthenticated GCS emulator; allows the credential to be omitted. |
 | `ASSET_USE_ABSOLUTE_URLS` | `true` | When database caching is enabled, feed rendering converts stable `/assets/{id}` links to full URLs rooted at `SERVER_ROOT_URL`. Set to `false` to keep relative links; the default requires `SERVER_ROOT_URL`. |
 | `ASSET_CACHE_MAX_SIZE_MB` | `5000` | Maximum aggregate size of cached binary bytes. `0` disables size-based eviction. The value is decimal megabytes: `5000` means 5,000,000,000 bytes. |
 | `ASSET_CACHE_MAX_AGE_DAYS` | `30` | Maximum age since the last successful access before cached bytes are evicted. `0` disables age-based eviction. |
@@ -726,6 +738,8 @@ PostgreSQL integration tests should cover:
 - a local OpenDAL filesystem backend using a temporary directory;
 - an S3-compatible OpenDAL backend against an optional local S3-compatible
   service such as MinIO, without requiring cloud credentials in normal CI;
+- a GCS OpenDAL backend against an optional local GCS-compatible emulator,
+  without requiring cloud credentials in normal CI;
 - an external object write followed by a failed PostgreSQL commit leaving an
   orphan eligible for cleanup;
 - concurrent external additions with equal checksums but different raw bytes

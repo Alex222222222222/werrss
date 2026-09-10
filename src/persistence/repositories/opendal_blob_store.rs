@@ -13,7 +13,7 @@ use crate::archive::asset_store::{
 
 const METADATA_SUFFIX: &str = ".metadata.json";
 const WRITE_LOCK_FILE: &str = ".werrss.lock";
-const S3_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
+const REMOTE_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 struct OpenDalBlobStoreCore {
@@ -35,6 +35,12 @@ pub struct OpenDalS3BlobStore {
     core: OpenDalBlobStoreCore,
 }
 
+/// Stores raw asset bytes in Google Cloud Storage through OpenDAL.
+#[derive(Clone)]
+pub struct OpenDalGcsBlobStore {
+    core: OpenDalBlobStoreCore,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct StoredMetadata {
     checksum: String,
@@ -48,7 +54,7 @@ impl OpenDalFsBlobStore {
         let root = PathBuf::from(root.as_ref());
         let root_string = root.to_string_lossy();
         let builder = services::Fs::default().root(&root_string);
-        let operator = Operator::new(builder).map_err(backend_error)?.finish();
+        let operator = Operator::new(builder).map_err(backend_error)?;
         Ok(Self {
             core: OpenDalBlobStoreCore {
                 operator,
@@ -74,7 +80,7 @@ impl OpenDalS3BlobStore {
             region,
             access_key_id,
             secret_access_key,
-            S3_OPERATION_TIMEOUT,
+            REMOTE_OPERATION_TIMEOUT,
         )
     }
 
@@ -96,12 +102,60 @@ impl OpenDalS3BlobStore {
             Some(endpoint) => builder.endpoint(endpoint),
             None => builder,
         };
-        let operator = Operator::new(builder).map_err(backend_error)?.finish();
+        let operator = Operator::new(builder).map_err(backend_error)?;
         Ok(Self {
             core: OpenDalBlobStoreCore {
                 operator,
                 root: None,
                 operation_timeout: Some(operation_timeout),
+            },
+        })
+    }
+}
+
+impl OpenDalGcsBlobStore {
+    /// Creates a Google Cloud Storage backend with an explicit credential.
+    ///
+    /// `credential` is the base64-encoded service-account or external-account
+    /// JSON accepted by OpenDAL's GCS service.
+    pub fn new(
+        bucket: &str,
+        endpoint: Option<&str>,
+        credential: &str,
+    ) -> Result<Self, AssetBlobStoreError> {
+        Self::new_with_options(bucket, endpoint, Some(credential), false)
+    }
+
+    /// Creates a Google Cloud Storage backend with explicit authentication options.
+    ///
+    /// `credential` is the base64-encoded service-account or external-account
+    /// JSON accepted by OpenDAL's GCS service. It may be omitted when
+    /// `skip_signature` is enabled for an unauthenticated emulator.
+    pub fn new_with_options(
+        bucket: &str,
+        endpoint: Option<&str>,
+        credential: Option<&str>,
+        skip_signature: bool,
+    ) -> Result<Self, AssetBlobStoreError> {
+        let mut builder = services::Gcs::default()
+            .bucket(bucket)
+            .disable_config_load()
+            .disable_vm_metadata();
+        if let Some(credential) = credential {
+            builder = builder.credential(credential);
+        }
+        if skip_signature {
+            builder = builder.skip_signature();
+        }
+        if let Some(endpoint) = endpoint {
+            builder = builder.endpoint(endpoint);
+        }
+        let operator = Operator::new(builder).map_err(backend_error)?;
+        Ok(Self {
+            core: OpenDalBlobStoreCore {
+                operator,
+                root: None,
+                operation_timeout: Some(REMOTE_OPERATION_TIMEOUT),
             },
         })
     }
@@ -367,7 +421,7 @@ impl OpenDalBlobStoreCore {
             }
             Err(error) => {
                 return Err(AssetBlobStoreError::Backend(format!(
-                    "S3 blob write could not be reconciled: {original_error}; body check failed: {error}"
+                    "external blob write could not be reconciled: {original_error}; body check failed: {error}"
                 )));
             }
         }
@@ -383,24 +437,24 @@ impl OpenDalBlobStoreCore {
             Ok(None) => {}
             Err(error) => {
                 return Err(AssetBlobStoreError::Backend(format!(
-                    "S3 blob write could not be reconciled: {original_error}; read failed: {error}"
+                    "external blob write could not be reconciled: {original_error}; read failed: {error}"
                 )));
             }
         }
 
         if let Err(retry_error) = self.write_metadata(key, blob).await {
             return Err(AssetBlobStoreError::Backend(format!(
-                "S3 blob write could not be reconciled: {original_error}; metadata retry failed: {retry_error}"
+                "external blob write could not be reconciled: {original_error}; metadata retry failed: {retry_error}"
             )));
         }
         match self.read(key).await {
             Ok(Some(existing)) if existing == *blob => Ok(()),
             Ok(Some(_)) => Err(AssetBlobStoreError::Conflict),
             Ok(None) => Err(AssetBlobStoreError::Backend(format!(
-                "S3 blob write could not be reconciled: {original_error}; metadata remained unavailable"
+                "external blob write could not be reconciled: {original_error}; metadata remained unavailable"
             ))),
             Err(error) => Err(AssetBlobStoreError::Backend(format!(
-                "S3 blob write could not be reconciled: {original_error}; final read failed: {error}"
+                "external blob write could not be reconciled: {original_error}; final read failed: {error}"
             ))),
         }
     }
@@ -459,6 +513,7 @@ macro_rules! impl_blob_store_for_open_dal {
 
 impl_blob_store_for_open_dal!(OpenDalFsBlobStore);
 impl_blob_store_for_open_dal!(OpenDalS3BlobStore);
+impl_blob_store_for_open_dal!(OpenDalGcsBlobStore);
 
 fn backend_error(error: impl std::fmt::Display) -> AssetBlobStoreError {
     AssetBlobStoreError::Backend(error.to_string())
@@ -476,6 +531,7 @@ mod tests {
     use super::*;
     use sha2::{Digest, Sha256};
     use std::{
+        collections::HashMap,
         env,
         ffi::OsString,
         sync::{Arc, Mutex},
@@ -558,9 +614,32 @@ mod tests {
             .unwrap()
             .core
             .operation_timeout,
-            Some(S3_OPERATION_TIMEOUT)
+            Some(REMOTE_OPERATION_TIMEOUT)
         );
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn gcs_backend_operations_have_a_bounded_timeout() {
+        let store = OpenDalGcsBlobStore::new(
+            "werrss-assets",
+            Some("http://127.0.0.1:9000"),
+            "base64-encoded-service-account",
+        )
+        .unwrap();
+        let core = OpenDalBlobStoreCore {
+            operator: store.core.operator.clone(),
+            root: None,
+            operation_timeout: Some(std::time::Duration::from_millis(10)),
+        };
+        let result = core
+            .run_backend_operation(std::future::pending::<Result<(), opendal::Error>>())
+            .await;
+
+        let error = result.expect_err("a stalled backend operation should time out");
+        assert_eq!(error.kind(), ErrorKind::Unexpected);
+        assert!(error.to_string().contains("timed out"));
+        assert_eq!(store.core.operation_timeout, Some(REMOTE_OPERATION_TIMEOUT));
     }
 
     #[tokio::test]
@@ -771,6 +850,13 @@ mod tests {
     }
 
     async fn read_mock_http_request(stream: &mut TcpStream) -> Option<(String, String)> {
+        let (method, target, _) = read_mock_http_request_with_body(stream).await?;
+        Some((method, target))
+    }
+
+    async fn read_mock_http_request_with_body(
+        stream: &mut TcpStream,
+    ) -> Option<(String, String, Vec<u8>)> {
         let mut request = Vec::new();
         let header_end;
         loop {
@@ -808,6 +894,7 @@ mod tests {
         Some((
             request_line.next()?.to_owned(),
             request_line.next()?.to_owned(),
+            request[header_end..header_end + content_length].to_vec(),
         ))
     }
 
@@ -816,9 +903,22 @@ mod tests {
         status: &str,
         body: &[u8],
     ) -> std::io::Result<()> {
+        write_mock_http_response_with_headers(stream, status, &[], body).await
+    }
+
+    async fn write_mock_http_response_with_headers(
+        stream: &mut TcpStream,
+        status: &str,
+        extra_headers: &[(&str, &str)],
+        body: &[u8],
+    ) -> std::io::Result<()> {
+        let extra_headers = extra_headers
+            .iter()
+            .map(|(name, value)| format!("{name}: {value}\r\n"))
+            .collect::<String>();
         let headers = format!(
-            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            body.len()
+            "HTTP/1.1 {status}\r\n{extra_headers}Content-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len(),
         );
         stream.write_all(headers.as_bytes()).await?;
         stream.write_all(body).await
@@ -981,6 +1081,140 @@ mod tests {
         let _ = server.await;
     }
 
+    #[derive(Default)]
+    struct MockGcsState {
+        objects: HashMap<String, Vec<u8>>,
+        sessions: HashMap<String, String>,
+        targets: Vec<String>,
+    }
+
+    fn gcs_object_name(target: &str) -> Option<String> {
+        let url = url::Url::parse(&format!("http://gcs.test{target}")).ok()?;
+        if let Some((_, name)) = url.query_pairs().find(|(key, _)| key == "name") {
+            return Some(name.into_owned());
+        }
+        let encoded_name = url.path().split("/o/").nth(1)?;
+        percent_encoding::percent_decode_str(encoded_name)
+            .decode_utf8()
+            .ok()
+            .map(|name| name.into_owned())
+    }
+
+    async fn serve_mock_gcs_connection(
+        mut stream: TcpStream,
+        state: Arc<Mutex<MockGcsState>>,
+        endpoint: String,
+    ) {
+        let Some((method, target, body)) = read_mock_http_request_with_body(&mut stream).await
+        else {
+            return;
+        };
+        let object_name = gcs_object_name(&target);
+        let (status, response_headers, response_body) = {
+            let mut state = state.lock().unwrap();
+            state.targets.push(target.clone());
+            match method.as_str() {
+                "GET" => match object_name.and_then(|name| state.objects.get(&name).cloned()) {
+                    Some(body) => ("200 OK", Vec::new(), body),
+                    None => ("404 Not Found", Vec::new(), Vec::new()),
+                },
+                "POST" => {
+                    if target.contains("uploadType=resumable") {
+                        let Some(object_name) = object_name else {
+                            return;
+                        };
+                        let session_path = format!("/session/{}", state.sessions.len() + 1);
+                        state.sessions.insert(session_path.clone(), object_name);
+                        let location = format!("{endpoint}{session_path}");
+                        ("200 OK", vec![("Location", location)], Vec::new())
+                    } else {
+                        let Some(object_name) = object_name else {
+                            return;
+                        };
+                        let size = body.len();
+                        state.objects.insert(object_name, body);
+                        (
+                            "200 OK",
+                            Vec::new(),
+                            format!(r#"{{"size":"{size}"}}"#).into_bytes(),
+                        )
+                    }
+                }
+                "PUT" if target.starts_with("/session/") => {
+                    let Some(object_name) = state.sessions.get(&target).cloned() else {
+                        return;
+                    };
+                    let size = body.len();
+                    state.objects.insert(object_name, body);
+                    (
+                        "200 OK",
+                        Vec::new(),
+                        format!(r#"{{"size":"{size}"}}"#).into_bytes(),
+                    )
+                }
+                "DELETE" => {
+                    if let Some(object_name) = object_name {
+                        state.objects.remove(&object_name);
+                    }
+                    ("204 No Content", Vec::new(), Vec::new())
+                }
+                _ => ("404 Not Found", Vec::new(), Vec::new()),
+            }
+        };
+        let response_headers = response_headers
+            .iter()
+            .map(|(name, value)| (*name, value.as_str()))
+            .collect::<Vec<_>>();
+        let _ = write_mock_http_response_with_headers(
+            &mut stream,
+            status,
+            &response_headers,
+            &response_body,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn gcs_unsigned_store_round_trips_nested_asset_keys_without_double_encoding() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let state = Arc::new(Mutex::new(MockGcsState::default()));
+        let server_state = state.clone();
+        let server_endpoint = endpoint.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(serve_mock_gcs_connection(
+                    stream,
+                    server_state.clone(),
+                    server_endpoint.clone(),
+                ));
+            }
+        });
+
+        let store =
+            OpenDalGcsBlobStore::new_with_options("werrss-assets", Some(&endpoint), None, true)
+                .unwrap();
+        let key = AssetBlobKey::for_blob_id(Uuid::new_v4());
+        let value = blob();
+
+        store.put(&key, &value).await.unwrap();
+        assert_eq!(store.read(&key).await.unwrap(), Some(value));
+
+        let state = state.lock().unwrap();
+        assert!(state.targets.iter().any(|target| target.contains("%2F")));
+        assert!(state.targets.iter().all(|target| !target.contains("%252F")));
+        assert!(state.objects.contains_key(key.as_str()));
+        assert!(state
+            .objects
+            .contains_key(&format!("{}{METADATA_SUFFIX}", key.as_str())));
+
+        server.abort();
+        let _ = server.await;
+    }
+
     #[test]
     fn s3_store_accepts_an_explicit_compatible_endpoint() {
         let store = OpenDalS3BlobStore::new(
@@ -989,6 +1223,27 @@ mod tests {
             "us-east-1",
             "access",
             "secret",
+        );
+        assert!(store.is_ok());
+    }
+
+    #[test]
+    fn gcs_store_accepts_an_explicit_endpoint_and_credential() {
+        let store = OpenDalGcsBlobStore::new(
+            "werrss-assets",
+            Some("http://127.0.0.1:9000"),
+            "base64-encoded-service-account",
+        );
+        assert!(store.is_ok());
+    }
+
+    #[test]
+    fn gcs_store_accepts_unsigned_emulator_options_without_credentials() {
+        let store = OpenDalGcsBlobStore::new_with_options(
+            "werrss-assets",
+            Some("http://127.0.0.1:9000"),
+            None,
+            true,
         );
         assert!(store.is_ok());
     }

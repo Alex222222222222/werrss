@@ -32,6 +32,8 @@
 //! ASSET_ARCHIVE_BACKEND / ASSET_LOCAL_ROOT / ASSET_CACHE_MAX_SIZE_MB /
 //! ASSET_S3_BUCKET / ASSET_S3_ENDPOINT / ASSET_S3_REGION /
 //! ASSET_S3_ACCESS_KEY_ID / ASSET_S3_SECRET_ACCESS_KEY /
+//! ASSET_GCS_BUCKET / ASSET_GCS_ENDPOINT / ASSET_GCS_CREDENTIAL /
+//! ASSET_GCS_SKIP_SIGNATURE /
 //! ASSET_CACHE_MAX_AGE_DAYS / ASSET_MAX_SIZE_MB /
 //! ASSET_USE_ABSOLUTE_URLS /
 //! ASSET_MAX_COUNT_PER_ARTICLE / ASSET_MAX_FETCH_BYTES_PER_ARTICLE_MB /
@@ -67,6 +69,7 @@
 
 use std::{env, str::FromStr, time::Duration};
 
+use base64::Engine as _;
 use chrono::NaiveTime;
 use chrono_tz::Tz;
 use secrecy::SecretString;
@@ -161,6 +164,10 @@ const KNOWN_ENVIRONMENT_VARIABLES: &[&str] = &[
     "ASSET_S3_REGION",
     "ASSET_S3_ACCESS_KEY_ID",
     "ASSET_S3_SECRET_ACCESS_KEY",
+    "ASSET_GCS_BUCKET",
+    "ASSET_GCS_ENDPOINT",
+    "ASSET_GCS_CREDENTIAL",
+    "ASSET_GCS_SKIP_SIGNATURE",
     "ASSET_CACHE_MAX_SIZE_MB",
     "ASSET_CACHE_MAX_AGE_DAYS",
     "ASSET_USE_ABSOLUTE_URLS",
@@ -317,6 +324,15 @@ pub enum AssetArchiveConfig {
         /// Cluster-wide admission and retry limits for public cache misses.
         repair_policy: AssetRepairPolicy,
     },
+    /// Store binary assets through an OpenDAL Google Cloud Storage service.
+    Gcs {
+        /// Google Cloud Storage connection settings.
+        storage: AssetGcsConfig,
+        /// Limits applied to acquisition, storage, and maintenance.
+        policy: AssetCachePolicy,
+        /// Cluster-wide admission and retry limits for public cache misses.
+        repair_policy: AssetRepairPolicy,
+    },
 }
 
 /// Credentials and endpoint settings for an S3-compatible asset backend.
@@ -383,6 +399,68 @@ impl AssetS3Config {
     }
 }
 
+/// Credentials and endpoint settings for a Google Cloud Storage asset backend.
+#[derive(Clone)]
+pub struct AssetGcsConfig {
+    bucket: String,
+    endpoint: Option<String>,
+    credential: Option<secrecy::SecretString>,
+    skip_signature: bool,
+}
+
+impl PartialEq for AssetGcsConfig {
+    fn eq(&self, other: &Self) -> bool {
+        self.bucket == other.bucket
+            && self.endpoint == other.endpoint
+            && self.skip_signature == other.skip_signature
+            && match (&self.credential, &other.credential) {
+                (Some(left), Some(right)) => {
+                    secrecy::ExposeSecret::expose_secret(left)
+                        == secrecy::ExposeSecret::expose_secret(right)
+                }
+                (None, None) => true,
+                _ => false,
+            }
+    }
+}
+
+impl Eq for AssetGcsConfig {}
+
+impl std::fmt::Debug for AssetGcsConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AssetGcsConfig")
+            .field("bucket", &self.bucket)
+            .field("endpoint", &self.endpoint)
+            .field("credential", &"<redacted>")
+            .finish()
+    }
+}
+
+impl AssetGcsConfig {
+    /// Returns the configured bucket.
+    pub fn bucket(&self) -> &str {
+        &self.bucket
+    }
+
+    /// Returns the optional provider endpoint.
+    pub fn endpoint(&self) -> Option<&str> {
+        self.endpoint.as_deref()
+    }
+
+    /// Returns the base64-encoded Google credential passed to OpenDAL, when configured.
+    pub fn credential(&self) -> Option<&str> {
+        self.credential
+            .as_ref()
+            .map(secrecy::ExposeSecret::expose_secret)
+    }
+
+    /// Returns whether OpenDAL should send unsigned requests.
+    pub const fn skip_signature(&self) -> bool {
+        self.skip_signature
+    }
+}
+
 impl AssetArchiveConfig {
     /// Returns the database policy when binary caching is enabled.
     pub const fn database_policy(&self) -> Option<AssetCachePolicy> {
@@ -390,7 +468,8 @@ impl AssetArchiveConfig {
             Self::Disabled => None,
             Self::Database { policy, .. }
             | Self::Local { policy, .. }
-            | Self::S3 { policy, .. } => Some(*policy),
+            | Self::S3 { policy, .. }
+            | Self::Gcs { policy, .. } => Some(*policy),
         }
     }
 
@@ -400,7 +479,8 @@ impl AssetArchiveConfig {
             Self::Disabled => None,
             Self::Database { repair_policy, .. }
             | Self::Local { repair_policy, .. }
-            | Self::S3 { repair_policy, .. } => Some(*repair_policy),
+            | Self::S3 { repair_policy, .. }
+            | Self::Gcs { repair_policy, .. } => Some(*repair_policy),
         }
     }
 
@@ -416,6 +496,14 @@ impl AssetArchiveConfig {
     pub fn s3_storage(&self) -> Option<&AssetS3Config> {
         match self {
             Self::S3 { storage, .. } => Some(storage),
+            _ => None,
+        }
+    }
+
+    /// Returns the configured Google Cloud Storage settings.
+    pub fn gcs_storage(&self) -> Option<&AssetGcsConfig> {
+        match self {
+            Self::Gcs { storage, .. } => Some(storage),
             _ => None,
         }
     }
@@ -789,6 +877,7 @@ impl AppConfig {
                 AssetArchiveConfig::Database { .. }
                     | AssetArchiveConfig::Local { .. }
                     | AssetArchiveConfig::S3 { .. }
+                    | AssetArchiveConfig::Gcs { .. }
             )
             && server_root_url.is_none()
         {
@@ -1007,6 +1096,10 @@ struct RawConfig {
     asset_s3_region: Option<String>,
     asset_s3_access_key_id: Option<String>,
     asset_s3_secret_access_key: Option<String>,
+    asset_gcs_bucket: Option<String>,
+    asset_gcs_endpoint: Option<String>,
+    asset_gcs_credential: Option<String>,
+    asset_gcs_skip_signature: Option<String>,
     asset_cache_max_size_mb: Option<u64>,
     asset_cache_max_age_days: Option<u64>,
     asset_use_absolute_urls: Option<String>,
@@ -1279,9 +1372,49 @@ fn asset_archive_config(raw: &RawConfig) -> Result<AssetArchiveConfig, ConfigErr
                 repair_policy: asset_repair_policy(raw)?,
             })
         }
+        "gcs" => {
+            let bucket = required(raw.asset_gcs_bucket.clone(), "ASSET_GCS_BUCKET")?;
+            let skip_signature = parse_bool(
+                raw.asset_gcs_skip_signature.as_deref().unwrap_or("false"),
+                "ASSET_GCS_SKIP_SIGNATURE",
+            )?;
+            let endpoint = raw
+                .asset_gcs_endpoint
+                .as_deref()
+                .map(str::trim)
+                .map(|endpoint| endpoint.trim_end_matches('/'))
+                .filter(|endpoint| !endpoint.is_empty())
+                .map(str::to_owned);
+            if skip_signature && endpoint.is_none() {
+                return Err(ConfigError::Missing {
+                    variable: "ASSET_GCS_ENDPOINT",
+                });
+            }
+            let credential = if skip_signature {
+                raw.asset_gcs_credential
+                    .clone()
+                    .filter(|credential| !credential.trim().is_empty())
+            } else {
+                Some(validate_gcs_credential(required(
+                    raw.asset_gcs_credential.clone(),
+                    "ASSET_GCS_CREDENTIAL",
+                )?)?)
+            };
+            Ok(AssetArchiveConfig::Gcs {
+                storage: AssetGcsConfig {
+                    bucket,
+                    endpoint,
+                    credential: credential
+                        .map(|credential| secrecy::SecretString::new(credential.into_boxed_str())),
+                    skip_signature,
+                },
+                policy,
+                repair_policy: asset_repair_policy(raw)?,
+            })
+        }
         _ => Err(ConfigError::InvalidValue {
             variable: "ASSET_ARCHIVE_BACKEND",
-            reason: "expected disabled, database, local, or s3 (postgres is an alias)",
+            reason: "expected disabled, database, local, s3, or gcs (postgres is an alias)",
         }),
     }
 }
@@ -1401,6 +1534,37 @@ fn required(value: Option<String>, variable: &'static str) -> Result<String, Con
     value
         .filter(|value| !value.trim().is_empty())
         .ok_or(ConfigError::Missing { variable })
+}
+
+fn validate_gcs_credential(credential: String) -> Result<String, ConfigError> {
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(credential.as_bytes())
+        .map_err(|_| ConfigError::InvalidValue {
+            variable: "ASSET_GCS_CREDENTIAL",
+            reason: "must be standard-base64-encoded Google credential JSON",
+        })?;
+    let document: serde_json::Value =
+        serde_json::from_slice(&decoded).map_err(|_| ConfigError::InvalidValue {
+            variable: "ASSET_GCS_CREDENTIAL",
+            reason: "must be standard-base64-encoded Google credential JSON",
+        })?;
+    let credential_type = document
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .ok_or(ConfigError::InvalidValue {
+            variable: "ASSET_GCS_CREDENTIAL",
+            reason: "must contain a supported Google credential type",
+        })?;
+    if !matches!(
+        credential_type,
+        "service_account" | "external_account" | "impersonated_service_account" | "authorized_user"
+    ) {
+        return Err(ConfigError::InvalidValue {
+            variable: "ASSET_GCS_CREDENTIAL",
+            reason: "must contain a supported Google credential type",
+        });
+    }
+    Ok(credential)
 }
 
 fn parse_optional_http_url(
@@ -1556,6 +1720,7 @@ fn bounded_delay(value: Option<f64>, variable: &'static str) -> Result<Option<f6
 
 #[cfg(test)]
 mod tests {
+    use base64::Engine as _;
     use secrecy::ExposeSecret;
 
     use super::*;
@@ -1578,6 +1743,12 @@ mod tests {
         .into_iter()
         .map(|(key, value)| (key.to_owned(), value.to_owned()))
         .collect()
+    }
+
+    fn valid_gcs_credential() -> String {
+        base64::engine::general_purpose::STANDARD.encode(
+            br#"{"type":"service_account","client_email":"test@example.test","private_key":"test"}"#,
+        )
     }
 
     fn replace_environment(
@@ -1826,7 +1997,7 @@ mod tests {
     #[test]
     fn rejects_unimplemented_asset_backends() {
         let mut environment = valid_environment();
-        environment.push(("ASSET_ARCHIVE_BACKEND".to_owned(), "gcs".to_owned()));
+        environment.push(("ASSET_ARCHIVE_BACKEND".to_owned(), "azure".to_owned()));
 
         assert!(matches!(
             AppConfig::from_env_iter(environment),
@@ -2228,6 +2399,142 @@ mod tests {
             AppConfig::from_env_iter(environment),
             Err(ConfigError::Missing {
                 variable: "ASSET_S3_BUCKET"
+            })
+        ));
+    }
+
+    #[test]
+    fn parses_gcs_asset_mode_without_exposing_credentials_in_debug() {
+        let mut environment =
+            replace_environment(valid_environment(), "ASSET_ARCHIVE_BACKEND", "gcs");
+        let credential = valid_gcs_credential();
+        environment.extend([
+            (
+                "SERVER_ROOT_URL".to_owned(),
+                "https://rss.example.test".to_owned(),
+            ),
+            ("ASSET_GCS_BUCKET".to_owned(), "werrss-assets".to_owned()),
+            (
+                "ASSET_GCS_ENDPOINT".to_owned(),
+                " http://gcs.example.test:4443/// ".to_owned(),
+            ),
+            ("ASSET_GCS_CREDENTIAL".to_owned(), credential.clone()),
+        ]);
+        let config = AppConfig::from_env_iter(environment).unwrap();
+        let storage = config.asset_archive.gcs_storage().unwrap();
+        assert_eq!(storage.bucket(), "werrss-assets");
+        assert_eq!(storage.endpoint(), Some("http://gcs.example.test:4443"));
+        assert_eq!(storage.credential(), Some(credential.as_str()));
+        assert!(!storage.skip_signature());
+        let debug = format!("{config:?}");
+        assert!(!debug.contains(&credential));
+    }
+
+    #[test]
+    fn gcs_asset_mode_requires_bucket_and_credential() {
+        let environment = replace_environment(valid_environment(), "ASSET_ARCHIVE_BACKEND", "gcs");
+        assert!(matches!(
+            AppConfig::from_env_iter(environment),
+            Err(ConfigError::Missing {
+                variable: "ASSET_GCS_BUCKET"
+            })
+        ));
+
+        let mut environment =
+            replace_environment(valid_environment(), "ASSET_ARCHIVE_BACKEND", "gcs");
+        environment.push(("ASSET_GCS_BUCKET".to_owned(), "werrss-assets".to_owned()));
+        assert!(matches!(
+            AppConfig::from_env_iter(environment),
+            Err(ConfigError::Missing {
+                variable: "ASSET_GCS_CREDENTIAL"
+            })
+        ));
+    }
+
+    #[test]
+    fn rejects_malformed_signed_gcs_credentials() {
+        let mut environment =
+            replace_environment(valid_environment(), "ASSET_ARCHIVE_BACKEND", "gcs");
+        environment.extend([
+            (
+                "SERVER_ROOT_URL".to_owned(),
+                "https://rss.example.test".to_owned(),
+            ),
+            ("ASSET_GCS_BUCKET".to_owned(), "werrss-assets".to_owned()),
+            ("ASSET_GCS_CREDENTIAL".to_owned(), "not-base64".to_owned()),
+        ]);
+
+        assert!(matches!(
+            AppConfig::from_env_iter(environment),
+            Err(ConfigError::InvalidValue {
+                variable: "ASSET_GCS_CREDENTIAL",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn parses_unsigned_gcs_asset_mode_without_credentials() {
+        let mut environment =
+            replace_environment(valid_environment(), "ASSET_ARCHIVE_BACKEND", "gcs");
+        environment.extend([
+            (
+                "SERVER_ROOT_URL".to_owned(),
+                "https://rss.example.test".to_owned(),
+            ),
+            ("ASSET_GCS_BUCKET".to_owned(), "werrss-assets".to_owned()),
+            (
+                "ASSET_GCS_ENDPOINT".to_owned(),
+                "http://gcs.example.test:4443".to_owned(),
+            ),
+            ("ASSET_GCS_SKIP_SIGNATURE".to_owned(), "true".to_owned()),
+        ]);
+
+        let config = AppConfig::from_env_iter(environment).unwrap();
+        let storage = config.asset_archive.gcs_storage().unwrap();
+        assert_eq!(storage.credential(), None);
+        assert!(storage.skip_signature());
+    }
+
+    #[test]
+    fn unsigned_gcs_asset_mode_requires_an_explicit_endpoint() {
+        let mut environment =
+            replace_environment(valid_environment(), "ASSET_ARCHIVE_BACKEND", "gcs");
+        environment.extend([
+            (
+                "SERVER_ROOT_URL".to_owned(),
+                "https://rss.example.test".to_owned(),
+            ),
+            ("ASSET_GCS_BUCKET".to_owned(), "werrss-assets".to_owned()),
+            ("ASSET_GCS_SKIP_SIGNATURE".to_owned(), "true".to_owned()),
+        ]);
+
+        assert!(matches!(
+            AppConfig::from_env_iter(environment),
+            Err(ConfigError::Missing {
+                variable: "ASSET_GCS_ENDPOINT"
+            })
+        ));
+    }
+
+    #[test]
+    fn gcs_signature_setting_requires_a_boolean() {
+        let mut environment =
+            replace_environment(valid_environment(), "ASSET_ARCHIVE_BACKEND", "gcs");
+        environment.extend([
+            ("ASSET_GCS_BUCKET".to_owned(), "werrss-assets".to_owned()),
+            ("ASSET_GCS_CREDENTIAL".to_owned(), valid_gcs_credential()),
+            (
+                "ASSET_GCS_SKIP_SIGNATURE".to_owned(),
+                "sometimes".to_owned(),
+            ),
+        ]);
+
+        assert!(matches!(
+            AppConfig::from_env_iter(environment),
+            Err(ConfigError::InvalidValue {
+                variable: "ASSET_GCS_SKIP_SIGNATURE",
+                ..
             })
         ));
     }
