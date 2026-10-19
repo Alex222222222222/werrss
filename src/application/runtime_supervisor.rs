@@ -49,7 +49,8 @@ use crate::{
             feed_token_repository::PostgresFeedTokenRepository,
             job_repository::PostgresJobRepository,
             opendal_blob_store::{
-                OpenDalAzureBlobStore, OpenDalFsBlobStore, OpenDalGcsBlobStore, OpenDalS3BlobStore,
+                OpenDalAzureBlobStore, OpenDalFsBlobStore, OpenDalGcsBlobStore,
+                OpenDalOssBlobStore, OpenDalS3BlobStore,
             },
             scheduler_repository::PostgresSchedulerRepository,
             source_repository::PostgresSourceRepository,
@@ -312,22 +313,33 @@ impl RuntimeSupervisor {
                     storage.access_key_id(),
                     storage.secret_access_key(),
                 )?)),
-                None => match self.config.asset_archive.gcs_storage() {
-                    Some(storage) => Ok(Arc::new(OpenDalGcsBlobStore::new_with_options(
+                None => match self.config.asset_archive.oss_storage() {
+                    Some(storage) => Ok(Arc::new(OpenDalOssBlobStore::new_with_options(
                         storage.bucket(),
                         storage.endpoint(),
-                        storage.credential(),
+                        storage.access_key_id(),
+                        storage.access_key_secret(),
+                        storage.security_token(),
+                        storage.addressing_style(),
                         storage.skip_signature(),
                     )?)),
-                    None => match self.config.asset_archive.azure_storage() {
-                        Some(storage) => Ok(Arc::new(OpenDalAzureBlobStore::new_with_options(
-                            storage.container(),
+                    None => match self.config.asset_archive.gcs_storage() {
+                        Some(storage) => Ok(Arc::new(OpenDalGcsBlobStore::new_with_options(
+                            storage.bucket(),
                             storage.endpoint(),
-                            storage.account_name(),
-                            storage.account_key(),
+                            storage.credential(),
                             storage.skip_signature(),
                         )?)),
-                        None => Ok(Arc::new(PostgresAssetBlobStore::new(self.pool.clone()))),
+                        None => match self.config.asset_archive.azure_storage() {
+                            Some(storage) => Ok(Arc::new(OpenDalAzureBlobStore::new_with_options(
+                                storage.container(),
+                                storage.endpoint(),
+                                storage.account_name(),
+                                storage.account_key(),
+                                storage.skip_signature(),
+                            )?)),
+                            None => Ok(Arc::new(PostgresAssetBlobStore::new(self.pool.clone()))),
+                        },
                     },
                 },
             },
@@ -1324,6 +1336,53 @@ mod tests {
         PgPoolOptions::new()
             .connect_lazy("postgres://unused")
             .expect("lazy test pool URL should be valid")
+    }
+
+    #[tokio::test]
+    async fn runtime_constructs_the_configured_oss_blob_store() {
+        let app_config = AppConfig::from_env_iter([
+            (
+                "DATABASE_URL".to_owned(),
+                "postgres://user:pass@db/feed".to_owned(),
+            ),
+            (
+                "CREDENTIAL_ENCRYPTION_KEY".to_owned(),
+                "runtime-test-key".to_owned(),
+            ),
+            ("APP_ROLES".to_owned(), "api".to_owned()),
+            (
+                "APP_INSTANCE_ID".to_owned(),
+                "runtime-supervisor-test".to_owned(),
+            ),
+            ("WORKER_CONCURRENCY".to_owned(), "2".to_owned()),
+            (
+                "SERVER_ROOT_URL".to_owned(),
+                "https://feeds.example.test/werrss.xml".to_owned(),
+            ),
+            ("ASSET_ARCHIVE_BACKEND".to_owned(), "oss".to_owned()),
+            ("ASSET_OSS_BUCKET".to_owned(), "werrss-assets".to_owned()),
+            ("ASSET_OSS_VERSIONING".to_owned(), "disabled".to_owned()),
+            (
+                "ASSET_OSS_ENDPOINT".to_owned(),
+                "http://oss.example.test:9000".to_owned(),
+            ),
+            (
+                "ASSET_OSS_ACCESS_KEY_ID".to_owned(),
+                "access-key".to_owned(),
+            ),
+            (
+                "ASSET_OSS_ACCESS_KEY_SECRET".to_owned(),
+                "access-secret".to_owned(),
+            ),
+        ])
+        .expect("OSS runtime configuration should be valid");
+        let supervisor = RuntimeSupervisor::new(app_config, lazy_pool())
+            .expect("OSS runtime should construct with a lazy pool");
+
+        let store = supervisor
+            .blob_store()
+            .expect("OSS blob store should be constructible");
+        assert!(store.as_any().is::<OpenDalOssBlobStore>());
     }
 
     #[derive(Clone)]

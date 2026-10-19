@@ -236,20 +236,28 @@ cookies are never sent to asset hosts. Feed delivery detects an existing cache
 with the wrong asset URL form and rebuilds it before serving. Missing cached
 bytes enqueue a deduplicated anonymous repair job and retain the same asset URL
 while the worker restores the data.
-The local-directory, S3-compatible, Google Cloud Storage, and Azure Blob backends use a
+The local-directory, S3-compatible, Aliyun OSS, Google Cloud Storage, and Azure Blob backends use a
 shared `AssetBlobStore` boundary backed by Apache OpenDAL. PostgreSQL will
 continue to own asset metadata, relationships, deduplication, leases, repair
 jobs, and eviction state.
 
 | Variable | Default | Explanation |
 | --- | --- | --- |
-| `ASSET_ARCHIVE_BACKEND` | `disabled` | `disabled` keeps approved external URLs. `database` (or `postgres`) stores bytes and URL/version metadata in PostgreSQL. `local`, `s3`, `gcs`, and `azure` (or `azblob`) use their configured OpenDAL backend. |
+| `ASSET_ARCHIVE_BACKEND` | `disabled` | `disabled` keeps approved external URLs. `database` (or `postgres`) stores bytes and URL/version metadata in PostgreSQL. `local`, `s3`, `oss`, `gcs`, and `azure` (or `azblob`) use their configured OpenDAL backend. |
 | `ASSET_LOCAL_ROOT` | — | Root directory for the local OpenDAL filesystem backend; required when the backend is `local`. |
 | `ASSET_S3_BUCKET` | — | S3-compatible bucket; required when the backend is `s3`. |
 | `ASSET_S3_ENDPOINT` | — | Optional S3-compatible endpoint, such as MinIO. |
 | `ASSET_S3_REGION` | — | S3 signing region; required when the backend is `s3`. |
 | `ASSET_S3_ACCESS_KEY_ID` | — | Secret-backed S3 access key; required when the backend is `s3`. |
 | `ASSET_S3_SECRET_ACCESS_KEY` | — | Secret-backed S3 secret key; required when the backend is `s3`. |
+| `ASSET_OSS_BUCKET` | — | Aliyun OSS bucket; required when the backend is `oss`. |
+| `ASSET_OSS_ENDPOINT` | — | Aliyun OSS HTTP(S) endpoint without embedded credentials, path, or query components; required for all OSS modes. |
+| `ASSET_OSS_ADDRESSING_STYLE` | `virtual` | OSS addressing style: `virtual`, `path`, or `cname`. |
+| `ASSET_OSS_VERSIONING` | — | Must be `disabled`; versioned and suspended OSS buckets are rejected because immutable create-if-absent writes are unavailable there. |
+| `ASSET_OSS_ACCESS_KEY_ID` | — | Secret-backed OSS access key ID; required for signed requests. |
+| `ASSET_OSS_ACCESS_KEY_SECRET` | — | Secret-backed OSS access key secret; required for signed requests. |
+| `ASSET_OSS_SECURITY_TOKEN` | — | Optional temporary OSS security token. |
+| `ASSET_OSS_SKIP_SIGNATURE` | `false` | Sends unsigned OSS requests for an explicitly configured compatible emulator; credentials may then be omitted. |
 | `ASSET_GCS_BUCKET` | — | Google Cloud Storage bucket; required when the backend is `gcs`. |
 | `ASSET_GCS_ENDPOINT` | — | Optional Google Cloud Storage-compatible endpoint for signed requests; required for unsigned emulator requests. |
 | `ASSET_GCS_CREDENTIAL` | — | Base64-encoded service-account or external-account JSON; required for signed `gcs` requests. |
@@ -333,11 +341,11 @@ adapts the existing PostgreSQL binary table without a migration. Both
 `PostgresAssetStore::with_blob_store` and
 `UnitOfWorkFactory::with_blob_store` accept an injected
 `Arc<dyn AssetBlobStore>`; their default constructors continue to use the
-database backend. Azure Blob is now available alongside the local, S3, and GCS
-adapters. The remaining roadmap items are future work:
+database backend. Azure Blob and Aliyun OSS are now available alongside the
+local, S3, and GCS adapters. The remaining roadmap items are future work:
 
-1. **Add OSS, FTP, SFTP, and WebDAV only after the common contract is stable.**
-   The local, S3-compatible, GCS, and Azure Blob adapters pass the shared
+1. **Add FTP, SFTP, and WebDAV only after the common contract is stable.**
+   The local, S3-compatible, OSS, GCS, and Azure Blob adapters pass the shared
    contract boundary; each remaining backend must add provider-appropriate
    integration tests before its configuration is accepted.
 2. **Evaluate PGMQ as a queue transport optimization.** The current custom

@@ -1,6 +1,6 @@
 # Asset caching design
 
-Status: the disabled/database/local/S3/GCS/Azure Blob slice is implemented. The current runtime
+Status: the disabled/database/local/S3/OSS/GCS/Azure Blob slice is implemented. The current runtime
 accepts the database policy, fetches approved public image assets before the
 article persistence transaction, stores them in PostgreSQL by default, rewrites
 successful references to `/assets/{asset_record_id}`, serves stable asset responses,
@@ -44,7 +44,7 @@ unavailable, or later replaced. It has four separate responsibilities:
 
 The first enabled storage implementation is PostgreSQL. The storage interface
 must remain independent of PostgreSQL so the local-directory, S3-compatible,
-GCS, and Azure Blob backends can operate without changing asset-domain behavior. Apache OpenDAL
+OSS, GCS, and Azure Blob backends can operate without changing asset-domain behavior. Apache OpenDAL
 will provide the infrastructure adapter for those object backends; it must not
 become the domain or transaction abstraction.
 
@@ -97,13 +97,18 @@ The implementations are adapters only:
   port and may commit independently of the repository transaction;
 - `OpenDalFsBlobStore` uses OpenDAL's filesystem service for a local directory;
 - `OpenDalS3BlobStore` uses OpenDAL's S3 service for S3-compatible providers;
+- `OpenDalOssBlobStore` uses OpenDAL's OSS service for Aliyun Object Storage Service and
+  enumerates/deletes all object versions and delete markers during cleanup. It
+  is limited to explicitly unversioned buckets because OSS does not provide
+  immutable create-if-absent writes through the OpenDAL adapter for versioned
+  or suspended buckets;
 - `OpenDalGcsBlobStore` uses OpenDAL's GCS service for Google Cloud Storage;
 - `OpenDalAzureBlobStore` uses OpenDAL's Azure Blob service;
-- later adapters may use OpenDAL's OSS, FTP, SFTP, WebDAV, or
+- later adapters may use OpenDAL's FTP, SFTP, WebDAV, or
   PostgreSQL services after the common contract is stable.
 
 OpenDAL service features should be enabled selectively when those adapters are
-implemented. The current integration enables only filesystem, GCS, S3, and Azure Blob
+implemented. The current integration enables only filesystem, GCS, S3, OSS, and Azure Blob
 support rather than compiling every service into the application. The async
 OpenDAL operator is required in this Tokio application; its blocking wrapper
 must not be called from async request or worker paths.
@@ -132,18 +137,26 @@ remain unchanged.
 ### Backend configuration
 
 The existing `disabled` and `database` modes remain unchanged and
-`disabled` remains the default. `local`, `s3`, `gcs`, and `azure` are explicit
+`disabled` remains the default. `local`, `s3`, `oss`, `gcs`, and `azure` are explicit
 backend values rather than a generic provider string:
 
 | Variable | Meaning |
 | --- | --- |
-| `ASSET_ARCHIVE_BACKEND` | `disabled`, `database`, `local`, `s3`, `gcs`, or `azure`; `postgres` remains an alias for `database` and `azblob` an alias for `azure`. |
+| `ASSET_ARCHIVE_BACKEND` | `disabled`, `database`, `local`, `s3`, `oss`, `gcs`, or `azure`; `postgres` remains an alias for `database` and `azblob` an alias for `azure`. |
 | `ASSET_LOCAL_ROOT` | Root directory for the local OpenDAL filesystem backend. |
 | `ASSET_S3_BUCKET` | Bucket used by the S3-compatible backend. |
 | `ASSET_S3_ENDPOINT` | Optional provider endpoint, including MinIO or another S3-compatible service. |
 | `ASSET_S3_REGION` | S3 signing region. |
 | `ASSET_S3_ACCESS_KEY_ID` | Secret-backed S3 access key. |
 | `ASSET_S3_SECRET_ACCESS_KEY` | Secret-backed S3 secret key. |
+| `ASSET_OSS_BUCKET` | Aliyun OSS bucket; required for `oss`. |
+| `ASSET_OSS_ENDPOINT` | Aliyun OSS HTTP(S) endpoint without embedded credentials, path, or query components; required for all OSS modes. |
+| `ASSET_OSS_ADDRESSING_STYLE` | `virtual`, `path`, or `cname`; defaults to `virtual`. |
+| `ASSET_OSS_VERSIONING` | Must be `disabled`; versioned and suspended buckets are unsupported. |
+| `ASSET_OSS_ACCESS_KEY_ID` | Secret-backed OSS access key ID; required for signed requests. |
+| `ASSET_OSS_ACCESS_KEY_SECRET` | Secret-backed OSS access key secret; required for signed requests. |
+| `ASSET_OSS_SECURITY_TOKEN` | Optional temporary OSS security token. |
+| `ASSET_OSS_SKIP_SIGNATURE` | Set to `true` only for an explicitly configured unauthenticated compatible service; credentials are then optional. |
 | `ASSET_GCS_BUCKET` | Bucket used by the Google Cloud Storage backend. |
 | `ASSET_GCS_ENDPOINT` | Optional for signed requests; required when unsigned requests target an emulator. |
 | `ASSET_GCS_CREDENTIAL` | Base64-encoded service-account or external-account JSON for signed requests. |
@@ -155,7 +168,7 @@ backend values rather than a generic provider string:
 | `ASSET_AZURE_SKIP_SIGNATURE` | Sends unsigned requests for an explicitly configured Azure emulator; account credentials are then optional. |
 
 Credentials must be loaded as secrets and must never be logged. Provider
-specific settings for OSS, FTP, SFTP, and WebDAV should be added only when
+specific settings for FTP, SFTP, and WebDAV should be added only when
 those services are implemented and tested; they should not be accepted as
 silently ignored configuration in earlier releases.
 
@@ -172,16 +185,35 @@ emulator. `azure` (or `azblob`) selects the OpenDAL Azure Blob adapter and
 requires its container, endpoint, account name, and base64-encoded account key
 unless `ASSET_AZURE_SKIP_SIGNATURE=true` is explicitly selected for an
 unauthenticated emulator.
+`oss` selects the OpenDAL OSS adapter and requires its bucket, endpoint, and
+credentials unless `ASSET_OSS_SKIP_SIGNATURE=true` is explicitly selected for
+an unauthenticated compatible service. The endpoint must be an HTTP(S) URL
+without embedded credentials, a path prefix, or a query component. `ASSET_OSS_VERSIONING=disabled`
+is required; versioned and suspended buckets are rejected because the OSS
+adapter cannot preserve immutable create-if-absent writes in those modes. OSS
+endpoint addressing defaults to `virtual`;
+use `path` or `cname` for compatible services that do not provide virtual-host
+DNS. Cleanup enumerates and removes every version and delete marker for the
+body and metadata objects, so the configured service must support object
+version listing.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `ASSET_ARCHIVE_BACKEND` | `disabled` | `disabled` leaves external URLs unchanged; `database` stores bytes in PostgreSQL; `local` stores bytes through OpenDAL in `ASSET_LOCAL_ROOT`; `s3`, `gcs`, and `azure` use their configured OpenDAL object stores. |
+| `ASSET_ARCHIVE_BACKEND` | `disabled` | `disabled` leaves external URLs unchanged; `database` stores bytes in PostgreSQL; `local` stores bytes through OpenDAL in `ASSET_LOCAL_ROOT`; `s3`, `oss`, `gcs`, and `azure` use their configured OpenDAL object stores. |
 | `ASSET_LOCAL_ROOT` | — | Local OpenDAL filesystem root; required for `local`. |
 | `ASSET_S3_BUCKET` | — | S3-compatible bucket; required for `s3`. |
 | `ASSET_S3_ENDPOINT` | — | Optional S3-compatible endpoint. |
 | `ASSET_S3_REGION` | — | S3 signing region; required for `s3`. |
 | `ASSET_S3_ACCESS_KEY_ID` | — | Secret-backed S3 access key; required for `s3`. |
 | `ASSET_S3_SECRET_ACCESS_KEY` | — | Secret-backed S3 secret key; required for `s3`. |
+| `ASSET_OSS_BUCKET` | — | Aliyun OSS bucket; required for `oss`. |
+| `ASSET_OSS_ENDPOINT` | — | Aliyun OSS HTTP(S) endpoint without embedded credentials, path, or query components; required for all OSS modes. |
+| `ASSET_OSS_ADDRESSING_STYLE` | `virtual` | OSS addressing style: `virtual`, `path`, or `cname`. |
+| `ASSET_OSS_VERSIONING` | — | Must be `disabled`; versioned and suspended buckets are unsupported. |
+| `ASSET_OSS_ACCESS_KEY_ID` | — | Secret-backed OSS access key ID; required for signed requests. |
+| `ASSET_OSS_ACCESS_KEY_SECRET` | — | Secret-backed OSS access key secret; required for signed requests. |
+| `ASSET_OSS_SECURITY_TOKEN` | — | Optional temporary OSS security token. |
+| `ASSET_OSS_SKIP_SIGNATURE` | `false` | Sends unsigned OSS requests for an explicitly configured compatible service; credentials are then optional. |
 | `ASSET_GCS_BUCKET` | — | Google Cloud Storage bucket; required for `gcs`. |
 | `ASSET_GCS_ENDPOINT` | — | Optional for signed requests; required for unsigned emulator requests. |
 | `ASSET_GCS_CREDENTIAL` | — | Base64-encoded service-account or external-account JSON; required for signed `gcs` requests. |
@@ -753,6 +785,8 @@ PostgreSQL integration tests should cover:
 - an S3-compatible OpenDAL backend against an optional local S3-compatible
   service such as MinIO, without requiring cloud credentials in normal CI;
 - a GCS OpenDAL backend against an optional local GCS-compatible emulator,
+  without requiring cloud credentials in normal CI;
+- an OSS OpenDAL backend against an optional local OSS-compatible service,
   without requiring cloud credentials in normal CI;
 - an Azure Blob OpenDAL backend against an optional local Azure-compatible
   emulator, without requiring cloud credentials in normal CI;

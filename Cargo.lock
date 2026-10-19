@@ -1864,6 +1864,7 @@ dependencies = [
  "opendal-service-azblob",
  "opendal-service-fs",
  "opendal-service-gcs",
+ "opendal-service-oss",
  "opendal-service-s3",
 ]
 
@@ -1972,6 +1973,23 @@ dependencies = [
  "serde_json",
  "tokio",
  "uuid",
+]
+
+[[package]]
+name = "opendal-service-oss"
+version = "0.59.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "284373c4a1143d8efaa7d010c1db05856d33a7cad475aaee8405dbcb0660cd96"
+dependencies = [
+ "bytes",
+ "http",
+ "log",
+ "opendal-core",
+ "quick-xml",
+ "reqsign-aliyun-oss",
+ "reqsign-core",
+ "reqsign-file-read-tokio",
+ "serde",
 ]
 
 [[package]]
@@ -2491,6 +2509,23 @@ name = "regex-syntax"
 version = "0.8.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
+
+[[package]]
+name = "reqsign-aliyun-oss"
+version = "3.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "10909dbc9fcb78f913014d78a5c9d1d51c477f491b1006fd1baba4fd286181df"
+dependencies = [
+ "anyhow",
+ "form_urlencoded",
+ "http",
+ "log",
+ "percent-encoding",
+ "reqsign-core",
+ "rust-ini",
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "reqsign-aws-core"
@@ -4000,6 +4035,7 @@ dependencies = [
  "ego-tree",
  "envy",
  "fs2",
+ "futures-util",
  "opendal",
  "percent-encoding",
  "qrcode",

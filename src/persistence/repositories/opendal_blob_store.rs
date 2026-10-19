@@ -4,6 +4,7 @@ use std::{any::Any, future::IntoFuture, path::PathBuf, time::Duration};
 
 use async_trait::async_trait;
 use fs2::FileExt;
+use futures_util::StreamExt;
 use opendal::{services, ErrorKind, Operator};
 use serde::{Deserialize, Serialize};
 
@@ -14,6 +15,7 @@ use crate::archive::asset_store::{
 const METADATA_SUFFIX: &str = ".metadata.json";
 const WRITE_LOCK_FILE: &str = ".werrss.lock";
 const REMOTE_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
+const OSS_VERSION_CLEANUP_PAGE_SIZE: usize = 128;
 
 #[derive(Clone)]
 struct OpenDalBlobStoreCore {
@@ -32,6 +34,12 @@ pub struct OpenDalFsBlobStore {
 /// Stores raw asset bytes in an S3-compatible service through OpenDAL.
 #[derive(Clone)]
 pub struct OpenDalS3BlobStore {
+    core: OpenDalBlobStoreCore,
+}
+
+/// Stores raw asset bytes in Aliyun Object Storage Service through OpenDAL.
+#[derive(Clone)]
+pub struct OpenDalOssBlobStore {
     core: OpenDalBlobStoreCore,
 }
 
@@ -114,6 +122,65 @@ impl OpenDalS3BlobStore {
                 operator,
                 root: None,
                 operation_timeout: Some(operation_timeout),
+            },
+        })
+    }
+}
+
+impl OpenDalOssBlobStore {
+    /// Creates an OSS backend with explicit credentials and virtual addressing.
+    pub fn new(
+        bucket: &str,
+        endpoint: &str,
+        access_key_id: &str,
+        access_key_secret: &str,
+    ) -> Result<Self, AssetBlobStoreError> {
+        Self::new_with_options(
+            bucket,
+            endpoint,
+            Some(access_key_id),
+            Some(access_key_secret),
+            None,
+            "virtual",
+            false,
+        )
+    }
+
+    /// Creates an OSS backend with explicit authentication and addressing options.
+    ///
+    /// Credentials may be omitted when `skip_signature` is enabled for an
+    /// unauthenticated compatible service.
+    pub fn new_with_options(
+        bucket: &str,
+        endpoint: &str,
+        access_key_id: Option<&str>,
+        access_key_secret: Option<&str>,
+        security_token: Option<&str>,
+        addressing_style: &str,
+        skip_signature: bool,
+    ) -> Result<Self, AssetBlobStoreError> {
+        let mut builder = services::Oss::default()
+            .bucket(bucket)
+            .endpoint(endpoint)
+            .addressing_style(addressing_style);
+        if let Some(access_key_id) = access_key_id {
+            builder = builder.access_key_id(access_key_id);
+        }
+        if let Some(access_key_secret) = access_key_secret {
+            builder = builder.access_key_secret(access_key_secret);
+        }
+        if let Some(security_token) = security_token {
+            builder = builder.security_token(security_token);
+        }
+        if skip_signature {
+            builder = builder.skip_signature();
+        }
+        let operator = Operator::new(builder).map_err(backend_error)?;
+        Ok(Self {
+            core: OpenDalBlobStoreCore {
+                operator,
+                root: None,
+                operation_timeout: Some(REMOTE_OPERATION_TIMEOUT),
             },
         })
     }
@@ -219,6 +286,13 @@ impl OpenDalAzureBlobStore {
 }
 
 impl OpenDalBlobStoreCore {
+    fn timeout_error(timeout: Duration) -> opendal::Error {
+        opendal::Error::new(
+            ErrorKind::Unexpected,
+            format!("asset blob backend operation timed out after {timeout:?}"),
+        )
+    }
+
     async fn run_backend_operation<T, F>(&self, operation: F) -> Result<T, opendal::Error>
     where
         F: IntoFuture<Output = Result<T, opendal::Error>>,
@@ -227,12 +301,7 @@ impl OpenDalBlobStoreCore {
         match self.operation_timeout {
             Some(timeout) => tokio::time::timeout(timeout, operation)
                 .await
-                .map_err(|_| {
-                    opendal::Error::new(
-                        ErrorKind::Unexpected,
-                        format!("asset blob backend operation timed out after {timeout:?}"),
-                    )
-                })?,
+                .map_err(|_| Self::timeout_error(timeout))?,
             None => operation.await,
         }
     }
@@ -518,13 +587,71 @@ impl OpenDalBlobStoreCore {
 
     async fn delete(&self, key: &AssetBlobKey) -> Result<(), AssetBlobStoreError> {
         for object in [key.as_str().to_owned(), Self::metadata_key(key)] {
-            match self
-                .run_backend_operation(self.operator.delete(&object))
+            self.delete_object(&object).await?;
+        }
+        Ok(())
+    }
+
+    async fn delete_object(&self, object: &str) -> Result<(), AssetBlobStoreError> {
+        match self
+            .run_backend_operation(self.operator.delete(object))
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(backend_error(error)),
+        }
+    }
+
+    async fn delete_all_versions(&self, key: &AssetBlobKey) -> Result<(), AssetBlobStoreError> {
+        for object in [key.as_str().to_owned(), Self::metadata_key(key)] {
+            let mut lister = self
+                .run_backend_operation(
+                    self.operator
+                        .lister_with(&object)
+                        .limit(OSS_VERSION_CLEANUP_PAGE_SIZE)
+                        .recursive(false)
+                        .versions(true)
+                        .deleted(true),
+                )
                 .await
-            {
-                Ok(()) => {}
-                Err(error) if error.kind() == ErrorKind::NotFound => {}
-                Err(error) => return Err(backend_error(error)),
+                .map_err(backend_error)?;
+            // A successful version listing with no matching entry means the
+            // object is already absent. Do not issue a versionless delete
+            // here: on a versioned bucket that would create a delete marker
+            // while retaining older billed versions.
+            loop {
+                let next = match self.operation_timeout {
+                    Some(timeout) => tokio::time::timeout(timeout, lister.next())
+                        .await
+                        .map_err(|_| backend_error(Self::timeout_error(timeout)))?,
+                    None => lister.next().await,
+                };
+                let Some(entry) = next.transpose().map_err(backend_error)? else {
+                    break;
+                };
+                if entry.path() != object {
+                    continue;
+                }
+                let Some(version) = entry.metadata().version() else {
+                    return Err(AssetBlobStoreError::Backend(
+                        "OSS version listing returned an object without a version identifier"
+                            .to_owned(),
+                    ));
+                };
+                // OSS lists unversioned objects with an empty VersionId.
+                if version.is_empty() {
+                    self.delete_object(&object).await?;
+                    continue;
+                }
+                match self
+                    .run_backend_operation(self.operator.delete_with(&object).version(version))
+                    .await
+                {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == ErrorKind::NotFound => {}
+                    Err(error) => return Err(backend_error(error)),
+                }
             }
         }
         Ok(())
@@ -572,6 +699,32 @@ impl_blob_store_for_open_dal!(OpenDalFsBlobStore);
 impl_blob_store_for_open_dal!(OpenDalS3BlobStore);
 impl_blob_store_for_open_dal!(OpenDalGcsBlobStore);
 impl_blob_store_for_open_dal!(OpenDalAzureBlobStore);
+
+#[async_trait]
+impl AssetBlobStore for OpenDalOssBlobStore {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    async fn read(&self, key: &AssetBlobKey) -> Result<Option<AssetBlob>, AssetBlobStoreError> {
+        self.core.read(key).await
+    }
+
+    async fn stat(
+        &self,
+        key: &AssetBlobKey,
+    ) -> Result<Option<AssetBlobMetadata>, AssetBlobStoreError> {
+        self.core.stat(key).await
+    }
+
+    async fn put(&self, key: &AssetBlobKey, blob: &AssetBlob) -> Result<(), AssetBlobStoreError> {
+        self.core.put(key, blob).await
+    }
+
+    async fn delete(&self, key: &AssetBlobKey) -> Result<(), AssetBlobStoreError> {
+        self.core.delete_all_versions(key).await
+    }
+}
 
 fn backend_error(error: impl std::fmt::Display) -> AssetBlobStoreError {
     AssetBlobStoreError::Backend(error.to_string())
@@ -675,6 +828,26 @@ mod tests {
             Some(REMOTE_OPERATION_TIMEOUT)
         );
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn oss_backend_operations_have_a_bounded_timeout() {
+        let store =
+            OpenDalOssBlobStore::new("werrss-assets", "http://127.0.0.1:9000", "access", "secret")
+                .unwrap();
+        let core = OpenDalBlobStoreCore {
+            operator: store.core.operator.clone(),
+            root: None,
+            operation_timeout: Some(std::time::Duration::from_millis(10)),
+        };
+        let result = core
+            .run_backend_operation(std::future::pending::<Result<(), opendal::Error>>())
+            .await;
+
+        let error = result.expect_err("a stalled backend operation should time out");
+        assert_eq!(error.kind(), ErrorKind::Unexpected);
+        assert!(error.to_string().contains("timed out"));
+        assert_eq!(store.core.operation_timeout, Some(REMOTE_OPERATION_TIMEOUT));
     }
 
     #[tokio::test]
@@ -1163,6 +1336,399 @@ mod tests {
         let _ = server.await;
     }
 
+    #[derive(Clone, Default)]
+    struct MockOssVersion {
+        id: String,
+        deleted: bool,
+        size: u64,
+    }
+
+    #[derive(Default)]
+    struct MockOssState {
+        objects: HashMap<String, Vec<u8>>,
+        versions: HashMap<String, Vec<MockOssVersion>>,
+        version_listing_snapshots: HashMap<String, Vec<(String, MockOssVersion)>>,
+        delete_requests: Vec<(String, Option<String>)>,
+        targets: Vec<String>,
+    }
+
+    fn oss_object_name(target: &str) -> Option<String> {
+        let url = url::Url::parse(&format!("http://oss.test{target}")).ok()?;
+        percent_encoding::percent_decode_str(url.path().trim_start_matches('/'))
+            .decode_utf8()
+            .ok()
+            .map(|name| name.into_owned())
+    }
+
+    fn oss_query_value(target: &str, name: &str) -> Option<String> {
+        let url = url::Url::parse(&format!("http://oss.test{target}")).ok()?;
+        url.query_pairs()
+            .find_map(|(key, value)| (key == name).then(|| value.into_owned()))
+    }
+
+    fn oss_is_version_listing(target: &str) -> bool {
+        let url = match url::Url::parse(&format!("http://oss.test{target}")) {
+            Ok(url) => url,
+            Err(_) => return false,
+        };
+        url.query_pairs().any(|(key, _)| key == "versions")
+    }
+
+    fn oss_version_entries(state: &MockOssState, prefix: &str) -> Vec<(String, MockOssVersion)> {
+        let mut entries = Vec::new();
+        for (name, body) in state
+            .objects
+            .iter()
+            .filter(|(name, _)| name.as_str() == prefix)
+        {
+            let versions = state
+                .versions
+                .get(name.as_str())
+                .cloned()
+                .unwrap_or_else(|| {
+                    vec![MockOssVersion {
+                        id: String::new(),
+                        deleted: false,
+                        size: body.len() as u64,
+                    }]
+                });
+            entries.extend(versions.into_iter().map(|version| (name.clone(), version)));
+        }
+        entries
+    }
+
+    fn oss_version_list_response(state: &mut MockOssState, prefix: &str, target: &str) -> Vec<u8> {
+        let marker = oss_query_value(target, "version-id-marker");
+        let versions = if marker.is_none() {
+            let versions = oss_version_entries(state, prefix);
+            state
+                .version_listing_snapshots
+                .insert(prefix.to_owned(), versions.clone());
+            versions
+        } else {
+            state
+                .version_listing_snapshots
+                .get(prefix)
+                .cloned()
+                .unwrap_or_default()
+        };
+        let start = marker
+            .as_deref()
+            .and_then(|marker| {
+                versions
+                    .iter()
+                    .position(|(_, version)| version.id == marker)
+            })
+            .map_or(0, |index| index + 1);
+        let page_size = oss_query_value(target, "max-keys")
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|size| *size > 0)
+            .unwrap_or_else(|| versions.len().max(1));
+        let end = start.saturating_add(page_size).min(versions.len());
+        let truncated = end < versions.len();
+        let mut response = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?><ListObjectVersionsResult><IsTruncated>{truncated}</IsTruncated>"#,
+        );
+        for (index, (name, version)) in versions[start..end].iter().enumerate() {
+            let global_index = start + index;
+            let is_latest = versions.iter().rposition(|(entry_name, entry_version)| {
+                entry_name == name && entry_version.id == version.id
+            }) == Some(global_index);
+            if version.deleted {
+                response.push_str(&format!(
+                    "<DeleteMarker><Key>{name}</Key><VersionId>{}</VersionId><IsLatest>{is_latest}</IsLatest><LastModified>2020-01-01T00:00:00.000Z</LastModified></DeleteMarker>",
+                    version.id
+                ));
+            } else {
+                response.push_str(&format!(
+                    "<Version><Key>{name}</Key><VersionId>{}</VersionId><IsLatest>{is_latest}</IsLatest><LastModified>2020-01-01T00:00:00.000Z</LastModified><Size>{}</Size></Version>",
+                    version.id, version.size
+                ));
+            }
+        }
+        if truncated {
+            if let Some((name, version)) = versions.get(end.saturating_sub(1)) {
+                response.push_str(&format!(
+                    "<NextKeyMarker>{name}</NextKeyMarker><NextVersionIdMarker>{}</NextVersionIdMarker>",
+                    version.id
+                ));
+            }
+        }
+        response.push_str("</ListObjectVersionsResult>");
+        response.into_bytes()
+    }
+
+    async fn serve_mock_oss_connection(mut stream: TcpStream, state: Arc<Mutex<MockOssState>>) {
+        let Some((method, target, body)) = read_mock_http_request_with_body(&mut stream).await
+        else {
+            return;
+        };
+        let object_name = oss_object_name(&target);
+        let version_listing = oss_is_version_listing(&target);
+        let (status, response_body) = {
+            let mut state = state.lock().unwrap();
+            state.targets.push(target.clone());
+            if method == "GET" && version_listing {
+                let prefix = oss_query_value(&target, "prefix").unwrap_or_default();
+                (
+                    "200 OK",
+                    oss_version_list_response(&mut state, &prefix, &target),
+                )
+            } else {
+                match method.as_str() {
+                    "GET" | "HEAD" => {
+                        match object_name.and_then(|name| state.objects.get(&name).cloned()) {
+                            Some(body) => ("200 OK", body),
+                            None => ("404 Not Found", Vec::new()),
+                        }
+                    }
+                    "PUT" => {
+                        let Some(object_name) = object_name else {
+                            return;
+                        };
+                        let size = body.len() as u64;
+                        state.objects.insert(object_name.clone(), body);
+                        state.versions.insert(
+                            object_name.clone(),
+                            vec![MockOssVersion {
+                                id: String::new(),
+                                deleted: false,
+                                size,
+                            }],
+                        );
+                        ("200 OK", Vec::new())
+                    }
+                    "DELETE" if oss_query_value(&target, "versionId").as_deref() == Some("") => {
+                        (
+                            "400 Bad Request",
+                            b"<Error><Code>InvalidArgument</Code><Message>Version id can not be the empty string</Message></Error>".to_vec(),
+                        )
+                    }
+                    "DELETE" => {
+                        if let Some(object_name) = object_name {
+                            let version_id = oss_query_value(&target, "versionId");
+                            state
+                                .delete_requests
+                                .push((object_name.clone(), version_id.clone()));
+                            if let Some(version_id) = version_id {
+                                if let Some(versions) = state.versions.get_mut(&object_name) {
+                                    versions.retain(|version| version.id != version_id);
+                                    if versions.is_empty() {
+                                        state.versions.remove(&object_name);
+                                        state.objects.remove(&object_name);
+                                    }
+                                } else {
+                                    state.objects.remove(&object_name);
+                                }
+                            } else {
+                                state.versions.remove(&object_name);
+                                state.objects.remove(&object_name);
+                            }
+                        }
+                        ("204 No Content", Vec::new())
+                    }
+                    _ => ("404 Not Found", Vec::new()),
+                }
+            }
+        };
+        let _ = write_mock_http_response(&mut stream, status, &response_body).await;
+    }
+
+    #[tokio::test]
+    async fn oss_unsigned_store_round_trips_asset_blobs_with_cname_addressing() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let state = Arc::new(Mutex::new(MockOssState::default()));
+        let server_state = state.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(serve_mock_oss_connection(stream, server_state.clone()));
+            }
+        });
+
+        let store = OpenDalOssBlobStore::new_with_options(
+            "werrss-assets",
+            &endpoint,
+            None,
+            None,
+            None,
+            "cname",
+            true,
+        )
+        .unwrap();
+        let key = AssetBlobKey::for_blob_id(Uuid::new_v4());
+        let value = blob();
+
+        store.put(&key, &value).await.unwrap();
+        assert_eq!(store.read(&key).await.unwrap(), Some(value.clone()));
+        assert_eq!(
+            store.stat(&key).await.unwrap().unwrap().byte_size(),
+            value.byte_size()
+        );
+        store.delete(&key).await.unwrap();
+        assert!(store.read(&key).await.unwrap().is_none());
+
+        {
+            let state = state.lock().unwrap();
+            assert!(state.targets.iter().all(|target| !target.contains("%252F")));
+            assert!(!state.objects.contains_key(key.as_str()));
+            assert!(!state
+                .objects
+                .contains_key(&format!("{}{METADATA_SUFFIX}", key.as_str())));
+            assert_eq!(state.delete_requests.len(), 2);
+            assert!(state
+                .delete_requests
+                .iter()
+                .all(|(_, version)| version.is_none()));
+        }
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn oss_delete_removes_all_object_versions_and_delete_markers() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let state = Arc::new(Mutex::new(MockOssState::default()));
+        let server_state = state.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(serve_mock_oss_connection(stream, server_state.clone()));
+            }
+        });
+
+        let key = AssetBlobKey::for_blob_id(Uuid::new_v4());
+        let metadata_key = format!("{}{METADATA_SUFFIX}", key.as_str());
+        {
+            let mut state = state.lock().unwrap();
+            state.objects.insert(key.as_str().to_owned(), vec![1, 2, 3]);
+            state.objects.insert(metadata_key.clone(), vec![4, 5]);
+            state.versions.insert(
+                key.as_str().to_owned(),
+                vec![
+                    MockOssVersion {
+                        id: "body-old".to_owned(),
+                        deleted: false,
+                        size: 3,
+                    },
+                    MockOssVersion {
+                        id: "body-marker".to_owned(),
+                        deleted: true,
+                        size: 0,
+                    },
+                    MockOssVersion {
+                        id: "body-current".to_owned(),
+                        deleted: false,
+                        size: 3,
+                    },
+                ],
+            );
+            state.versions.insert(
+                metadata_key.clone(),
+                vec![MockOssVersion {
+                    id: "metadata-current".to_owned(),
+                    deleted: false,
+                    size: 2,
+                }],
+            );
+        }
+
+        let store = OpenDalOssBlobStore::new_with_options(
+            "werrss-assets",
+            &endpoint,
+            None,
+            None,
+            None,
+            "cname",
+            true,
+        )
+        .unwrap();
+        store.delete(&key).await.unwrap();
+
+        {
+            let state = state.lock().unwrap();
+            assert!(!state.objects.contains_key(key.as_str()));
+            assert!(!state.objects.contains_key(&metadata_key));
+            assert_eq!(state.delete_requests.len(), 4);
+            assert!(state
+                .delete_requests
+                .iter()
+                .all(|(_, version)| version.is_some()));
+        }
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn oss_delete_streams_paginated_version_history() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let state = Arc::new(Mutex::new(MockOssState::default()));
+        let server_state = state.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(serve_mock_oss_connection(stream, server_state.clone()));
+            }
+        });
+
+        let key = AssetBlobKey::for_blob_id(Uuid::new_v4());
+        let version_count = OSS_VERSION_CLEANUP_PAGE_SIZE + 1;
+        {
+            let mut state = state.lock().unwrap();
+            state.objects.insert(key.as_str().to_owned(), vec![1, 2, 3]);
+            state.versions.insert(
+                key.as_str().to_owned(),
+                (0..version_count)
+                    .map(|index| MockOssVersion {
+                        id: format!("version-{index:03}"),
+                        deleted: index % 7 == 0,
+                        size: 3,
+                    })
+                    .collect(),
+            );
+        }
+
+        let store = OpenDalOssBlobStore::new_with_options(
+            "werrss-assets",
+            &endpoint,
+            None,
+            None,
+            None,
+            "cname",
+            true,
+        )
+        .unwrap();
+        store.delete(&key).await.unwrap();
+
+        {
+            let state = state.lock().unwrap();
+            assert!(!state.objects.contains_key(key.as_str()));
+            assert_eq!(state.delete_requests.len(), version_count);
+            assert!(
+                state
+                    .targets
+                    .iter()
+                    .filter(|target| oss_is_version_listing(target))
+                    .count()
+                    > 2
+            );
+        }
+
+        server.abort();
+        let _ = server.await;
+    }
+
     #[derive(Default)]
     struct MockGcsState {
         objects: HashMap<String, Vec<u8>>,
@@ -1401,6 +1967,34 @@ mod tests {
             "us-east-1",
             "access",
             "secret",
+        );
+        assert!(store.is_ok());
+    }
+
+    #[test]
+    fn oss_store_accepts_explicit_credentials_and_addressing_style() {
+        let store = OpenDalOssBlobStore::new_with_options(
+            "werrss-assets",
+            "http://127.0.0.1:9000/",
+            Some("access"),
+            Some("secret"),
+            Some("security-token"),
+            "path",
+            false,
+        );
+        assert!(store.is_ok());
+    }
+
+    #[test]
+    fn oss_store_accepts_unsigned_emulator_options_without_credentials() {
+        let store = OpenDalOssBlobStore::new_with_options(
+            "werrss-assets",
+            "http://127.0.0.1:9000",
+            None,
+            None,
+            None,
+            "cname",
+            true,
         );
         assert!(store.is_ok());
     }

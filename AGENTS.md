@@ -19,3 +19,9 @@ are the same and splitting the test would duplicate that setup.
 If a test fails because the restricted environment prevents a test listener
 from binding, rerun the affected test outside the sandbox before treating the
 failure as a code or test regression.
+
+## Workspace hygiene
+
+Check the Rust `target/` directory size regularly, especially after large
+builds or test runs. If it exceeds 20 GB, run `cargo clean` before continuing
+to avoid consuming excessive workspace storage.

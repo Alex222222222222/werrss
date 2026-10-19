@@ -32,6 +32,10 @@
 //! ASSET_ARCHIVE_BACKEND / ASSET_LOCAL_ROOT / ASSET_CACHE_MAX_SIZE_MB /
 //! ASSET_S3_BUCKET / ASSET_S3_ENDPOINT / ASSET_S3_REGION /
 //! ASSET_S3_ACCESS_KEY_ID / ASSET_S3_SECRET_ACCESS_KEY /
+//! ASSET_OSS_BUCKET / ASSET_OSS_ENDPOINT / ASSET_OSS_ADDRESSING_STYLE /
+//! ASSET_OSS_VERSIONING /
+//! ASSET_OSS_ACCESS_KEY_ID / ASSET_OSS_ACCESS_KEY_SECRET /
+//! ASSET_OSS_SECURITY_TOKEN / ASSET_OSS_SKIP_SIGNATURE /
 //! ASSET_GCS_BUCKET / ASSET_GCS_ENDPOINT / ASSET_GCS_CREDENTIAL /
 //! ASSET_GCS_SKIP_SIGNATURE /
 //! ASSET_AZURE_CONTAINER / ASSET_AZURE_ENDPOINT /
@@ -167,6 +171,14 @@ const KNOWN_ENVIRONMENT_VARIABLES: &[&str] = &[
     "ASSET_S3_REGION",
     "ASSET_S3_ACCESS_KEY_ID",
     "ASSET_S3_SECRET_ACCESS_KEY",
+    "ASSET_OSS_BUCKET",
+    "ASSET_OSS_ENDPOINT",
+    "ASSET_OSS_ADDRESSING_STYLE",
+    "ASSET_OSS_VERSIONING",
+    "ASSET_OSS_ACCESS_KEY_ID",
+    "ASSET_OSS_ACCESS_KEY_SECRET",
+    "ASSET_OSS_SECURITY_TOKEN",
+    "ASSET_OSS_SKIP_SIGNATURE",
     "ASSET_GCS_BUCKET",
     "ASSET_GCS_ENDPOINT",
     "ASSET_GCS_CREDENTIAL",
@@ -332,6 +344,15 @@ pub enum AssetArchiveConfig {
         /// Cluster-wide admission and retry limits for public cache misses.
         repair_policy: AssetRepairPolicy,
     },
+    /// Store binary assets through an OpenDAL Aliyun OSS service.
+    Oss {
+        /// Aliyun OSS connection settings.
+        storage: AssetOssConfig,
+        /// Limits applied to acquisition, storage, and maintenance.
+        policy: AssetCachePolicy,
+        /// Cluster-wide admission and retry limits for public cache misses.
+        repair_policy: AssetRepairPolicy,
+    },
     /// Store binary assets through an OpenDAL Google Cloud Storage service.
     Gcs {
         /// Google Cloud Storage connection settings.
@@ -413,6 +434,111 @@ impl AssetS3Config {
     /// Returns the secret key for backend construction.
     pub fn secret_access_key(&self) -> &str {
         secrecy::ExposeSecret::expose_secret(&self.secret_access_key)
+    }
+}
+
+/// Credentials and endpoint settings for an Aliyun OSS asset backend.
+#[derive(Clone)]
+pub struct AssetOssConfig {
+    bucket: String,
+    endpoint: String,
+    addressing_style: String,
+    access_key_id: Option<secrecy::SecretString>,
+    access_key_secret: Option<secrecy::SecretString>,
+    security_token: Option<secrecy::SecretString>,
+    skip_signature: bool,
+}
+
+impl PartialEq for AssetOssConfig {
+    fn eq(&self, other: &Self) -> bool {
+        self.bucket == other.bucket
+            && self.endpoint == other.endpoint
+            && self.addressing_style == other.addressing_style
+            && self.skip_signature == other.skip_signature
+            && match (&self.access_key_id, &other.access_key_id) {
+                (Some(left), Some(right)) => {
+                    secrecy::ExposeSecret::expose_secret(left)
+                        == secrecy::ExposeSecret::expose_secret(right)
+                }
+                (None, None) => true,
+                _ => false,
+            }
+            && match (&self.access_key_secret, &other.access_key_secret) {
+                (Some(left), Some(right)) => {
+                    secrecy::ExposeSecret::expose_secret(left)
+                        == secrecy::ExposeSecret::expose_secret(right)
+                }
+                (None, None) => true,
+                _ => false,
+            }
+            && match (&self.security_token, &other.security_token) {
+                (Some(left), Some(right)) => {
+                    secrecy::ExposeSecret::expose_secret(left)
+                        == secrecy::ExposeSecret::expose_secret(right)
+                }
+                (None, None) => true,
+                _ => false,
+            }
+    }
+}
+
+impl Eq for AssetOssConfig {}
+
+impl std::fmt::Debug for AssetOssConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AssetOssConfig")
+            .field("bucket", &self.bucket)
+            .field("endpoint", &self.endpoint)
+            .field("addressing_style", &self.addressing_style)
+            .field("access_key_id", &"<redacted>")
+            .field("access_key_secret", &"<redacted>")
+            .field("security_token", &"<redacted>")
+            .field("skip_signature", &self.skip_signature)
+            .finish()
+    }
+}
+
+impl AssetOssConfig {
+    /// Returns the configured bucket.
+    pub fn bucket(&self) -> &str {
+        &self.bucket
+    }
+
+    /// Returns the configured OSS endpoint.
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
+    /// Returns the OSS addressing style.
+    pub fn addressing_style(&self) -> &str {
+        &self.addressing_style
+    }
+
+    /// Returns the access key ID, when configured.
+    pub fn access_key_id(&self) -> Option<&str> {
+        self.access_key_id
+            .as_ref()
+            .map(secrecy::ExposeSecret::expose_secret)
+    }
+
+    /// Returns the access key secret, when configured.
+    pub fn access_key_secret(&self) -> Option<&str> {
+        self.access_key_secret
+            .as_ref()
+            .map(secrecy::ExposeSecret::expose_secret)
+    }
+
+    /// Returns the temporary security token, when configured.
+    pub fn security_token(&self) -> Option<&str> {
+        self.security_token
+            .as_ref()
+            .map(secrecy::ExposeSecret::expose_secret)
+    }
+
+    /// Returns whether OpenDAL should send unsigned requests.
+    pub const fn skip_signature(&self) -> bool {
+        self.skip_signature
     }
 }
 
@@ -566,6 +692,7 @@ impl AssetArchiveConfig {
             Self::Database { policy, .. }
             | Self::Local { policy, .. }
             | Self::S3 { policy, .. }
+            | Self::Oss { policy, .. }
             | Self::Gcs { policy, .. }
             | Self::Azure { policy, .. } => Some(*policy),
         }
@@ -578,6 +705,7 @@ impl AssetArchiveConfig {
             Self::Database { repair_policy, .. }
             | Self::Local { repair_policy, .. }
             | Self::S3 { repair_policy, .. }
+            | Self::Oss { repair_policy, .. }
             | Self::Gcs { repair_policy, .. }
             | Self::Azure { repair_policy, .. } => Some(*repair_policy),
         }
@@ -595,6 +723,14 @@ impl AssetArchiveConfig {
     pub fn s3_storage(&self) -> Option<&AssetS3Config> {
         match self {
             Self::S3 { storage, .. } => Some(storage),
+            _ => None,
+        }
+    }
+
+    /// Returns the configured Aliyun OSS storage settings.
+    pub fn oss_storage(&self) -> Option<&AssetOssConfig> {
+        match self {
+            Self::Oss { storage, .. } => Some(storage),
             _ => None,
         }
     }
@@ -984,6 +1120,7 @@ impl AppConfig {
                 AssetArchiveConfig::Database { .. }
                     | AssetArchiveConfig::Local { .. }
                     | AssetArchiveConfig::S3 { .. }
+                    | AssetArchiveConfig::Oss { .. }
                     | AssetArchiveConfig::Gcs { .. }
                     | AssetArchiveConfig::Azure { .. }
             )
@@ -1204,6 +1341,14 @@ struct RawConfig {
     asset_s3_region: Option<String>,
     asset_s3_access_key_id: Option<String>,
     asset_s3_secret_access_key: Option<String>,
+    asset_oss_bucket: Option<String>,
+    asset_oss_endpoint: Option<String>,
+    asset_oss_addressing_style: Option<String>,
+    asset_oss_versioning: Option<String>,
+    asset_oss_access_key_id: Option<String>,
+    asset_oss_access_key_secret: Option<String>,
+    asset_oss_security_token: Option<String>,
+    asset_oss_skip_signature: Option<String>,
     asset_gcs_bucket: Option<String>,
     asset_gcs_endpoint: Option<String>,
     asset_gcs_credential: Option<String>,
@@ -1485,6 +1630,86 @@ fn asset_archive_config(raw: &RawConfig) -> Result<AssetArchiveConfig, ConfigErr
                 repair_policy: asset_repair_policy(raw)?,
             })
         }
+        "oss" => {
+            let bucket = required(raw.asset_oss_bucket.clone(), "ASSET_OSS_BUCKET")?;
+            let versioning = required(
+                raw.asset_oss_versioning.clone(),
+                "ASSET_OSS_VERSIONING",
+            )?;
+            if !versioning.trim().eq_ignore_ascii_case("disabled") {
+                return Err(ConfigError::InvalidValue {
+                    variable: "ASSET_OSS_VERSIONING",
+                    reason: "must be disabled; versioned and suspended buckets are unsupported",
+                });
+            }
+            let endpoint = required(raw.asset_oss_endpoint.clone(), "ASSET_OSS_ENDPOINT")?
+                .trim()
+                .trim_end_matches('/')
+                .to_owned();
+            if endpoint.is_empty() {
+                return Err(ConfigError::Missing {
+                    variable: "ASSET_OSS_ENDPOINT",
+                });
+            }
+            let endpoint_url = parse_optional_http_url(Some(endpoint), "ASSET_OSS_ENDPOINT")?
+                .expect("a supplied OSS endpoint must produce a URL");
+            if endpoint_url.path() != "/" || endpoint_url.query().is_some() {
+                return Err(ConfigError::InvalidValue {
+                    variable: "ASSET_OSS_ENDPOINT",
+                    reason: "must not contain a path or query because the OSS adapter does not preserve endpoint components",
+                });
+            }
+            let endpoint = endpoint_url.to_string().trim_end_matches('/').to_owned();
+            let addressing_style = parse_oss_addressing_style(
+                raw.asset_oss_addressing_style
+                    .as_deref()
+                    .unwrap_or("virtual"),
+            )?;
+            let skip_signature = parse_bool(
+                raw.asset_oss_skip_signature.as_deref().unwrap_or("false"),
+                "ASSET_OSS_SKIP_SIGNATURE",
+            )?;
+            let access_key_id = if skip_signature {
+                raw.asset_oss_access_key_id
+                    .clone()
+                    .filter(|value| !value.trim().is_empty())
+            } else {
+                Some(required(
+                    raw.asset_oss_access_key_id.clone(),
+                    "ASSET_OSS_ACCESS_KEY_ID",
+                )?)
+            };
+            let access_key_secret = if skip_signature {
+                raw.asset_oss_access_key_secret
+                    .clone()
+                    .filter(|value| !value.trim().is_empty())
+            } else {
+                Some(required(
+                    raw.asset_oss_access_key_secret.clone(),
+                    "ASSET_OSS_ACCESS_KEY_SECRET",
+                )?)
+            };
+            let security_token = raw
+                .asset_oss_security_token
+                .clone()
+                .filter(|value| !value.trim().is_empty());
+            Ok(AssetArchiveConfig::Oss {
+                storage: AssetOssConfig {
+                    bucket,
+                    endpoint,
+                    addressing_style,
+                    access_key_id: access_key_id
+                        .map(|value| secrecy::SecretString::new(value.into_boxed_str())),
+                    access_key_secret: access_key_secret
+                        .map(|value| secrecy::SecretString::new(value.into_boxed_str())),
+                    security_token: security_token
+                        .map(|value| secrecy::SecretString::new(value.into_boxed_str())),
+                    skip_signature,
+                },
+                policy,
+                repair_policy: asset_repair_policy(raw)?,
+            })
+        }
         "gcs" => {
             let bucket = required(raw.asset_gcs_bucket.clone(), "ASSET_GCS_BUCKET")?;
             let skip_signature = parse_bool(
@@ -1584,7 +1809,7 @@ fn asset_archive_config(raw: &RawConfig) -> Result<AssetArchiveConfig, ConfigErr
         }
         _ => Err(ConfigError::InvalidValue {
             variable: "ASSET_ARCHIVE_BACKEND",
-            reason: "expected disabled, database, local, s3, gcs, or azure (postgres and azblob are aliases)",
+            reason: "expected disabled, database, local, s3, oss, gcs, or azure (postgres and azblob are aliases)",
         }),
     }
 }
@@ -1745,6 +1970,17 @@ fn validate_azure_account_key(account_key: String) -> Result<String, ConfigError
             reason: "must be standard-base64-encoded Azure account key",
         })?;
     Ok(account_key)
+}
+
+fn parse_oss_addressing_style(value: &str) -> Result<String, ConfigError> {
+    let value = value.trim().to_ascii_lowercase();
+    if matches!(value.as_str(), "virtual" | "path" | "cname") {
+        return Ok(value);
+    }
+    Err(ConfigError::InvalidValue {
+        variable: "ASSET_OSS_ADDRESSING_STYLE",
+        reason: "expected virtual, path, or cname",
+    })
 }
 
 fn parse_optional_http_url(
@@ -1919,6 +2155,7 @@ mod tests {
             ("HTTP_PORT", "8088"),
             ("JOB_LEASE_SECONDS", "120"),
             ("RSS_CACHE_TTL_SECONDS", "1800"),
+            ("ASSET_OSS_VERSIONING", "disabled"),
         ]
         .into_iter()
         .map(|(key, value)| (key.to_owned(), value.to_owned()))
@@ -2585,6 +2822,288 @@ mod tests {
                 variable: "ASSET_S3_BUCKET"
             })
         ));
+    }
+
+    #[test]
+    fn parses_oss_asset_mode_without_exposing_credentials_in_debug() {
+        let mut environment =
+            replace_environment(valid_environment(), "ASSET_ARCHIVE_BACKEND", "oss");
+        environment.extend([
+            (
+                "SERVER_ROOT_URL".to_owned(),
+                "https://rss.example.test".to_owned(),
+            ),
+            ("ASSET_OSS_BUCKET".to_owned(), "werrss-assets".to_owned()),
+            (
+                "ASSET_OSS_ENDPOINT".to_owned(),
+                " http://oss.example.test:9000/// ".to_owned(),
+            ),
+            ("ASSET_OSS_ADDRESSING_STYLE".to_owned(), " PATH ".to_owned()),
+            (
+                "ASSET_OSS_ACCESS_KEY_ID".to_owned(),
+                "access-secret".to_owned(),
+            ),
+            (
+                "ASSET_OSS_ACCESS_KEY_SECRET".to_owned(),
+                "secret-secret".to_owned(),
+            ),
+            (
+                "ASSET_OSS_SECURITY_TOKEN".to_owned(),
+                "session-token".to_owned(),
+            ),
+        ]);
+
+        let config = AppConfig::from_env_iter(environment).unwrap();
+        let storage = config.asset_archive.oss_storage().unwrap();
+        assert_eq!(storage.bucket(), "werrss-assets");
+        assert_eq!(storage.endpoint(), "http://oss.example.test:9000");
+        assert_eq!(storage.addressing_style(), "path");
+        assert_eq!(storage.access_key_id(), Some("access-secret"));
+        assert_eq!(storage.access_key_secret(), Some("secret-secret"));
+        assert_eq!(storage.security_token(), Some("session-token"));
+        assert!(!storage.skip_signature());
+        let debug = format!("{config:?}");
+        assert!(!debug.contains("access-secret"));
+        assert!(!debug.contains("secret-secret"));
+        assert!(!debug.contains("session-token"));
+    }
+
+    #[test]
+    fn parses_unsigned_oss_asset_mode_without_credentials() {
+        let mut environment =
+            replace_environment(valid_environment(), "ASSET_ARCHIVE_BACKEND", "oss");
+        environment.extend([
+            (
+                "SERVER_ROOT_URL".to_owned(),
+                "https://rss.example.test".to_owned(),
+            ),
+            ("ASSET_OSS_BUCKET".to_owned(), "werrss-assets".to_owned()),
+            (
+                "ASSET_OSS_ENDPOINT".to_owned(),
+                "http://oss.example.test:9000".to_owned(),
+            ),
+            ("ASSET_OSS_ADDRESSING_STYLE".to_owned(), "cname".to_owned()),
+            ("ASSET_OSS_SKIP_SIGNATURE".to_owned(), "true".to_owned()),
+        ]);
+
+        let config = AppConfig::from_env_iter(environment).unwrap();
+        let storage = config.asset_archive.oss_storage().unwrap();
+        assert_eq!(storage.access_key_id(), None);
+        assert_eq!(storage.access_key_secret(), None);
+        assert!(storage.skip_signature());
+    }
+
+    #[test]
+    fn oss_asset_mode_requires_signed_credentials() {
+        let mut environment =
+            replace_environment(valid_environment(), "ASSET_ARCHIVE_BACKEND", "oss");
+        environment.extend([
+            ("ASSET_OSS_BUCKET".to_owned(), "werrss-assets".to_owned()),
+            (
+                "ASSET_OSS_ENDPOINT".to_owned(),
+                "http://oss.example.test:9000".to_owned(),
+            ),
+        ]);
+        assert!(matches!(
+            AppConfig::from_env_iter(environment),
+            Err(ConfigError::Missing {
+                variable: "ASSET_OSS_ACCESS_KEY_ID"
+            })
+        ));
+
+        let mut environment =
+            replace_environment(valid_environment(), "ASSET_ARCHIVE_BACKEND", "oss");
+        environment.extend([
+            ("ASSET_OSS_BUCKET".to_owned(), "werrss-assets".to_owned()),
+            (
+                "ASSET_OSS_ENDPOINT".to_owned(),
+                "http://oss.example.test:9000".to_owned(),
+            ),
+            (
+                "ASSET_OSS_ACCESS_KEY_ID".to_owned(),
+                "access-secret".to_owned(),
+            ),
+        ]);
+        assert!(matches!(
+            AppConfig::from_env_iter(environment),
+            Err(ConfigError::Missing {
+                variable: "ASSET_OSS_ACCESS_KEY_SECRET"
+            })
+        ));
+    }
+
+    #[test]
+    fn rejects_invalid_oss_addressing_styles() {
+        let mut environment =
+            replace_environment(valid_environment(), "ASSET_ARCHIVE_BACKEND", "oss");
+        environment.extend([
+            ("ASSET_OSS_BUCKET".to_owned(), "werrss-assets".to_owned()),
+            (
+                "ASSET_OSS_ENDPOINT".to_owned(),
+                "http://oss.example.test:9000".to_owned(),
+            ),
+            ("ASSET_OSS_ADDRESSING_STYLE".to_owned(), "host".to_owned()),
+            (
+                "ASSET_OSS_ACCESS_KEY_ID".to_owned(),
+                "access-secret".to_owned(),
+            ),
+            (
+                "ASSET_OSS_ACCESS_KEY_SECRET".to_owned(),
+                "secret-secret".to_owned(),
+            ),
+        ]);
+
+        assert!(matches!(
+            AppConfig::from_env_iter(environment),
+            Err(ConfigError::InvalidValue {
+                variable: "ASSET_OSS_ADDRESSING_STYLE",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn rejects_credentials_embedded_in_an_oss_endpoint() {
+        let mut environment =
+            replace_environment(valid_environment(), "ASSET_ARCHIVE_BACKEND", "oss");
+        environment.extend([
+            ("ASSET_OSS_BUCKET".to_owned(), "werrss-assets".to_owned()),
+            (
+                "ASSET_OSS_ENDPOINT".to_owned(),
+                "http://access:secret@oss.example.test:9000".to_owned(),
+            ),
+            (
+                "ASSET_OSS_ACCESS_KEY_ID".to_owned(),
+                "configured-access".to_owned(),
+            ),
+            (
+                "ASSET_OSS_ACCESS_KEY_SECRET".to_owned(),
+                "configured-secret".to_owned(),
+            ),
+        ]);
+
+        assert!(matches!(
+            AppConfig::from_env_iter(environment),
+            Err(ConfigError::InvalidValue {
+                variable: "ASSET_OSS_ENDPOINT",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn rejects_oss_endpoint_paths_that_open_dal_drops() {
+        let mut environment =
+            replace_environment(valid_environment(), "ASSET_ARCHIVE_BACKEND", "oss");
+        environment.extend([
+            ("ASSET_OSS_BUCKET".to_owned(), "werrss-assets".to_owned()),
+            (
+                "ASSET_OSS_ENDPOINT".to_owned(),
+                "https://proxy.example.test/oss/".to_owned(),
+            ),
+            (
+                "ASSET_OSS_ACCESS_KEY_ID".to_owned(),
+                "configured-access".to_owned(),
+            ),
+            (
+                "ASSET_OSS_ACCESS_KEY_SECRET".to_owned(),
+                "configured-secret".to_owned(),
+            ),
+        ]);
+
+        assert!(matches!(
+            AppConfig::from_env_iter(environment),
+            Err(ConfigError::InvalidValue {
+                variable: "ASSET_OSS_ENDPOINT",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn rejects_oss_endpoint_queries_that_open_dal_drops() {
+        let mut environment =
+            replace_environment(valid_environment(), "ASSET_ARCHIVE_BACKEND", "oss");
+        environment.extend([
+            ("ASSET_OSS_BUCKET".to_owned(), "werrss-assets".to_owned()),
+            (
+                "ASSET_OSS_ENDPOINT".to_owned(),
+                "https://proxy.example.test/?tenant=werrss".to_owned(),
+            ),
+            (
+                "ASSET_OSS_ACCESS_KEY_ID".to_owned(),
+                "configured-access".to_owned(),
+            ),
+            (
+                "ASSET_OSS_ACCESS_KEY_SECRET".to_owned(),
+                "configured-secret".to_owned(),
+            ),
+        ]);
+
+        assert!(matches!(
+            AppConfig::from_env_iter(environment),
+            Err(ConfigError::InvalidValue {
+                variable: "ASSET_OSS_ENDPOINT",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn oss_asset_mode_requires_an_explicitly_unversioned_bucket() {
+        let mut environment =
+            replace_environment(valid_environment(), "ASSET_ARCHIVE_BACKEND", "oss");
+        environment.extend([
+            ("ASSET_OSS_BUCKET".to_owned(), "werrss-assets".to_owned()),
+            (
+                "ASSET_OSS_ENDPOINT".to_owned(),
+                "https://oss.example.test".to_owned(),
+            ),
+            (
+                "ASSET_OSS_ACCESS_KEY_ID".to_owned(),
+                "configured-access".to_owned(),
+            ),
+            (
+                "ASSET_OSS_ACCESS_KEY_SECRET".to_owned(),
+                "configured-secret".to_owned(),
+            ),
+        ]);
+        environment.retain(|(key, _)| key != "ASSET_OSS_VERSIONING");
+
+        assert!(matches!(
+            AppConfig::from_env_iter(environment),
+            Err(ConfigError::Missing {
+                variable: "ASSET_OSS_VERSIONING"
+            })
+        ));
+
+        for versioning in ["enabled", "suspended"] {
+            let mut environment =
+                replace_environment(valid_environment(), "ASSET_ARCHIVE_BACKEND", "oss");
+            environment.extend([
+                ("ASSET_OSS_BUCKET".to_owned(), "werrss-assets".to_owned()),
+                (
+                    "ASSET_OSS_ENDPOINT".to_owned(),
+                    "https://oss.example.test".to_owned(),
+                ),
+                (
+                    "ASSET_OSS_ACCESS_KEY_ID".to_owned(),
+                    "configured-access".to_owned(),
+                ),
+                (
+                    "ASSET_OSS_ACCESS_KEY_SECRET".to_owned(),
+                    "configured-secret".to_owned(),
+                ),
+            ]);
+            let environment = replace_environment(environment, "ASSET_OSS_VERSIONING", versioning);
+            assert!(matches!(
+                AppConfig::from_env_iter(environment),
+                Err(ConfigError::InvalidValue {
+                    variable: "ASSET_OSS_VERSIONING",
+                    ..
+                })
+            ));
+        }
     }
 
     #[test]
