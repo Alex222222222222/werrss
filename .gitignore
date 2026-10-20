@@ -2,3 +2,4 @@ wechrss-main
 target
 .dev/
 mutants.out*/
+.worktrees/
