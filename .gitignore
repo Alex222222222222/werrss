@@ -3,3 +3,4 @@ target
 .dev/
 mutants.out*/
 .worktrees/
+/docs/superpowers/

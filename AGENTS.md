@@ -9,6 +9,9 @@ cluster details, credentials, endpoints, or other operational information into
 tracked files, command output committed to the repository, or user-facing
 documentation. The directory is intentionally gitignored.
 
+Keep generated superpowers documentation in `docs/superpowers/` out of git
+history. The directory is intentionally gitignored.
+
 ## Testing
 
 Keep each test focused on one behavior or outcome. A test may cover multiple
