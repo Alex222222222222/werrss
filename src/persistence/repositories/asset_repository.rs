@@ -1006,12 +1006,14 @@ impl PostgresAssetStore {
         let size_evicted_blobs = enforce_cache_limit(
             self.blob_store.as_ref(),
             &mut transaction,
-            self.policy.max_cache_size_bytes(),
-            0,
-            &[],
-            0,
-            &[],
-            &mut deferred_evictions,
+            CacheLimit {
+                max_bytes: self.policy.max_cache_size_bytes(),
+                additional_bytes: 0,
+                protected_blob_ids: &[],
+                pending_bytes: 0,
+                pending_blob_ids: &[],
+                deferred_evictions: &mut deferred_evictions,
+            },
         )
         .await?;
         for blob_id in &deferred_evictions {
@@ -2038,12 +2040,14 @@ async fn insert_blob(
     enforce_cache_limit(
         context.blob_store,
         transaction,
-        context.policy.max_cache_size_bytes(),
-        u64::try_from(byte_size).expect("non-negative asset size"),
-        protected_blob_ids,
-        pending_bytes,
-        &pending_blob_ids,
-        &mut deferred_evictions,
+        CacheLimit {
+            max_bytes: context.policy.max_cache_size_bytes(),
+            additional_bytes: u64::try_from(byte_size).expect("non-negative asset size"),
+            protected_blob_ids,
+            pending_bytes,
+            pending_blob_ids: &pending_blob_ids,
+            deferred_evictions: &mut deferred_evictions,
+        },
     )
     .await?;
     context.mutation_state.lock().unwrap().deferred_evictions = deferred_evictions;
@@ -2245,7 +2249,7 @@ async fn evict_stale_blobs(
         let key = AssetBlobKey::for_blob_id(blob_id);
         if blob_stat_in_transaction(blob_store, transaction, &key)
             .await?
-            .is_some_and(|metadata| metadata.is_present())
+            .is_some_and(|metadata| metadata.stored_byte_size().is_some())
         {
             evicted.push(blob_id);
         }
@@ -2271,7 +2275,7 @@ async fn cached_byte_size(
         .map_err(storage_error);
     }
     let rows = sqlx::query(
-        "SELECT id, byte_size
+        "SELECT id
          FROM asset_blobs
          WHERE NOT (id = ANY($1::uuid[]))",
     )
@@ -2282,20 +2286,26 @@ async fn cached_byte_size(
     let mut total = 0_i64;
     for row in rows {
         let blob_id = row.try_get::<Uuid, _>("id").map_err(storage_error)?;
-        if blob_stat_in_transaction(blob_store, transaction, &AssetBlobKey::for_blob_id(blob_id))
-            .await?
-            .is_some_and(|metadata| metadata.is_present())
-        {
-            let byte_size = row.try_get::<i64, _>("byte_size").map_err(storage_error)?;
-            total = total.checked_add(byte_size).ok_or_else(|| {
-                AssetRepositoryError::Storage("asset byte count overflow".to_owned())
-            })?;
+        let stored_byte_size =
+            blob_stat_in_transaction(blob_store, transaction, &AssetBlobKey::for_blob_id(blob_id))
+                .await?
+                .and_then(|metadata| metadata.stored_byte_size());
+        if let Some(byte_size) = stored_byte_size {
+            total = total
+                .checked_add(i64::try_from(byte_size).map_err(|_| {
+                    AssetRepositoryError::Storage(
+                        "asset byte count exceeds PostgreSQL range".to_owned(),
+                    )
+                })?)
+                .ok_or_else(|| {
+                    AssetRepositoryError::Storage("asset byte count overflow".to_owned())
+                })?;
         }
     }
     Ok(total)
 }
 
-async fn oldest_present(
+async fn oldest_stored(
     blob_store: &dyn AssetBlobStore,
     transaction: &mut Transaction<'_, Postgres>,
     protected_blob_ids: &[Uuid],
@@ -2315,7 +2325,7 @@ async fn oldest_present(
         .map_err(storage_error);
     }
     let rows = sqlx::query(
-        "SELECT id, byte_size
+        "SELECT id
          FROM asset_blobs
          WHERE NOT (id = ANY($1::uuid[]))
          ORDER BY last_accessed_at ASC, id ASC",
@@ -2326,29 +2336,44 @@ async fn oldest_present(
     .map_err(storage_error)?;
     for row in rows {
         let blob_id = row.try_get::<Uuid, _>("id").map_err(storage_error)?;
-        if blob_stat_in_transaction(blob_store, transaction, &AssetBlobKey::for_blob_id(blob_id))
-            .await?
-            .is_some_and(|metadata| metadata.is_present())
+        if let Some(byte_size) =
+            blob_stat_in_transaction(blob_store, transaction, &AssetBlobKey::for_blob_id(blob_id))
+                .await?
+                .and_then(|metadata| metadata.stored_byte_size())
         {
-            return Ok(Some((
-                blob_id,
-                row.try_get::<i64, _>("byte_size").map_err(storage_error)?,
-            )));
+            let byte_size = i64::try_from(byte_size).map_err(|_| {
+                AssetRepositoryError::Storage(
+                    "asset byte count exceeds PostgreSQL range".to_owned(),
+                )
+            })?;
+            return Ok(Some((blob_id, byte_size)));
         }
     }
     Ok(None)
 }
 
+struct CacheLimit<'a> {
+    max_bytes: u64,
+    additional_bytes: u64,
+    protected_blob_ids: &'a [Uuid],
+    pending_bytes: u64,
+    pending_blob_ids: &'a [Uuid],
+    deferred_evictions: &'a mut Vec<Uuid>,
+}
+
 async fn enforce_cache_limit(
     blob_store: &dyn AssetBlobStore,
     transaction: &mut Transaction<'_, Postgres>,
-    max_bytes: u64,
-    additional_bytes: u64,
-    protected_blob_ids: &[Uuid],
-    pending_bytes: u64,
-    pending_blob_ids: &[Uuid],
-    deferred_evictions: &mut Vec<Uuid>,
+    limit: CacheLimit<'_>,
 ) -> Result<u64, AssetRepositoryError> {
+    let CacheLimit {
+        max_bytes,
+        additional_bytes,
+        protected_blob_ids,
+        pending_bytes,
+        pending_blob_ids,
+        deferred_evictions,
+    } = limit;
     if max_bytes == 0 {
         return Ok(0);
     }
@@ -2398,8 +2423,7 @@ async fn enforce_cache_limit(
 
         let mut protected = protected_blob_ids.to_vec();
         protected.extend(deferred_evictions.iter().copied());
-        let Some((blob_id, byte_size)) =
-            oldest_present(blob_store, transaction, &protected).await?
+        let Some((blob_id, byte_size)) = oldest_stored(blob_store, transaction, &protected).await?
         else {
             return Err(AssetRepositoryError::CapacityExceeded {
                 requested_bytes: additional_bytes,

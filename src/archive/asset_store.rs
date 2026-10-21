@@ -454,6 +454,7 @@ pub struct AssetBlobMetadata {
     media_type: String,
     byte_size: u64,
     present: bool,
+    stored_byte_size: Option<u64>,
 }
 
 impl AssetBlobMetadata {
@@ -462,7 +463,7 @@ impl AssetBlobMetadata {
     /// This constructor is public because third-party storage adapters must be
     /// able to implement [`AssetBlobStore::stat`]. The checksum and media type
     /// are immutable metadata owned by the application, while `present` only
-    /// describes whether the backend currently retains the binary bytes.
+    /// describes whether the backend currently retains the complete body.
     pub fn new(
         checksum: String,
         media_type: String,
@@ -480,7 +481,16 @@ impl AssetBlobMetadata {
             media_type,
             byte_size,
             present,
+            stored_byte_size: present.then_some(byte_size),
         })
+    }
+
+    /// Records the actual number of bytes retained by the backend and updates
+    /// whether the complete body is available.
+    pub fn with_stored_byte_size(mut self, stored_byte_size: u64) -> Self {
+        self.present = stored_byte_size == self.byte_size;
+        self.stored_byte_size = Some(stored_byte_size);
+        self
     }
 
     /// Returns the checksum recorded for the blob.
@@ -498,7 +508,12 @@ impl AssetBlobMetadata {
         self.byte_size
     }
 
-    /// Returns whether the backend currently has binary data for the key.
+    /// Returns the number of bytes currently retained by the backend.
+    pub const fn stored_byte_size(&self) -> Option<u64> {
+        self.stored_byte_size
+    }
+
+    /// Returns whether the backend currently has a complete binary body.
     pub const fn is_present(&self) -> bool {
         self.present
     }
@@ -778,6 +793,7 @@ mod tests {
         assert_eq!(metadata.checksum().len(), 64);
         assert_eq!(metadata.media_type(), "image/png");
         assert_eq!(metadata.byte_size(), 11);
+        assert_eq!(metadata.stored_byte_size(), Some(11));
         assert!(metadata.is_present());
     }
 

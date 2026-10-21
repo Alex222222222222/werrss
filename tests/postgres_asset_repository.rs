@@ -27,6 +27,7 @@ use werrss::{
                 AssetTransactionRepository, PostgresAssetStore,
             },
             job_repository::{JobLease, JobQueue, PostgresJobRepository},
+            opendal_blob_store::OpenDalFsBlobStore,
             source_repository::SourceTransactionRepository,
         },
         unit_of_work::UnitOfWorkFactory,
@@ -261,16 +262,13 @@ async fn asset_rollback_keeps_evicted_bytes_and_cleans_new_allocations(pool: PgP
         .await
         .unwrap()
         .is_none());
-    assert_eq!(
-        sqlx::query_scalar::<_, bool>(
-            "SELECT fetch_status = 'available' FROM asset_records WHERE id = $1"
-        )
-        .bind(first_stored.id())
-        .fetch_one(&pool)
-        .await
-        .unwrap(),
-        true
-    );
+    assert!(sqlx::query_scalar::<_, bool>(
+        "SELECT fetch_status = 'available' FROM asset_records WHERE id = $1"
+    )
+    .bind(first_stored.id())
+    .fetch_one(&pool)
+    .await
+    .unwrap());
 }
 
 #[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
@@ -1941,6 +1939,123 @@ async fn maintenance_evicts_idle_bytes_but_retains_the_repair_record(pool: PgPoo
 }
 
 #[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn maintenance_deletes_a_truncated_external_blob(pool: PgPool) {
+    let source_id = SourceId::from_uuid(Uuid::new_v4());
+    create_source_and_articles(&pool, source_id, &["truncated-article"]).await;
+    let root = std::env::temp_dir().join(format!("werrss-assets-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(root.join("blobs")).unwrap();
+    let root_string = root.to_string_lossy();
+    let backend = Arc::new(OpenDalFsBlobStore::new(root_string.as_ref()).unwrap());
+    let policy = test_policy(0, Duration::from_secs(1), 1024);
+    let input = asset_input("https://cdn.example/truncated.png", FIRST_BYTES, 0);
+    let factory = UnitOfWorkFactory::with_blob_store(pool.clone(), backend.clone());
+    let mut unit_of_work = factory
+        .begin_with_assets(std::slice::from_ref(&input))
+        .await
+        .unwrap();
+    let stored = unit_of_work
+        .assets(policy)
+        .store_for_article(source_id, "truncated-article", &[input])
+        .await
+        .unwrap()
+        .remove(0);
+    unit_of_work.commit().await.unwrap();
+    let key = AssetBlobKey::for_blob_id(stored.blob_id());
+    std::fs::write(root.join(key.as_str()), b"short").unwrap();
+    sqlx::query("UPDATE asset_blobs SET last_accessed_at = clock_timestamp() - interval '1 day' WHERE id = $1")
+        .bind(stored.blob_id())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let result = PostgresAssetStore::with_blob_store(pool.clone(), policy, backend.clone())
+        .maintenance()
+        .await
+        .unwrap();
+
+    assert_eq!(result.stale_blobs, 1);
+    assert!(!root.join(key.as_str()).exists());
+    assert!(!root
+        .join(format!("{}.metadata.json", key.as_str()))
+        .exists());
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn size_limit_evicts_truncated_external_bytes_by_their_stored_size(pool: PgPool) {
+    let source_id = SourceId::from_uuid(Uuid::new_v4());
+    create_source_and_articles(
+        &pool,
+        source_id,
+        &[
+            "truncated-size-article",
+            "intact-size-article-one",
+            "intact-size-article-two",
+        ],
+    )
+    .await;
+    let root = std::env::temp_dir().join(format!("werrss-assets-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(root.join("blobs")).unwrap();
+    let root_string = root.to_string_lossy();
+    let backend: Arc<dyn AssetBlobStore> =
+        Arc::new(OpenDalFsBlobStore::new(root_string.as_ref()).unwrap());
+    let store_policy = test_policy(100, Duration::from_secs(30), 1024);
+    let partial = store_asset_with_backend(
+        &pool,
+        store_policy,
+        source_id,
+        "truncated-size-article",
+        asset_input("https://cdn.example/truncated-size.png", FIRST_BYTES, 0),
+        backend.clone(),
+    )
+    .await;
+    let intact_one = store_asset_with_backend(
+        &pool,
+        store_policy,
+        source_id,
+        "intact-size-article-one",
+        asset_input("https://cdn.example/intact-size-one.png", SECOND_BYTES, 0),
+        backend.clone(),
+    )
+    .await;
+    let intact_two = store_asset_with_backend(
+        &pool,
+        store_policy,
+        source_id,
+        "intact-size-article-two",
+        asset_input("https://cdn.example/intact-size-two.png", b"third-image", 0),
+        backend.clone(),
+    )
+    .await;
+    let partial_key = AssetBlobKey::for_blob_id(partial.blob_id());
+    let intact_one_key = AssetBlobKey::for_blob_id(intact_one.blob_id());
+    let intact_two_key = AssetBlobKey::for_blob_id(intact_two.blob_id());
+    std::fs::write(root.join(partial_key.as_str()), b"short").unwrap();
+    sqlx::query("UPDATE asset_blobs SET last_accessed_at = clock_timestamp() - interval '3 hours' WHERE id = $1")
+        .bind(partial.blob_id())
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE asset_blobs SET last_accessed_at = clock_timestamp() - interval '2 hours' WHERE id = $1")
+        .bind(intact_one.blob_id())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let limit_policy = test_policy(20, Duration::ZERO, 1024);
+    let result = PostgresAssetStore::with_blob_store(pool.clone(), limit_policy, backend)
+        .maintenance()
+        .await
+        .unwrap();
+
+    assert_eq!(result.size_evicted_blobs, 2);
+    assert!(!root.join(partial_key.as_str()).exists());
+    assert!(!root.join(intact_one_key.as_str()).exists());
+    assert!(root.join(intact_two_key.as_str()).exists());
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
 async fn maintenance_and_asset_reuse_follow_the_same_lock_order(pool: PgPool) {
     let source_id = SourceId::from_uuid(Uuid::new_v4());
     create_source_and_articles(
@@ -2323,7 +2438,7 @@ async fn store_asset_with_backend(
     source_id: SourceId,
     review_id: &str,
     input: AssetInput,
-    backend: Arc<MemoryBlobStore>,
+    backend: Arc<dyn AssetBlobStore>,
 ) -> werrss::archive::asset_store::StoredAsset {
     let factory = UnitOfWorkFactory::with_blob_store(pool.clone(), backend);
     let mut unit_of_work = factory

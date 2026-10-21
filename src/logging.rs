@@ -14,6 +14,7 @@ use tracing_subscriber::{
 };
 
 const THIRTYFOUR_TARGET: &str = "thirtyfour";
+const OPENDAL_TARGET: &str = "opendal";
 
 /// Installs the human-readable process logger.
 ///
@@ -50,9 +51,10 @@ fn target_filter(level: LevelFilter) -> Targets {
         // thirtyfour logs the complete WebDriver response body at DEBUG.
         // Those responses can contain article content, so never enable that
         // dependency target above WARN when application diagnostics are
-        // requested. Preserve the quieter application settings as well: a
-        // target directive overrides the default directive, including OFF.
+        // requested. OpenDAL builder debug events include backend config,
+        // including WebDAV usernames, so keep its diagnostics at WARN too.
         .with_target(THIRTYFOUR_TARGET, third_party_target_level(level))
+        .with_target(OPENDAL_TARGET, third_party_target_level(level))
 }
 
 fn third_party_target_level(level: LevelFilter) -> LevelFilter {
@@ -122,6 +124,15 @@ mod tests {
 
         assert!(filter.would_enable("thirtyfour::session::http", &tracing::Level::ERROR));
         assert!(!filter.would_enable("thirtyfour::session::http", &tracing::Level::WARN));
+    }
+
+    #[test]
+    fn opendal_debug_events_that_include_backend_configuration_are_filtered() {
+        let filter = target_filter(LevelFilter::TRACE);
+
+        assert!(filter.would_enable("opendal::services::webdav", &tracing::Level::WARN));
+        assert!(!filter.would_enable("opendal::services::webdav", &tracing::Level::DEBUG));
+        assert!(!filter.would_enable("opendal::services::webdav::backend", &tracing::Level::DEBUG));
     }
 
     #[test]

@@ -1,6 +1,6 @@
 # Asset caching design
 
-Status: the disabled/database/local/S3/OSS/GCS/Azure Blob slice is implemented. The current runtime
+Status: the disabled/database/local/S3/OSS/GCS/Azure Blob/FTP/SFTP/WebDAV slice is implemented. The current runtime
 accepts the database policy, fetches approved public image assets before the
 article persistence transaction, stores them in PostgreSQL by default, rewrites
 successful references to `/assets/{asset_record_id}`, serves stable asset responses,
@@ -21,9 +21,13 @@ the PostgreSQL asset repository.
 `new` constructors select `PostgresAssetBlobStore` by default. The outer
 PostgreSQL transaction remains authoritative for blob metadata and article
 relationships, while the injected port owns binary bytes and may commit them
-independently. A backend implementation must therefore tolerate retries and
-best-effort cleanup when a metadata transaction fails; it must not assume that
-binary writes participate in a distributed transaction with PostgreSQL.
+independently. Backends must therefore tolerate retries and best-effort cleanup
+when a metadata transaction fails; binary writes do not participate in a
+distributed transaction with PostgreSQL. FTP and WebDAV use a separate bounded
+coordination pool so their advisory-lock acquisition cannot starve behind an
+application transaction holding the application pool's only connection. One
+coordination pool is shared by all roles for the supervisor lifetime; it allows
+up to the configured application-pool maximum in additional connections.
 
 Automatic repair of a missing asset is implemented. Signed-URL refresh
 lineages remain future work. The repair implementation covers only the public, anonymous re-fetch
@@ -104,12 +108,14 @@ The implementations are adapters only:
   or suspended buckets;
 - `OpenDalGcsBlobStore` uses OpenDAL's GCS service for Google Cloud Storage;
 - `OpenDalAzureBlobStore` uses OpenDAL's Azure Blob service;
-- later adapters may use OpenDAL's FTP, SFTP, WebDAV, or
-  PostgreSQL services after the common contract is stable.
+- `OpenDalFtpBlobStore` uses FTP or FTPS with PostgreSQL advisory-lock
+  coordination for immutable writes and deletes;
+- `OpenDalSftpBlobStore` uses strict known-host verification and conditional
+  writes;
+- `OpenDalWebdavBlobStore` uses WebDAV with PostgreSQL advisory-lock
+  coordination for immutable writes and deletes.
 
-OpenDAL service features should be enabled selectively when those adapters are
-implemented. The current integration enables only filesystem, GCS, S3, OSS, and Azure Blob
-support rather than compiling every service into the application. The async
+OpenDAL service features are enabled selectively; the current integration enables filesystem, GCS, S3, OSS, Azure Blob, FTP, SFTP, and WebDAV support rather than compiling every service into the application. The async
 OpenDAL operator is required in this Tokio application; its blocking wrapper
 must not be called from async request or worker paths.
 
@@ -137,12 +143,12 @@ remain unchanged.
 ### Backend configuration
 
 The existing `disabled` and `database` modes remain unchanged and
-`disabled` remains the default. `local`, `s3`, `oss`, `gcs`, and `azure` are explicit
+`disabled` remains the default. `local`, `s3`, `oss`, `gcs`, `azure`, `ftp`, `sftp`, and `webdav` are explicit
 backend values rather than a generic provider string:
 
 | Variable | Meaning |
 | --- | --- |
-| `ASSET_ARCHIVE_BACKEND` | `disabled`, `database`, `local`, `s3`, `oss`, `gcs`, or `azure`; `postgres` remains an alias for `database` and `azblob` an alias for `azure`. |
+| `ASSET_ARCHIVE_BACKEND` | `disabled`, `database`, `local`, `s3`, `oss`, `gcs`, `azure`, `ftp`, `sftp`, or `webdav`; `postgres` remains an alias for `database` and `azblob` an alias for `azure`. |
 | `ASSET_LOCAL_ROOT` | Root directory for the local OpenDAL filesystem backend. |
 | `ASSET_S3_BUCKET` | Bucket used by the S3-compatible backend. |
 | `ASSET_S3_ENDPOINT` | Optional provider endpoint, including MinIO or another S3-compatible service. |
@@ -166,11 +172,18 @@ backend values rather than a generic provider string:
 | `ASSET_AZURE_ACCOUNT_NAME` | Secret-backed Azure Storage account name; required for signed requests. |
 | `ASSET_AZURE_ACCOUNT_KEY` | Base64-encoded secret-backed Azure Storage account key; required for signed requests. |
 | `ASSET_AZURE_SKIP_SIGNATURE` | Sends unsigned requests for an explicitly configured Azure emulator; account credentials are then optional. |
+| `ASSET_FTP_ENDPOINT` | Required FTP or FTPS host endpoint without embedded credentials, path, query, or fragment. Plain FTP is unencrypted; use FTPS to protect credentials and data in transit. |
+| `ASSET_FTP_ROOT` | Optional FTP root directory. |
+| `ASSET_FTP_USER` / `ASSET_FTP_PASSWORD` | Optional credentials; both must be set together. |
+| `ASSET_SFTP_ENDPOINT` | Required `sftp://host[:port]` endpoint without credentials, path, query, or fragment. Strict known-host checking is enabled. |
+| `ASSET_SFTP_ROOT` | Optional SFTP root directory. |
+| `ASSET_SFTP_USER` | Required SFTP username. |
+| `ASSET_SFTP_KEY` | Required absolute path to a mounted SSH private-key file; key contents remain outside application configuration. |
+| `ASSET_WEBDAV_ENDPOINT` | Required HTTP(S) endpoint with optional mount path, no embedded credentials, query, or fragment. Use HTTPS with authentication. |
+| `ASSET_WEBDAV_ROOT` | Optional WebDAV root directory. |
+| `ASSET_WEBDAV_USER` / `ASSET_WEBDAV_PASSWORD` | Optional Basic credentials; both must be set together. |
 
-Credentials must be loaded as secrets and must never be logged. Provider
-specific settings for FTP, SFTP, and WebDAV should be added only when
-those services are implemented and tested; they should not be accepted as
-silently ignored configuration in earlier releases.
+All credential values are secret-backed and omitted from config Debug output. SFTP private-key contents are never read by application config, and the referenced file must be mounted into the runtime. FTP and WebDAV use PostgreSQL advisory locks to preserve immutable writes and deletes across Werrss replicas; their lock pool is separate from the application pool and allows up to the configured application-pool maximum in additional connections. Lock-pool acquisition and advisory-lock waits are bounded by 30 seconds. External protocol writers are not coordinated. FTP without TLS does not protect credentials or data in transit, so prefer FTPS. Use HTTPS for authenticated WebDAV.
 
 ## Configuration contract
 
@@ -184,7 +197,16 @@ GCS adapter and requires its bucket and base64-encoded credential JSON unless
 emulator. `azure` (or `azblob`) selects the OpenDAL Azure Blob adapter and
 requires its container, endpoint, account name, and base64-encoded account key
 unless `ASSET_AZURE_SKIP_SIGNATURE=true` is explicitly selected for an
-unauthenticated emulator.
+unauthenticated emulator. `ftp` selects the FTP adapter, which accepts `ftp://` or
+`ftps://` endpoints; `sftp` selects SFTP with strict host-key verification, and `webdav` selects WebDAV.
+FTP and WebDAV use transaction-scoped PostgreSQL advisory locks around immutable
+writes and deletes, so their operations require the configured database; the
+separate lock pool is bounded by the application pool's configured maximum and
+uses a 30-second acquisition and lock-wait deadline. The locks coordinate Werrss instances only. FTP credentials and traffic are
+unencrypted without FTPS. WebDAV authentication should use HTTPS. FTP, SFTP,
+and WebDAV endpoints reject embedded credentials and fragments; FTP host endpoints
+also reject paths, while SFTP endpoints reject paths and queries and WebDAV
+endpoints reject queries. WebDAV mount paths are allowed.
 `oss` selects the OpenDAL OSS adapter and requires its bucket, endpoint, and
 credentials unless `ASSET_OSS_SKIP_SIGNATURE=true` is explicitly selected for
 an unauthenticated compatible service. The endpoint must be an HTTP(S) URL
@@ -199,7 +221,7 @@ version listing.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `ASSET_ARCHIVE_BACKEND` | `disabled` | `disabled` leaves external URLs unchanged; `database` stores bytes in PostgreSQL; `local` stores bytes through OpenDAL in `ASSET_LOCAL_ROOT`; `s3`, `oss`, `gcs`, and `azure` use their configured OpenDAL object stores. |
+| `ASSET_ARCHIVE_BACKEND` | `disabled` | `disabled` leaves external URLs unchanged; `database` stores bytes in PostgreSQL; `local` stores bytes through OpenDAL in `ASSET_LOCAL_ROOT`; `s3`, `oss`, `gcs`, `azure`, `ftp`, `sftp`, and `webdav` use their configured OpenDAL services. |
 | `ASSET_LOCAL_ROOT` | — | Local OpenDAL filesystem root; required for `local`. |
 | `ASSET_S3_BUCKET` | — | S3-compatible bucket; required for `s3`. |
 | `ASSET_S3_ENDPOINT` | — | Optional S3-compatible endpoint. |
@@ -223,6 +245,16 @@ version listing.
 | `ASSET_AZURE_ACCOUNT_NAME` | — | Secret-backed Azure Storage account name; required for signed requests. |
 | `ASSET_AZURE_ACCOUNT_KEY` | — | Base64-encoded secret-backed Azure Storage account key; required for signed requests. |
 | `ASSET_AZURE_SKIP_SIGNATURE` | `false` | Sends unsigned requests for an explicitly configured Azure emulator; account credentials are then optional. |
+| `ASSET_FTP_ENDPOINT` | — | Required FTP or FTPS host endpoint without embedded credentials, path, query, or fragment. |
+| `ASSET_FTP_ROOT` | — | Optional remote root directory. |
+| `ASSET_FTP_USER` / `ASSET_FTP_PASSWORD` | — | Optional credentials; configure both or neither. |
+| `ASSET_SFTP_ENDPOINT` | — | Required SFTP endpoint with host and optional port; path and query are forbidden. |
+| `ASSET_SFTP_ROOT` | — | Optional remote root directory. |
+| `ASSET_SFTP_USER` | — | Required SFTP username. |
+| `ASSET_SFTP_KEY` | — | Required absolute path to mounted SSH private-key file. |
+| `ASSET_WEBDAV_ENDPOINT` | — | Required HTTP(S) endpoint with optional mount path and no embedded credentials, query, or fragment. |
+| `ASSET_WEBDAV_ROOT` | — | Optional remote root directory. |
+| `ASSET_WEBDAV_USER` / `ASSET_WEBDAV_PASSWORD` | — | Optional Basic credentials; configure both or neither. |
 | `ASSET_USE_ABSOLUTE_URLS` | `true` | When database caching is enabled, feed rendering converts stable `/assets/{id}` links to full URLs rooted at `SERVER_ROOT_URL`. Set to `false` to keep relative links; the default requires `SERVER_ROOT_URL`. |
 | `ASSET_CACHE_MAX_SIZE_MB` | `5000` | Maximum aggregate size of cached binary bytes. `0` disables size-based eviction. The value is decimal megabytes: `5000` means 5,000,000,000 bytes. |
 | `ASSET_CACHE_MAX_AGE_DAYS` | `30` | Maximum age since the last successful access before cached bytes are evicted. `0` disables age-based eviction. |
@@ -239,6 +271,8 @@ version listing.
 
 `ASSET_REFRESH_*` settings are reserved for the future signed-URL refresh
 feature and are not accepted by the current environment parser.
+
+The live protocol tests are ignored by default and target only operator-provided test endpoints. Run one by name with `cargo test --locked --test asset_blob_store_protocols -- --ignored <test_name> --exact`. FTP uses `WERRSS_TEST_FTP_ENDPOINT` and optional `WERRSS_TEST_FTP_ROOT`, `WERRSS_TEST_FTP_USER`, and `WERRSS_TEST_FTP_PASSWORD`; SFTP uses `WERRSS_TEST_SFTP_ENDPOINT`, optional `WERRSS_TEST_SFTP_ROOT`, required `WERRSS_TEST_SFTP_USER`, and `WERRSS_TEST_SFTP_KEY`; WebDAV uses `WERRSS_TEST_WEBDAV_ENDPOINT` and optional `WERRSS_TEST_WEBDAV_ROOT`, `WERRSS_TEST_WEBDAV_USER`, and `WERRSS_TEST_WEBDAV_PASSWORD`. FTP and WebDAV require `DATABASE_URL` for cross-replica lock coordination. Tests generate unique blob keys and attempt cleanup after every contract run.
 
 The aggregate cache limit counts only the raw binary response bytes for rows
 whose data is present. It does not count PostgreSQL TOAST overhead, indexes,

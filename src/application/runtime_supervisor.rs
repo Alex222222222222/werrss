@@ -49,8 +49,9 @@ use crate::{
             feed_token_repository::PostgresFeedTokenRepository,
             job_repository::PostgresJobRepository,
             opendal_blob_store::{
-                OpenDalAzureBlobStore, OpenDalFsBlobStore, OpenDalGcsBlobStore,
-                OpenDalOssBlobStore, OpenDalS3BlobStore,
+                OpenDalAzureBlobStore, OpenDalFsBlobStore, OpenDalFtpBlobStore,
+                OpenDalGcsBlobStore, OpenDalOssBlobStore, OpenDalS3BlobStore, OpenDalSftpBlobStore,
+                OpenDalWebdavBlobStore,
             },
             scheduler_repository::PostgresSchedulerRepository,
             source_repository::PostgresSourceRepository,
@@ -295,6 +296,7 @@ pub struct RuntimeSupervisor {
     config: AppConfig,
     plan: RuntimePlan,
     pool: PgPool,
+    blob_store: Arc<dyn AssetBlobStore>,
     browser_pool: Option<BrowserPool>,
     browser_health: BrowserHealth,
     browser_monitor: Option<BrowserHealthMonitor>,
@@ -303,47 +305,76 @@ pub struct RuntimeSupervisor {
 
 impl RuntimeSupervisor {
     fn blob_store(&self) -> Result<Arc<dyn AssetBlobStore>, RuntimeSupervisorError> {
-        match self.config.asset_archive.local_root() {
-            Some(root) => Ok(Arc::new(OpenDalFsBlobStore::new(root)?)),
-            None => match self.config.asset_archive.s3_storage() {
-                Some(storage) => Ok(Arc::new(OpenDalS3BlobStore::new(
-                    storage.bucket(),
-                    storage.endpoint(),
-                    storage.region(),
-                    storage.access_key_id(),
-                    storage.secret_access_key(),
-                )?)),
-                None => match self.config.asset_archive.oss_storage() {
-                    Some(storage) => Ok(Arc::new(OpenDalOssBlobStore::new_with_options(
-                        storage.bucket(),
-                        storage.endpoint(),
-                        storage.access_key_id(),
-                        storage.access_key_secret(),
-                        storage.security_token(),
-                        storage.addressing_style(),
-                        storage.skip_signature(),
-                    )?)),
-                    None => match self.config.asset_archive.gcs_storage() {
-                        Some(storage) => Ok(Arc::new(OpenDalGcsBlobStore::new_with_options(
-                            storage.bucket(),
-                            storage.endpoint(),
-                            storage.credential(),
-                            storage.skip_signature(),
-                        )?)),
-                        None => match self.config.asset_archive.azure_storage() {
-                            Some(storage) => Ok(Arc::new(OpenDalAzureBlobStore::new_with_options(
-                                storage.container(),
-                                storage.endpoint(),
-                                storage.account_name(),
-                                storage.account_key(),
-                                storage.skip_signature(),
-                            )?)),
-                            None => Ok(Arc::new(PostgresAssetBlobStore::new(self.pool.clone()))),
-                        },
-                    },
-                },
-            },
-        }
+        Ok(Arc::clone(&self.blob_store))
+    }
+
+    fn build_blob_store(
+        config: &AppConfig,
+        pool: &PgPool,
+    ) -> Result<Arc<dyn AssetBlobStore>, RuntimeSupervisorError> {
+        let archive = &config.asset_archive;
+        let store: Arc<dyn AssetBlobStore> = if let Some(root) = archive.local_root() {
+            Arc::new(OpenDalFsBlobStore::new(root)?)
+        } else if let Some(storage) = archive.s3_storage() {
+            Arc::new(OpenDalS3BlobStore::new(
+                storage.bucket(),
+                storage.endpoint(),
+                storage.region(),
+                storage.access_key_id(),
+                storage.secret_access_key(),
+            )?)
+        } else if let Some(storage) = archive.oss_storage() {
+            Arc::new(OpenDalOssBlobStore::new_with_options(
+                storage.bucket(),
+                storage.endpoint(),
+                storage.access_key_id(),
+                storage.access_key_secret(),
+                storage.security_token(),
+                storage.addressing_style(),
+                storage.skip_signature(),
+            )?)
+        } else if let Some(storage) = archive.gcs_storage() {
+            Arc::new(OpenDalGcsBlobStore::new_with_options(
+                storage.bucket(),
+                storage.endpoint(),
+                storage.credential(),
+                storage.skip_signature(),
+            )?)
+        } else if let Some(storage) = archive.azure_storage() {
+            Arc::new(OpenDalAzureBlobStore::new_with_options(
+                storage.container(),
+                storage.endpoint(),
+                storage.account_name(),
+                storage.account_key(),
+                storage.skip_signature(),
+            )?)
+        } else if let Some(storage) = archive.ftp_storage() {
+            Arc::new(OpenDalFtpBlobStore::new(
+                pool.clone(),
+                storage.endpoint(),
+                storage.root(),
+                storage.user(),
+                storage.password(),
+            )?)
+        } else if let Some(storage) = archive.sftp_storage() {
+            Arc::new(OpenDalSftpBlobStore::new(
+                storage.endpoint(),
+                storage.root(),
+                storage.user(),
+                storage.key(),
+            )?)
+        } else if let Some(storage) = archive.webdav_storage() {
+            Arc::new(OpenDalWebdavBlobStore::new(
+                pool.clone(),
+                storage.endpoint(),
+                storage.root(),
+                storage.user(),
+                storage.password(),
+            )?)
+        } else {
+            Arc::new(PostgresAssetBlobStore::new(pool.clone()))
+        };
+        Ok(store)
     }
 
     fn build_asset_store(
@@ -388,6 +419,7 @@ impl RuntimeSupervisor {
                 browser_pool.clone(),
             )
         });
+        let blob_store = Self::build_blob_store(&config, &pool)?;
         tracing::info!(
             components = plan.components().len(),
             "runtime supervisor initialized"
@@ -396,6 +428,7 @@ impl RuntimeSupervisor {
             config,
             plan,
             pool,
+            blob_store,
             browser_pool,
             browser_health,
             browser_monitor,
@@ -419,6 +452,7 @@ impl RuntimeSupervisor {
                 browser_pool.clone(),
             )
         });
+        let blob_store = Self::build_blob_store(&config, &pool)?;
         tracing::debug!(
             components = plan.components().len(),
             "runtime supervisor created from existing pool"
@@ -427,6 +461,7 @@ impl RuntimeSupervisor {
             config,
             plan,
             pool,
+            blob_store,
             browser_pool,
             browser_health,
             browser_monitor,
@@ -1336,6 +1371,97 @@ mod tests {
         PgPoolOptions::new()
             .connect_lazy("postgres://unused")
             .expect("lazy test pool URL should be valid")
+    }
+
+    #[tokio::test]
+    async fn runtime_constructs_the_configured_ftp_blob_store() {
+        let app_config = AppConfig::from_env_iter([
+            (
+                "DATABASE_URL".to_owned(),
+                "postgres://user:pass@db/feed".to_owned(),
+            ),
+            (
+                "CREDENTIAL_ENCRYPTION_KEY".to_owned(),
+                "runtime-test-key".to_owned(),
+            ),
+            ("APP_ROLES".to_owned(), "api".to_owned()),
+            (
+                "SERVER_ROOT_URL".to_owned(),
+                "https://feeds.example.test".to_owned(),
+            ),
+            ("ASSET_ARCHIVE_BACKEND".to_owned(), "ftp".to_owned()),
+            (
+                "ASSET_FTP_ENDPOINT".to_owned(),
+                "ftps://ftp.example.test".to_owned(),
+            ),
+        ])
+        .unwrap();
+        let supervisor = RuntimeSupervisor::new(app_config, lazy_pool()).unwrap();
+        let store = supervisor.blob_store().unwrap();
+        assert!(store.as_any().is::<OpenDalFtpBlobStore>());
+        assert!(Arc::ptr_eq(&store, &supervisor.blob_store().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn runtime_constructs_the_configured_sftp_blob_store() {
+        let app_config = AppConfig::from_env_iter([
+            (
+                "DATABASE_URL".to_owned(),
+                "postgres://user:pass@db/feed".to_owned(),
+            ),
+            (
+                "CREDENTIAL_ENCRYPTION_KEY".to_owned(),
+                "runtime-test-key".to_owned(),
+            ),
+            ("APP_ROLES".to_owned(), "api".to_owned()),
+            (
+                "SERVER_ROOT_URL".to_owned(),
+                "https://feeds.example.test".to_owned(),
+            ),
+            ("ASSET_ARCHIVE_BACKEND".to_owned(), "sftp".to_owned()),
+            (
+                "ASSET_SFTP_ENDPOINT".to_owned(),
+                "sftp://sftp.example.test:2222".to_owned(),
+            ),
+            ("ASSET_SFTP_USER".to_owned(), "user".to_owned()),
+            ("ASSET_SFTP_KEY".to_owned(), "/mounted/key".to_owned()),
+        ])
+        .unwrap();
+        let supervisor = RuntimeSupervisor::new(app_config, lazy_pool()).unwrap();
+        assert!(supervisor
+            .blob_store()
+            .unwrap()
+            .as_any()
+            .is::<OpenDalSftpBlobStore>());
+    }
+
+    #[tokio::test]
+    async fn runtime_constructs_the_configured_webdav_blob_store() {
+        let app_config = AppConfig::from_env_iter([
+            (
+                "DATABASE_URL".to_owned(),
+                "postgres://user:pass@db/feed".to_owned(),
+            ),
+            (
+                "CREDENTIAL_ENCRYPTION_KEY".to_owned(),
+                "runtime-test-key".to_owned(),
+            ),
+            ("APP_ROLES".to_owned(), "api".to_owned()),
+            (
+                "SERVER_ROOT_URL".to_owned(),
+                "https://feeds.example.test".to_owned(),
+            ),
+            ("ASSET_ARCHIVE_BACKEND".to_owned(), "webdav".to_owned()),
+            (
+                "ASSET_WEBDAV_ENDPOINT".to_owned(),
+                "https://dav.example.test/remote.php/dav".to_owned(),
+            ),
+        ])
+        .unwrap();
+        let supervisor = RuntimeSupervisor::new(app_config, lazy_pool()).unwrap();
+        let store = supervisor.blob_store().unwrap();
+        assert!(store.as_any().is::<OpenDalWebdavBlobStore>());
+        assert!(Arc::ptr_eq(&store, &supervisor.blob_store().unwrap()));
     }
 
     #[tokio::test]

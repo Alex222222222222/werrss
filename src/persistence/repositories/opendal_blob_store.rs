@@ -2,6 +2,8 @@
 
 use std::{any::Any, future::IntoFuture, path::PathBuf, time::Duration};
 
+use sqlx::{postgres::PgPoolOptions, PgPool};
+
 use async_trait::async_trait;
 use fs2::FileExt;
 use futures_util::StreamExt;
@@ -22,6 +24,7 @@ struct OpenDalBlobStoreCore {
     operator: Operator,
     root: Option<PathBuf>,
     operation_timeout: Option<Duration>,
+    remote_lock_pool: Option<PgPool>,
 }
 
 /// Stores raw asset bytes in a local directory through OpenDAL's filesystem
@@ -55,6 +58,24 @@ pub struct OpenDalAzureBlobStore {
     core: OpenDalBlobStoreCore,
 }
 
+/// Stores raw asset bytes in an FTP or FTPS server through OpenDAL.
+#[derive(Clone)]
+pub struct OpenDalFtpBlobStore {
+    core: OpenDalBlobStoreCore,
+}
+
+/// Stores raw asset bytes in an SFTP server through OpenDAL.
+#[derive(Clone)]
+pub struct OpenDalSftpBlobStore {
+    core: OpenDalBlobStoreCore,
+}
+
+/// Stores raw asset bytes in a WebDAV server through OpenDAL.
+#[derive(Clone)]
+pub struct OpenDalWebdavBlobStore {
+    core: OpenDalBlobStoreCore,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct StoredMetadata {
     checksum: String,
@@ -74,6 +95,7 @@ impl OpenDalFsBlobStore {
                 operator,
                 root: Some(root),
                 operation_timeout: None,
+                remote_lock_pool: None,
             },
         })
     }
@@ -122,6 +144,7 @@ impl OpenDalS3BlobStore {
                 operator,
                 root: None,
                 operation_timeout: Some(operation_timeout),
+                remote_lock_pool: None,
             },
         })
     }
@@ -181,6 +204,7 @@ impl OpenDalOssBlobStore {
                 operator,
                 root: None,
                 operation_timeout: Some(REMOTE_OPERATION_TIMEOUT),
+                remote_lock_pool: None,
             },
         })
     }
@@ -229,6 +253,7 @@ impl OpenDalGcsBlobStore {
                 operator,
                 root: None,
                 operation_timeout: Some(REMOTE_OPERATION_TIMEOUT),
+                remote_lock_pool: None,
             },
         })
     }
@@ -280,12 +305,183 @@ impl OpenDalAzureBlobStore {
                 operator,
                 root: None,
                 operation_timeout: Some(REMOTE_OPERATION_TIMEOUT),
+                remote_lock_pool: None,
             },
         })
     }
 }
 
+impl OpenDalFtpBlobStore {
+    /// Creates an FTP/FTPS backend with optional root and login credentials.
+    pub fn new(
+        pool: PgPool,
+        endpoint: &str,
+        root: Option<&str>,
+        user: Option<&str>,
+        password: Option<&str>,
+    ) -> Result<Self, AssetBlobStoreError> {
+        let endpoint = ftp_endpoint_scheme(endpoint);
+        let mut builder = services::Ftp::default().endpoint(&endpoint);
+        if let Some(root) = root {
+            builder = builder.root(root);
+        }
+        if let Some(user) = user {
+            builder = builder.user(user);
+        }
+        if let Some(password) = password {
+            builder = builder.password(password);
+        }
+        let operator = Operator::new(builder).map_err(backend_error)?;
+        Ok(Self {
+            core: OpenDalBlobStoreCore {
+                operator,
+                root: None,
+                operation_timeout: Some(REMOTE_OPERATION_TIMEOUT),
+                remote_lock_pool: Some(coordination_pool(&pool)),
+            },
+        })
+    }
+}
+
+impl OpenDalSftpBlobStore {
+    /// Creates an SFTP backend using strict known-host verification.
+    pub fn new(
+        endpoint: &str,
+        root: Option<&str>,
+        user: &str,
+        key: &str,
+    ) -> Result<Self, AssetBlobStoreError> {
+        let endpoint = sftp_ssh_destination(endpoint);
+        let mut builder = services::Sftp::default()
+            .endpoint(&endpoint)
+            .user(user)
+            .key(key)
+            .known_hosts_strategy("strict");
+        if let Some(root) = root {
+            builder = builder.root(root);
+        }
+        let operator = Operator::new(builder).map_err(backend_error)?;
+        Ok(Self {
+            core: OpenDalBlobStoreCore {
+                operator,
+                root: None,
+                operation_timeout: Some(REMOTE_OPERATION_TIMEOUT),
+                remote_lock_pool: None,
+            },
+        })
+    }
+}
+
+impl OpenDalWebdavBlobStore {
+    /// Creates a WebDAV backend with optional Basic authentication.
+    pub fn new(
+        pool: PgPool,
+        endpoint: &str,
+        root: Option<&str>,
+        username: Option<&str>,
+        password: Option<&str>,
+    ) -> Result<Self, AssetBlobStoreError> {
+        let mut builder = services::Webdav::default().endpoint(endpoint);
+        if let Some(root) = root {
+            builder = builder.root(root);
+        }
+        if let Some(username) = username {
+            builder = builder.username(username);
+        }
+        if let Some(password) = password {
+            builder = builder.password(password);
+        }
+        let operator = Operator::new(builder).map_err(backend_error)?;
+        Ok(Self {
+            core: OpenDalBlobStoreCore {
+                operator,
+                root: None,
+                operation_timeout: Some(REMOTE_OPERATION_TIMEOUT),
+                remote_lock_pool: Some(coordination_pool(&pool)),
+            },
+        })
+    }
+}
+
+fn coordination_pool(pool: &PgPool) -> PgPool {
+    PgPoolOptions::new()
+        .max_connections(pool.options().get_max_connections())
+        .acquire_timeout(REMOTE_OPERATION_TIMEOUT)
+        .connect_lazy_with(pool.connect_options().as_ref().clone())
+}
+
 impl OpenDalBlobStoreCore {
+    async fn acquire_remote_lock(
+        &self,
+        key: &AssetBlobKey,
+    ) -> Result<Option<sqlx::Transaction<'_, sqlx::Postgres>>, AssetBlobStoreError> {
+        if self.operator.info().capability().write_with_if_not_exists {
+            return Ok(None);
+        }
+        let pool = self.remote_lock_pool.as_ref().ok_or_else(|| {
+            AssetBlobStoreError::Backend(
+                "backend requires a PostgreSQL coordination pool for immutable writes".to_owned(),
+            )
+        })?;
+        let mut lock_keys = if matches!(self.operator.info().scheme(), "ftp" | "webdav") {
+            vec![key.as_str().to_owned(), Self::metadata_key(key)]
+        } else {
+            vec![key.as_str().to_owned()]
+        };
+        lock_keys.sort_unstable();
+        lock_keys.dedup();
+        let deadline = tokio::time::Instant::now() + REMOTE_OPERATION_TIMEOUT;
+        let mut transaction = tokio::time::timeout_at(deadline, pool.begin())
+            .await
+            .map_err(|_| {
+                AssetBlobStoreError::Backend(format!(
+                    "asset blob coordination timed out after {REMOTE_OPERATION_TIMEOUT:?}"
+                ))
+            })?
+            .map_err(backend_error)?;
+        for lock_key in lock_keys {
+            loop {
+                let locked = tokio::time::timeout_at(
+                    deadline,
+                    sqlx::query_scalar::<_, bool>(
+                        "SELECT pg_try_advisory_xact_lock(hashtextextended('asset-blob:' || $1, 0))",
+                    )
+                    .bind(&lock_key)
+                    .fetch_one(&mut *transaction),
+                )
+                .await
+                .map_err(|_| {
+                    AssetBlobStoreError::Backend(format!(
+                        "asset blob coordination lock timed out after {REMOTE_OPERATION_TIMEOUT:?}"
+                    ))
+                })?
+                .map_err(backend_error)?;
+                if locked {
+                    break;
+                }
+                tokio::time::sleep_until(
+                    (tokio::time::Instant::now() + Duration::from_millis(50)).min(deadline),
+                )
+                .await;
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(AssetBlobStoreError::Backend(format!(
+                        "asset blob coordination lock timed out after {REMOTE_OPERATION_TIMEOUT:?}"
+                    )));
+                }
+            }
+        }
+        Ok(Some(transaction))
+    }
+
+    async fn commit_remote_lock(
+        transaction: Option<sqlx::Transaction<'_, sqlx::Postgres>>,
+    ) -> Result<(), AssetBlobStoreError> {
+        if let Some(transaction) = transaction {
+            transaction.commit().await.map_err(backend_error)?;
+        }
+        Ok(())
+    }
+
     fn timeout_error(timeout: Duration) -> opendal::Error {
         opendal::Error::new(
             ErrorKind::Unexpected,
@@ -343,7 +539,22 @@ impl OpenDalBlobStoreCore {
         }
     }
 
-    async fn write_metadata(
+    async fn write_object(
+        &self,
+        object: &str,
+        bytes: Vec<u8>,
+        conditional: bool,
+    ) -> Result<(), opendal::Error> {
+        let write = self.operator.write_with(object, bytes);
+        let write = if conditional {
+            write.if_not_exists(true)
+        } else {
+            write
+        };
+        self.run_backend_operation(write).await.map(|_| ())
+    }
+
+    async fn write_ftp_metadata(
         &self,
         key: &AssetBlobKey,
         blob: &AssetBlob,
@@ -354,14 +565,82 @@ impl OpenDalBlobStoreCore {
             byte_size: blob.byte_size(),
         };
         let encoded = serde_json::to_vec(&metadata).map_err(backend_error)?;
-        match self
-            .run_backend_operation(
-                self.operator
-                    .write_with(&Self::metadata_key(key), encoded)
-                    .if_not_exists(true),
-            )
+        let mut record = Vec::with_capacity(encoded.len() + 2);
+        record.push(b'\n');
+        record.extend_from_slice(&encoded);
+        record.push(b'\n');
+        self.write_object(&Self::metadata_key(key), record, false)
             .await
-        {
+            .map_err(backend_error)
+    }
+
+    async fn put_ftp_under_lock_inner(
+        &self,
+        key: &AssetBlobKey,
+        blob: &AssetBlob,
+    ) -> Result<(), AssetBlobStoreError> {
+        let metadata = self.read_object_bytes(&Self::metadata_key(key)).await?;
+        let metadata = metadata.as_deref().and_then(parse_ftp_metadata);
+        if let Some(metadata) = &metadata {
+            if metadata.checksum != blob.checksum()
+                || metadata.media_type != blob.media_type()
+                || metadata.byte_size != blob.byte_size()
+            {
+                return Err(AssetBlobStoreError::Conflict);
+            }
+        }
+
+        if let Some(body) = self.read_body(key).await? {
+            if body == blob.bytes() {
+                if metadata.is_none() {
+                    self.write_ftp_metadata(key, blob).await?;
+                }
+                return Ok(());
+            }
+            if !blob.bytes().starts_with(&body) || metadata.is_none() {
+                return Err(AssetBlobStoreError::Conflict);
+            }
+            self.delete_body(key).await?;
+        }
+
+        if metadata.is_none() {
+            self.write_ftp_metadata(key, blob).await?;
+        }
+        self.write_object(key.as_str(), blob.bytes().to_vec(), false)
+            .await
+            .map_err(backend_error)
+    }
+
+    async fn write_metadata(
+        &self,
+        key: &AssetBlobKey,
+        blob: &AssetBlob,
+    ) -> Result<(), AssetBlobStoreError> {
+        self.write_metadata_with_condition(key, blob, true).await
+    }
+
+    async fn write_metadata_unconditionally(
+        &self,
+        key: &AssetBlobKey,
+        blob: &AssetBlob,
+    ) -> Result<(), AssetBlobStoreError> {
+        self.write_metadata_with_condition(key, blob, false).await
+    }
+
+    async fn write_metadata_with_condition(
+        &self,
+        key: &AssetBlobKey,
+        blob: &AssetBlob,
+        conditional: bool,
+    ) -> Result<(), AssetBlobStoreError> {
+        let metadata = StoredMetadata {
+            checksum: blob.checksum().to_owned(),
+            media_type: blob.media_type().to_owned(),
+            byte_size: blob.byte_size(),
+        };
+        let encoded = serde_json::to_vec(&metadata).map_err(backend_error)?;
+        let metadata_key = Self::metadata_key(key);
+        match self.write_object(&metadata_key, encoded, conditional).await {
             Ok(_) => Ok(()),
             Err(error) if is_existing_error(&error) => match self.read(key).await? {
                 Some(existing) if existing == *blob => Ok(()),
@@ -418,6 +697,21 @@ impl OpenDalBlobStoreCore {
         }
     }
 
+    async fn read_object_bytes(
+        &self,
+        object: &str,
+    ) -> Result<Option<Vec<u8>>, AssetBlobStoreError> {
+        match self.run_backend_operation(self.operator.read(object)).await {
+            Ok(bytes) => Ok(Some(bytes.to_vec())),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(backend_error(error)),
+        }
+    }
+
+    async fn read_body(&self, key: &AssetBlobKey) -> Result<Option<Vec<u8>>, AssetBlobStoreError> {
+        self.read_object_bytes(key.as_str()).await
+    }
+
     async fn read_metadata(
         &self,
         key: &AssetBlobKey,
@@ -431,6 +725,9 @@ impl OpenDalBlobStoreCore {
             Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(backend_error(error)),
         };
+        if self.operator.info().scheme() == "ftp" {
+            return Ok(parse_ftp_metadata(&bytes.to_vec()));
+        }
         serde_json::from_slice(&bytes.to_vec())
             .map(Some)
             .map_err(backend_error)
@@ -450,6 +747,11 @@ impl OpenDalBlobStoreCore {
             Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(backend_error(error)),
         };
+        // FTP publishes the sidecar before the body, so a body shorter than the
+        // promised size is an interrupted upload, not a readable blob.
+        if bytes.len() as u64 != metadata.byte_size {
+            return Ok(None);
+        }
         AssetBlob::new(bytes, metadata.media_type, metadata.checksum).map(Some)
     }
 
@@ -460,20 +762,24 @@ impl OpenDalBlobStoreCore {
         let Some(metadata) = self.read_metadata(key).await? else {
             return Ok(None);
         };
-        match self
+        let stat = match self
             .run_backend_operation(self.operator.stat(key.as_str()))
             .await
         {
-            Ok(_) => {}
+            Ok(stat) => stat,
             Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(backend_error(error)),
-        }
-        Ok(Some(AssetBlobMetadata::new(
-            metadata.checksum,
-            metadata.media_type,
-            metadata.byte_size,
-            true,
-        )?))
+        };
+        let stored_byte_size = stat.content_length();
+        Ok(Some(
+            AssetBlobMetadata::new(
+                metadata.checksum,
+                metadata.media_type,
+                metadata.byte_size,
+                stored_byte_size == metadata.byte_size,
+            )?
+            .with_stored_byte_size(stored_byte_size),
+        ))
     }
 
     async fn put(&self, key: &AssetBlobKey, blob: &AssetBlob) -> Result<(), AssetBlobStoreError> {
@@ -481,6 +787,112 @@ impl OpenDalBlobStoreCore {
             true => Some(self.acquire_write_lock().await?),
             false => None,
         };
+        if !self.operator.info().capability().write_with_if_not_exists {
+            let remote_lock = self.acquire_remote_lock(key).await?;
+            if self.operator.info().scheme() == "ftp" {
+                let result = self.put_ftp_under_lock_inner(key, blob).await;
+                if result.is_ok() {
+                    Self::commit_remote_lock(remote_lock).await?;
+                }
+                return result;
+            }
+            return self.put_under_lock(key, blob, remote_lock).await;
+        }
+        self.put_with_conditional_write(key, blob).await
+    }
+
+    async fn put_under_lock(
+        &self,
+        key: &AssetBlobKey,
+        blob: &AssetBlob,
+        remote_lock: Option<sqlx::Transaction<'_, sqlx::Postgres>>,
+    ) -> Result<(), AssetBlobStoreError> {
+        let result = self
+            .put_under_lock_inner(key, blob, remote_lock.is_some())
+            .await;
+        match (result, remote_lock) {
+            (Ok(()), Some(transaction)) => transaction.commit().await.map_err(backend_error),
+            (result, _) => result,
+        }
+    }
+
+    async fn put_under_lock_inner(
+        &self,
+        key: &AssetBlobKey,
+        blob: &AssetBlob,
+        lock_held: bool,
+    ) -> Result<(), AssetBlobStoreError> {
+        if let Some(existing) = self.read(key).await? {
+            return if existing == *blob {
+                Ok(())
+            } else {
+                Err(AssetBlobStoreError::Conflict)
+            };
+        }
+        if let Some(metadata) = self.read_metadata(key).await? {
+            if metadata.checksum == blob.checksum()
+                && metadata.media_type == blob.media_type()
+                && metadata.byte_size == blob.byte_size()
+            {
+                self.write_body(key, blob, !lock_held).await?;
+                return Ok(());
+            }
+            return Err(AssetBlobStoreError::Conflict);
+        }
+        if let Some(body) = self.read_body(key).await? {
+            if body != blob.bytes() {
+                return Err(AssetBlobStoreError::Conflict);
+            }
+            if lock_held {
+                return self.write_metadata_unconditionally(key, blob).await;
+            }
+            return self.write_metadata(key, blob).await;
+        }
+        self.write_body(key, blob, !lock_held).await?;
+        let metadata_write = if lock_held {
+            self.write_metadata_unconditionally(key, blob).await
+        } else {
+            self.write_metadata(key, blob).await
+        };
+        match metadata_write {
+            Ok(()) => Ok(()),
+            Err(error) => match self.delete_locked_objects(key).await {
+                Ok(()) => Err(error),
+                Err(cleanup_error) => Err(AssetBlobStoreError::Backend(format!(
+                    "metadata write failed: {error}; cleanup failed: {cleanup_error}"
+                ))),
+            },
+        }
+    }
+
+    async fn write_body(
+        &self,
+        key: &AssetBlobKey,
+        blob: &AssetBlob,
+        conditional: bool,
+    ) -> Result<(), AssetBlobStoreError> {
+        if conditional {
+            self.run_backend_operation(
+                self.operator
+                    .write_with(key.as_str(), blob.bytes().to_vec())
+                    .if_not_exists(true),
+            )
+            .await
+            .map(|_| ())
+            .map_err(backend_error)
+        } else {
+            self.run_backend_operation(self.operator.write(key.as_str(), blob.bytes().to_vec()))
+                .await
+                .map(|_| ())
+                .map_err(backend_error)
+        }
+    }
+
+    async fn put_with_conditional_write(
+        &self,
+        key: &AssetBlobKey,
+        blob: &AssetBlob,
+    ) -> Result<(), AssetBlobStoreError> {
         if let Some(existing) = self.read(key).await? {
             return if existing == *blob {
                 Ok(())
@@ -504,29 +916,21 @@ impl OpenDalBlobStoreCore {
                     None => self.recover_body_only_partial_write(key, blob, error).await,
                 };
             }
-            Err(error) if self.root.is_none() => {
+            Err(error) => {
                 return self
                     .reconcile_external_write(key, blob, backend_error(error))
                     .await;
             }
-            Err(error) => return Err(backend_error(error)),
         }
         match self.write_metadata(key, blob).await {
             Ok(()) => Ok(()),
-            Err(error) if self.root.is_none() => {
-                self.reconcile_external_write(key, blob, error).await
-            }
-            Err(error) => {
-                // The body was created before its metadata. Remove it before
-                // returning so the caller never loses track of a partial put.
-                let cleanup = self.delete(key).await;
-                match cleanup {
-                    Ok(()) => Err(error),
-                    Err(cleanup_error) => Err(AssetBlobStoreError::Backend(format!(
-                        "metadata write failed: {error}; cleanup failed: {cleanup_error}"
-                    ))),
-                }
-            }
+            Err(error) if self.root.is_some() => match self.delete_locked_objects(key).await {
+                Ok(()) => Err(error),
+                Err(cleanup_error) => Err(AssetBlobStoreError::Backend(format!(
+                    "metadata write failed: {error}; cleanup failed: {cleanup_error}"
+                ))),
+            },
+            Err(error) => self.reconcile_external_write(key, blob, error).await,
         }
     }
 
@@ -569,9 +973,18 @@ impl OpenDalBlobStoreCore {
         }
 
         if let Err(retry_error) = self.write_metadata(key, blob).await {
-            return Err(AssetBlobStoreError::Backend(format!(
+            let failure = AssetBlobStoreError::Backend(format!(
                 "external blob write could not be reconciled: {original_error}; metadata retry failed: {retry_error}"
-            )));
+            ));
+            if self.root.is_some() {
+                return match self.delete_locked_objects(key).await {
+                    Ok(()) => Err(failure),
+                    Err(cleanup_error) => Err(AssetBlobStoreError::Backend(format!(
+                        "{failure}; body cleanup failed: {cleanup_error}"
+                    ))),
+                };
+            }
+            return Err(failure);
         }
         match self.read(key).await {
             Ok(Some(existing)) if existing == *blob => Ok(()),
@@ -585,11 +998,36 @@ impl OpenDalBlobStoreCore {
         }
     }
 
-    async fn delete(&self, key: &AssetBlobKey) -> Result<(), AssetBlobStoreError> {
+    async fn delete_locked_objects(&self, key: &AssetBlobKey) -> Result<(), AssetBlobStoreError> {
         for object in [key.as_str().to_owned(), Self::metadata_key(key)] {
             self.delete_object(&object).await?;
         }
         Ok(())
+    }
+
+    async fn delete(&self, key: &AssetBlobKey) -> Result<(), AssetBlobStoreError> {
+        let remote_lock = if self.remote_lock_pool.is_some()
+            && !self.operator.info().capability().write_with_if_not_exists
+        {
+            self.acquire_remote_lock(key).await?
+        } else {
+            None
+        };
+        self.delete_objects_and_commit(key, remote_lock).await
+    }
+
+    async fn delete_objects_and_commit(
+        &self,
+        key: &AssetBlobKey,
+        remote_lock: Option<sqlx::Transaction<'_, sqlx::Postgres>>,
+    ) -> Result<(), AssetBlobStoreError> {
+        let result = if self.operator.info().scheme() == "oss" {
+            self.delete_all_versions(key).await
+        } else {
+            self.delete_locked_objects(key).await
+        };
+        result?;
+        Self::commit_remote_lock(remote_lock).await
     }
 
     async fn delete_object(&self, object: &str) -> Result<(), AssetBlobStoreError> {
@@ -699,6 +1137,9 @@ impl_blob_store_for_open_dal!(OpenDalFsBlobStore);
 impl_blob_store_for_open_dal!(OpenDalS3BlobStore);
 impl_blob_store_for_open_dal!(OpenDalGcsBlobStore);
 impl_blob_store_for_open_dal!(OpenDalAzureBlobStore);
+impl_blob_store_for_open_dal!(OpenDalFtpBlobStore);
+impl_blob_store_for_open_dal!(OpenDalSftpBlobStore);
+impl_blob_store_for_open_dal!(OpenDalWebdavBlobStore);
 
 #[async_trait]
 impl AssetBlobStore for OpenDalOssBlobStore {
@@ -723,6 +1164,46 @@ impl AssetBlobStore for OpenDalOssBlobStore {
 
     async fn delete(&self, key: &AssetBlobKey) -> Result<(), AssetBlobStoreError> {
         self.core.delete_all_versions(key).await
+    }
+}
+
+fn parse_ftp_metadata(bytes: &[u8]) -> Option<StoredMetadata> {
+    let mut latest = None;
+    for record in bytes
+        .split(|byte| *byte == b'\n')
+        .filter(|record| !record.is_empty())
+    {
+        if let Ok(metadata) = serde_json::from_slice(record) {
+            latest = Some(metadata);
+        }
+    }
+    latest
+}
+
+fn ftp_endpoint_scheme(endpoint: &str) -> String {
+    if endpoint
+        .get(..6)
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("ftp://"))
+    {
+        format!("ftp://{}", &endpoint[6..])
+    } else if endpoint
+        .get(..7)
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("ftps://"))
+    {
+        format!("ftps://{}", &endpoint[7..])
+    } else {
+        endpoint.to_owned()
+    }
+}
+
+fn sftp_ssh_destination(endpoint: &str) -> String {
+    if endpoint
+        .get(..7)
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("sftp://"))
+    {
+        format!("ssh://{}", &endpoint[7..])
+    } else {
+        endpoint.to_owned()
     }
 }
 
@@ -766,6 +1247,303 @@ mod tests {
         AssetBlob::new(bytes, "image/jpeg".to_owned(), checksum).unwrap()
     }
 
+    #[tokio::test]
+    async fn locked_write_recovers_a_partial_body_for_the_same_blob() {
+        let root = std::env::temp_dir().join(format!("werrss-opendal-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("blobs")).unwrap();
+        let root_string = root.to_string_lossy();
+        let core = OpenDalBlobStoreCore {
+            operator: Operator::new(services::Fs::default().root(&root_string)).unwrap(),
+            root: None,
+            operation_timeout: Some(REMOTE_OPERATION_TIMEOUT),
+            remote_lock_pool: None,
+        };
+        let key = AssetBlobKey::for_blob_id(Uuid::new_v4());
+        let value = blob();
+        core.write_ftp_metadata(&key, &value).await.unwrap();
+        core.operator
+            .write(key.as_str(), value.bytes()[..5].to_vec())
+            .await
+            .unwrap();
+
+        core.put_ftp_under_lock_inner(&key, &value).await.unwrap();
+
+        assert_eq!(core.read(&key).await.unwrap(), Some(value));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn locked_write_recovers_a_partial_ftp_sidecar_for_the_same_blob() {
+        let root = std::env::temp_dir().join(format!("werrss-opendal-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("blobs")).unwrap();
+        let root_string = root.to_string_lossy();
+        let core = OpenDalBlobStoreCore {
+            operator: Operator::new(services::Fs::default().root(&root_string)).unwrap(),
+            root: None,
+            operation_timeout: Some(REMOTE_OPERATION_TIMEOUT),
+            remote_lock_pool: None,
+        };
+        let key = AssetBlobKey::for_blob_id(Uuid::new_v4());
+        let value = blob();
+        core.operator
+            .write(key.as_str(), value.bytes().to_vec())
+            .await
+            .unwrap();
+        core.operator
+            .write(
+                &OpenDalBlobStoreCore::metadata_key(&key),
+                b"{\"checksum\":\"partial".to_vec(),
+            )
+            .await
+            .unwrap();
+
+        core.put_ftp_under_lock_inner(&key, &value).await.unwrap();
+
+        let sidecar = core
+            .read_object_bytes(&OpenDalBlobStoreCore::metadata_key(&key))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            parse_ftp_metadata(&sidecar).unwrap().checksum,
+            value.checksum()
+        );
+        assert_eq!(
+            core.read_body(&key).await.unwrap(),
+            Some(value.bytes().to_vec())
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn interrupted_ftp_upload_reads_as_absent_and_is_repaired() {
+        let root = std::env::temp_dir().join(format!("werrss-opendal-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("blobs")).unwrap();
+        let root_string = root.to_string_lossy();
+        let core = OpenDalBlobStoreCore {
+            operator: Operator::new(services::Fs::default().root(&root_string)).unwrap(),
+            root: None,
+            operation_timeout: Some(REMOTE_OPERATION_TIMEOUT),
+            remote_lock_pool: None,
+        };
+        let key = AssetBlobKey::for_blob_id(Uuid::new_v4());
+        let value = blob();
+        core.write_ftp_metadata(&key, &value).await.unwrap();
+        core.operator
+            .write(key.as_str(), value.bytes()[..5].to_vec())
+            .await
+            .unwrap();
+
+        assert!(core.read(&key).await.unwrap().is_none());
+        let metadata = core.stat(&key).await.unwrap().unwrap();
+        assert!(!metadata.is_present());
+        assert_eq!(metadata.stored_byte_size(), Some(5));
+
+        core.put_ftp_under_lock_inner(&key, &value).await.unwrap();
+
+        assert_eq!(core.read(&key).await.unwrap(), Some(value));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn ftp_exact_body_repairs_missing_metadata() {
+        let root = std::env::temp_dir().join(format!("werrss-opendal-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("blobs")).unwrap();
+        let root_string = root.to_string_lossy();
+        let core = OpenDalBlobStoreCore {
+            operator: Operator::new(services::Fs::default().root(&root_string)).unwrap(),
+            root: None,
+            operation_timeout: Some(REMOTE_OPERATION_TIMEOUT),
+            remote_lock_pool: None,
+        };
+        let key = AssetBlobKey::for_blob_id(Uuid::new_v4());
+        let value = blob();
+        core.operator
+            .write(key.as_str(), value.bytes().to_vec())
+            .await
+            .unwrap();
+
+        let result = core.put_ftp_under_lock_inner(&key, &value).await;
+
+        assert_eq!(result, Ok(()));
+        assert_eq!(
+            core.read_body(&key).await.unwrap(),
+            Some(value.bytes().to_vec())
+        );
+        let metadata = core
+            .read_object_bytes(&OpenDalBlobStoreCore::metadata_key(&key))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            parse_ftp_metadata(&metadata).unwrap().checksum,
+            value.checksum()
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn ftp_retry_preserves_a_prefix_body_without_matching_metadata() {
+        let root = std::env::temp_dir().join(format!("werrss-opendal-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("blobs")).unwrap();
+        let root_string = root.to_string_lossy();
+        let core = OpenDalBlobStoreCore {
+            operator: Operator::new(services::Fs::default().root(&root_string)).unwrap(),
+            root: None,
+            operation_timeout: Some(REMOTE_OPERATION_TIMEOUT),
+            remote_lock_pool: None,
+        };
+        let key = AssetBlobKey::for_blob_id(Uuid::new_v4());
+        let requested = AssetBlob::new(
+            b"abc".to_vec(),
+            "image/png".to_owned(),
+            format!("{:x}", Sha256::digest(b"abc")),
+        )
+        .unwrap();
+        core.operator
+            .write(key.as_str(), b"ab".to_vec())
+            .await
+            .unwrap();
+
+        let result = core.put_ftp_under_lock_inner(&key, &requested).await;
+
+        assert_eq!(result, Err(AssetBlobStoreError::Conflict));
+        assert_eq!(core.read_body(&key).await.unwrap(), Some(b"ab".to_vec()));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn locked_write_preserves_conflicting_body_without_metadata() {
+        let operator = Operator::new(services::Memory::default()).unwrap();
+        let core = OpenDalBlobStoreCore {
+            operator,
+            root: None,
+            operation_timeout: Some(REMOTE_OPERATION_TIMEOUT),
+            remote_lock_pool: None,
+        };
+        let key = AssetBlobKey::for_blob_id(Uuid::new_v4());
+        let original = blob();
+        core.operator
+            .write(key.as_str(), original.bytes().to_vec())
+            .await
+            .unwrap();
+
+        let result = core.put_under_lock_inner(&key, &other_blob(), true).await;
+
+        assert_eq!(result, Err(AssetBlobStoreError::Conflict));
+        assert_eq!(
+            core.operator.read(key.as_str()).await.unwrap().to_vec(),
+            original.bytes()
+        );
+    }
+
+    #[tokio::test]
+    async fn locked_write_preserves_conflicting_metadata_without_body() {
+        let operator = Operator::new(services::Memory::default()).unwrap();
+        let core = OpenDalBlobStoreCore {
+            operator,
+            root: None,
+            operation_timeout: Some(REMOTE_OPERATION_TIMEOUT),
+            remote_lock_pool: None,
+        };
+        let key = AssetBlobKey::for_blob_id(Uuid::new_v4());
+        let original = blob();
+        let metadata = StoredMetadata {
+            checksum: original.checksum().to_owned(),
+            media_type: original.media_type().to_owned(),
+            byte_size: original.byte_size(),
+        };
+        let metadata_key = OpenDalBlobStoreCore::metadata_key(&key);
+        let metadata_bytes = serde_json::to_vec(&metadata).unwrap();
+        core.operator
+            .write(&metadata_key, metadata_bytes.clone())
+            .await
+            .unwrap();
+
+        let result = core.put_under_lock_inner(&key, &other_blob(), true).await;
+
+        assert_eq!(result, Err(AssetBlobStoreError::Conflict));
+        assert!(core.read_body(&key).await.unwrap().is_none());
+        assert_eq!(
+            core.operator.read(&metadata_key).await.unwrap().to_vec(),
+            metadata_bytes
+        );
+    }
+
+    #[tokio::test]
+    async fn locked_write_restores_matching_blob_when_body_is_missing() {
+        let operator = Operator::new(services::Memory::default()).unwrap();
+        let core = OpenDalBlobStoreCore {
+            operator,
+            root: None,
+            operation_timeout: Some(REMOTE_OPERATION_TIMEOUT),
+            remote_lock_pool: None,
+        };
+        let key = AssetBlobKey::for_blob_id(Uuid::new_v4());
+        let value = blob();
+        let metadata = StoredMetadata {
+            checksum: value.checksum().to_owned(),
+            media_type: value.media_type().to_owned(),
+            byte_size: value.byte_size(),
+        };
+        core.operator
+            .write(
+                &OpenDalBlobStoreCore::metadata_key(&key),
+                serde_json::to_vec(&metadata).unwrap(),
+            )
+            .await
+            .unwrap();
+
+        core.put_under_lock_inner(&key, &value, true).await.unwrap();
+
+        assert_eq!(core.read(&key).await.unwrap(), Some(value));
+    }
+
+    #[tokio::test]
+    async fn locked_write_recovers_matching_body_without_metadata() {
+        let operator = Operator::new(services::Memory::default()).unwrap();
+        let core = OpenDalBlobStoreCore {
+            operator,
+            root: None,
+            operation_timeout: Some(REMOTE_OPERATION_TIMEOUT),
+            remote_lock_pool: None,
+        };
+        let key = AssetBlobKey::for_blob_id(Uuid::new_v4());
+        let value = blob();
+        core.operator
+            .write(key.as_str(), value.bytes().to_vec())
+            .await
+            .unwrap();
+
+        core.put_under_lock_inner(&key, &value, true).await.unwrap();
+
+        assert_eq!(core.read(&key).await.unwrap(), Some(value));
+    }
+
+    #[tokio::test]
+    async fn non_conditional_backend_requires_a_coordination_pool() {
+        let operator = Operator::new(services::Memory::default()).unwrap().layer(
+            opendal::layers::CapabilityOverrideLayer::new(|mut capability| {
+                capability.write_with_if_not_exists = false;
+                capability
+            }),
+        );
+        let core = OpenDalBlobStoreCore {
+            operator,
+            root: None,
+            operation_timeout: Some(REMOTE_OPERATION_TIMEOUT),
+            remote_lock_pool: None,
+        };
+        let key = AssetBlobKey::for_blob_id(Uuid::new_v4());
+
+        let result = core.put(&key, &blob()).await;
+
+        assert!(
+            matches!(result, Err(AssetBlobStoreError::Backend(message)) if message.contains("coordination pool"))
+        );
+        assert!(core.read_body(&key).await.unwrap().is_none());
+    }
+
     static AWS_ENDPOINT_ENV_LOCK: TokioMutex<()> = TokioMutex::const_new(());
     const AWS_ENDPOINT_ENV_NAMES: [&str; 3] =
         ["AWS_ENDPOINT_URL", "AWS_ENDPOINT", "AWS_S3_ENDPOINT"];
@@ -805,6 +1583,7 @@ mod tests {
             operator: filesystem_store.core.operator.clone(),
             root: None,
             operation_timeout: Some(std::time::Duration::from_millis(10)),
+            remote_lock_pool: None,
         };
 
         let result = core
@@ -839,6 +1618,7 @@ mod tests {
             operator: store.core.operator.clone(),
             root: None,
             operation_timeout: Some(std::time::Duration::from_millis(10)),
+            remote_lock_pool: None,
         };
         let result = core
             .run_backend_operation(std::future::pending::<Result<(), opendal::Error>>())
@@ -862,6 +1642,7 @@ mod tests {
             operator: store.core.operator.clone(),
             root: None,
             operation_timeout: Some(std::time::Duration::from_millis(10)),
+            remote_lock_pool: None,
         };
         let result = core
             .run_backend_operation(std::future::pending::<Result<(), opendal::Error>>())
@@ -886,6 +1667,7 @@ mod tests {
             operator: store.core.operator.clone(),
             root: None,
             operation_timeout: Some(std::time::Duration::from_millis(10)),
+            remote_lock_pool: None,
         };
         let result = core
             .run_backend_operation(std::future::pending::<Result<(), opendal::Error>>())
@@ -1957,6 +2739,196 @@ mod tests {
 
         server.abort();
         let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn ftp_backend_operations_have_a_bounded_timeout() {
+        let pool = PgPool::connect_lazy("postgres://unused").expect("valid lazy URL");
+        let store =
+            OpenDalFtpBlobStore::new(pool, "ftp://127.0.0.1:2121", None, None, None).unwrap();
+
+        assert_eq!(store.core.operation_timeout, Some(REMOTE_OPERATION_TIMEOUT));
+    }
+
+    #[tokio::test]
+    async fn ftp_backend_accepts_case_insensitive_schemes() {
+        let pool = PgPool::connect_lazy("postgres://unused").expect("valid lazy URL");
+        let ftp = OpenDalFtpBlobStore::new(pool.clone(), "FTP://127.0.0.1:2121", None, None, None);
+        let ftps = OpenDalFtpBlobStore::new(pool, "FTPS://127.0.0.1:2121", None, None, None);
+
+        assert!(ftp.is_ok());
+        assert!(ftps.is_ok());
+    }
+
+    #[tokio::test]
+    async fn ftp_lock_pool_is_independent_and_has_bounded_acquisition() {
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(Duration::from_secs(60))
+            .connect_lazy("postgres://unused")
+            .expect("valid lazy URL");
+        let store =
+            OpenDalFtpBlobStore::new(pool.clone(), "ftp://127.0.0.1:2121", None, None, None)
+                .unwrap();
+        let lock_pool = store.core.remote_lock_pool.as_ref().unwrap();
+
+        assert_eq!(lock_pool.options().get_max_connections(), 1);
+        assert_eq!(
+            lock_pool.options().get_acquire_timeout(),
+            REMOTE_OPERATION_TIMEOUT
+        );
+        assert!(!Arc::ptr_eq(
+            &pool.connect_options(),
+            &lock_pool.connect_options()
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_write_cleans_body_when_metadata_write_fails() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!("werrss-opendal-{}", Uuid::new_v4()));
+        let key = AssetBlobKey::for_blob_id(Uuid::new_v4());
+        let metadata_path = root.join(OpenDalBlobStoreCore::metadata_key(&key));
+        std::fs::create_dir_all(root.join("blobs")).unwrap();
+        symlink(root.join("missing-metadata-target"), &metadata_path).unwrap();
+        let root_string = root.to_string_lossy();
+        let operator = Operator::new(services::Fs::default().root(&root_string)).unwrap();
+        let core = OpenDalBlobStoreCore {
+            operator,
+            root: Some(root.clone()),
+            operation_timeout: None,
+            remote_lock_pool: None,
+        };
+
+        let result = core.put_with_conditional_write(&key, &blob()).await;
+
+        assert!(result.is_err());
+        assert!(!root.join(key.as_str()).exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn ftp_retry_preserves_a_valid_conflicting_sidecar() {
+        let root = std::env::temp_dir().join(format!("werrss-opendal-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("blobs")).unwrap();
+        let root_string = root.to_string_lossy();
+        let core = OpenDalBlobStoreCore {
+            operator: Operator::new(services::Fs::default().root(&root_string)).unwrap(),
+            root: None,
+            operation_timeout: Some(REMOTE_OPERATION_TIMEOUT),
+            remote_lock_pool: None,
+        };
+        let key = AssetBlobKey::for_blob_id(Uuid::new_v4());
+        let original = blob();
+        let metadata = StoredMetadata {
+            checksum: original.checksum().to_owned(),
+            media_type: original.media_type().to_owned(),
+            byte_size: original.byte_size(),
+        };
+        let mut sidecar = serde_json::to_vec(&metadata).unwrap();
+        sidecar.push(b'\n');
+        core.operator
+            .write(key.as_str(), original.bytes().to_vec())
+            .await
+            .unwrap();
+        let metadata_key = OpenDalBlobStoreCore::metadata_key(&key);
+        core.operator
+            .write(&metadata_key, sidecar.clone())
+            .await
+            .unwrap();
+
+        let result = core.put_ftp_under_lock_inner(&key, &other_blob()).await;
+
+        assert_eq!(result, Err(AssetBlobStoreError::Conflict));
+        assert_eq!(
+            core.read_body(&key).await.unwrap(),
+            Some(original.bytes().to_vec())
+        );
+        assert_eq!(
+            core.read_object_bytes(&metadata_key).await.unwrap(),
+            Some(sidecar)
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn ftp_metadata_parser_accepts_legacy_single_record_sidecars() {
+        let parsed = parse_ftp_metadata(
+            b"{\"checksum\":\"valid\",\"media_type\":\"image/png\",\"byte_size\":10}",
+        )
+        .unwrap();
+
+        assert_eq!(parsed.checksum, "valid");
+        assert_eq!(parsed.media_type, "image/png");
+        assert_eq!(parsed.byte_size, 10);
+    }
+
+    #[test]
+    fn ftp_metadata_parser_recovers_last_complete_sidecar_record() {
+        let parsed = parse_ftp_metadata(
+            b"\n{\"checksum\":\"valid\",\"media_type\":\"image/png\",\"byte_size\":10}\n{\"checksum\":\"partial",
+        )
+        .unwrap();
+
+        assert_eq!(parsed.checksum, "valid");
+        assert_eq!(parsed.media_type, "image/png");
+        assert_eq!(parsed.byte_size, 10);
+    }
+
+    #[test]
+    fn sftp_endpoint_uses_ssh_uri_syntax_for_openssh() {
+        assert_eq!(
+            sftp_ssh_destination("sftp://sftp.example.test:2222"),
+            "ssh://sftp.example.test:2222"
+        );
+        assert_eq!(
+            sftp_ssh_destination("SFTP://sftp.example.test:2222"),
+            "ssh://sftp.example.test:2222"
+        );
+    }
+
+    #[tokio::test]
+    async fn ftp_write_replaces_existing_object() {
+        let root = std::env::temp_dir().join(format!("werrss-opendal-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let root_string = root.to_string_lossy();
+        let operator = Operator::new(services::Fs::default().root(&root_string)).unwrap();
+        let core = OpenDalBlobStoreCore {
+            operator,
+            root: None,
+            operation_timeout: Some(REMOTE_OPERATION_TIMEOUT),
+            remote_lock_pool: None,
+        };
+
+        core.write_object("asset", b"first".to_vec(), false)
+            .await
+            .unwrap();
+        core.write_object("asset", b"second".to_vec(), false)
+            .await
+            .unwrap();
+
+        assert_eq!(std::fs::read(root.join("asset")).unwrap(), b"second");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn sftp_backend_operations_have_a_bounded_timeout() {
+        let store =
+            OpenDalSftpBlobStore::new("sftp://127.0.0.1:2222", None, "werrss", "/etc/hosts")
+                .unwrap();
+        assert_eq!(store.core.operation_timeout, Some(REMOTE_OPERATION_TIMEOUT));
+    }
+
+    #[tokio::test]
+    async fn webdav_backend_operations_have_a_bounded_timeout() {
+        let pool = PgPool::connect_lazy("postgres://unused").expect("valid lazy URL");
+        let store =
+            OpenDalWebdavBlobStore::new(pool, "http://127.0.0.1:8080/dav", None, None, None)
+                .unwrap();
+        assert_eq!(store.core.operation_timeout, Some(REMOTE_OPERATION_TIMEOUT));
+        assert!(store.core.remote_lock_pool.is_some());
     }
 
     #[test]

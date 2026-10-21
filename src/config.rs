@@ -32,15 +32,8 @@
 //! ASSET_ARCHIVE_BACKEND / ASSET_LOCAL_ROOT / ASSET_CACHE_MAX_SIZE_MB /
 //! ASSET_S3_BUCKET / ASSET_S3_ENDPOINT / ASSET_S3_REGION /
 //! ASSET_S3_ACCESS_KEY_ID / ASSET_S3_SECRET_ACCESS_KEY /
-//! ASSET_OSS_BUCKET / ASSET_OSS_ENDPOINT / ASSET_OSS_ADDRESSING_STYLE /
-//! ASSET_OSS_VERSIONING /
-//! ASSET_OSS_ACCESS_KEY_ID / ASSET_OSS_ACCESS_KEY_SECRET /
-//! ASSET_OSS_SECURITY_TOKEN / ASSET_OSS_SKIP_SIGNATURE /
-//! ASSET_GCS_BUCKET / ASSET_GCS_ENDPOINT / ASSET_GCS_CREDENTIAL /
-//! ASSET_GCS_SKIP_SIGNATURE /
-//! ASSET_AZURE_CONTAINER / ASSET_AZURE_ENDPOINT /
-//! ASSET_AZURE_ACCOUNT_NAME / ASSET_AZURE_ACCOUNT_KEY /
-//! ASSET_AZURE_SKIP_SIGNATURE /
+//! ASSET_OSS_* / ASSET_GCS_* / ASSET_AZURE_* /
+//! ASSET_FTP_* / ASSET_SFTP_* / ASSET_WEBDAV_* /
 //! ASSET_CACHE_MAX_AGE_DAYS / ASSET_MAX_SIZE_MB /
 //! ASSET_USE_ABSOLUTE_URLS /
 //! ASSET_MAX_COUNT_PER_ARTICLE / ASSET_MAX_FETCH_BYTES_PER_ARTICLE_MB /
@@ -188,6 +181,18 @@ const KNOWN_ENVIRONMENT_VARIABLES: &[&str] = &[
     "ASSET_AZURE_ACCOUNT_NAME",
     "ASSET_AZURE_ACCOUNT_KEY",
     "ASSET_AZURE_SKIP_SIGNATURE",
+    "ASSET_FTP_ENDPOINT",
+    "ASSET_FTP_ROOT",
+    "ASSET_FTP_USER",
+    "ASSET_FTP_PASSWORD",
+    "ASSET_SFTP_ENDPOINT",
+    "ASSET_SFTP_ROOT",
+    "ASSET_SFTP_USER",
+    "ASSET_SFTP_KEY",
+    "ASSET_WEBDAV_ENDPOINT",
+    "ASSET_WEBDAV_ROOT",
+    "ASSET_WEBDAV_USER",
+    "ASSET_WEBDAV_PASSWORD",
     "ASSET_CACHE_MAX_SIZE_MB",
     "ASSET_CACHE_MAX_AGE_DAYS",
     "ASSET_USE_ABSOLUTE_URLS",
@@ -366,6 +371,33 @@ pub enum AssetArchiveConfig {
     Azure {
         /// Azure Blob connection settings.
         storage: AssetAzureConfig,
+        /// Limits applied to acquisition, storage, and maintenance.
+        policy: AssetCachePolicy,
+        /// Cluster-wide admission and retry limits for public cache misses.
+        repair_policy: AssetRepairPolicy,
+    },
+    /// Store binary assets through an FTP server.
+    Ftp {
+        /// FTP connection settings.
+        storage: AssetFtpConfig,
+        /// Limits applied to acquisition, storage, and maintenance.
+        policy: AssetCachePolicy,
+        /// Cluster-wide admission and retry limits for public cache misses.
+        repair_policy: AssetRepairPolicy,
+    },
+    /// Store binary assets through an SFTP server.
+    Sftp {
+        /// SFTP connection settings.
+        storage: AssetSftpConfig,
+        /// Limits applied to acquisition, storage, and maintenance.
+        policy: AssetCachePolicy,
+        /// Cluster-wide admission and retry limits for public cache misses.
+        repair_policy: AssetRepairPolicy,
+    },
+    /// Store binary assets through a WebDAV server.
+    Webdav {
+        /// WebDAV connection settings.
+        storage: AssetWebdavConfig,
         /// Limits applied to acquisition, storage, and maintenance.
         policy: AssetCachePolicy,
         /// Cluster-wide admission and retry limits for public cache misses.
@@ -684,7 +716,197 @@ impl AssetAzureConfig {
     }
 }
 
+/// Endpoint and optional credentials for an FTP asset backend.
+#[derive(Clone)]
+pub struct AssetFtpConfig {
+    endpoint: String,
+    root: Option<String>,
+    user: Option<SecretString>,
+    password: Option<SecretString>,
+}
+impl PartialEq for AssetFtpConfig {
+    fn eq(&self, other: &Self) -> bool {
+        self.endpoint == other.endpoint
+            && self.root == other.root
+            && self.user.as_ref().map(secrecy::ExposeSecret::expose_secret)
+                == other
+                    .user
+                    .as_ref()
+                    .map(secrecy::ExposeSecret::expose_secret)
+            && self
+                .password
+                .as_ref()
+                .map(secrecy::ExposeSecret::expose_secret)
+                == other
+                    .password
+                    .as_ref()
+                    .map(secrecy::ExposeSecret::expose_secret)
+    }
+}
+impl Eq for AssetFtpConfig {}
+
+impl std::fmt::Debug for AssetFtpConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AssetFtpConfig")
+            .field("endpoint", &"<redacted>")
+            .field("root", &"<redacted>")
+            .field("user", &"<redacted>")
+            .field("password", &"<redacted>")
+            .finish()
+    }
+}
+impl AssetFtpConfig {
+    /// Returns the FTP or FTPS endpoint.
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+    /// Returns the optional remote root.
+    pub fn root(&self) -> Option<&str> {
+        self.root.as_deref()
+    }
+    /// Returns the optional FTP username.
+    pub fn user(&self) -> Option<&str> {
+        self.user.as_ref().map(secrecy::ExposeSecret::expose_secret)
+    }
+    /// Returns the optional FTP password.
+    pub fn password(&self) -> Option<&str> {
+        self.password
+            .as_ref()
+            .map(secrecy::ExposeSecret::expose_secret)
+    }
+}
+
+/// Endpoint and private-key settings for an SFTP asset backend.
+#[derive(Clone)]
+pub struct AssetSftpConfig {
+    endpoint: String,
+    root: Option<String>,
+    user: SecretString,
+    key: SecretString,
+}
+impl PartialEq for AssetSftpConfig {
+    fn eq(&self, other: &Self) -> bool {
+        self.endpoint == other.endpoint
+            && self.root == other.root
+            && secrecy::ExposeSecret::expose_secret(&self.user)
+                == secrecy::ExposeSecret::expose_secret(&other.user)
+            && secrecy::ExposeSecret::expose_secret(&self.key)
+                == secrecy::ExposeSecret::expose_secret(&other.key)
+    }
+}
+impl Eq for AssetSftpConfig {}
+impl std::fmt::Debug for AssetSftpConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AssetSftpConfig")
+            .field("endpoint", &"<redacted>")
+            .field("root", &"<redacted>")
+            .field("user", &"<redacted>")
+            .field("key", &"<redacted>")
+            .finish()
+    }
+}
+impl AssetSftpConfig {
+    /// Returns the SFTP endpoint.
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+    /// Returns the optional remote root.
+    pub fn root(&self) -> Option<&str> {
+        self.root.as_deref()
+    }
+    /// Returns the required SSH username.
+    pub fn user(&self) -> &str {
+        secrecy::ExposeSecret::expose_secret(&self.user)
+    }
+    /// Returns the mounted private-key file path.
+    pub fn key(&self) -> &str {
+        secrecy::ExposeSecret::expose_secret(&self.key)
+    }
+}
+
+/// Endpoint and optional credentials for a WebDAV asset backend.
+#[derive(Clone)]
+pub struct AssetWebdavConfig {
+    endpoint: String,
+    root: Option<String>,
+    user: Option<SecretString>,
+    password: Option<SecretString>,
+}
+impl PartialEq for AssetWebdavConfig {
+    fn eq(&self, other: &Self) -> bool {
+        self.endpoint == other.endpoint
+            && self.root == other.root
+            && self.user.as_ref().map(secrecy::ExposeSecret::expose_secret)
+                == other
+                    .user
+                    .as_ref()
+                    .map(secrecy::ExposeSecret::expose_secret)
+            && self
+                .password
+                .as_ref()
+                .map(secrecy::ExposeSecret::expose_secret)
+                == other
+                    .password
+                    .as_ref()
+                    .map(secrecy::ExposeSecret::expose_secret)
+    }
+}
+impl Eq for AssetWebdavConfig {}
+impl std::fmt::Debug for AssetWebdavConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AssetWebdavConfig")
+            .field("endpoint", &"<redacted>")
+            .field("root", &"<redacted>")
+            .field("user", &"<redacted>")
+            .field("password", &"<redacted>")
+            .finish()
+    }
+}
+impl AssetWebdavConfig {
+    /// Returns the HTTP or HTTPS WebDAV endpoint.
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+    /// Returns the optional remote root.
+    pub fn root(&self) -> Option<&str> {
+        self.root.as_deref()
+    }
+    /// Returns the optional WebDAV username.
+    pub fn user(&self) -> Option<&str> {
+        self.user.as_ref().map(secrecy::ExposeSecret::expose_secret)
+    }
+    pub fn password(&self) -> Option<&str> {
+        self.password
+            .as_ref()
+            .map(secrecy::ExposeSecret::expose_secret)
+    }
+}
+
 impl AssetArchiveConfig {
+    /// Returns the FTP settings when FTP storage is enabled.
+    pub fn ftp_storage(&self) -> Option<&AssetFtpConfig> {
+        match self {
+            Self::Ftp { storage, .. } => Some(storage),
+            _ => None,
+        }
+    }
+
+    /// Returns the SFTP settings when SFTP storage is enabled.
+    pub fn sftp_storage(&self) -> Option<&AssetSftpConfig> {
+        match self {
+            Self::Sftp { storage, .. } => Some(storage),
+            _ => None,
+        }
+    }
+
+    /// Returns the WebDAV settings when WebDAV storage is enabled.
+    pub fn webdav_storage(&self) -> Option<&AssetWebdavConfig> {
+        match self {
+            Self::Webdav { storage, .. } => Some(storage),
+            _ => None,
+        }
+    }
+
     /// Returns the database policy when binary caching is enabled.
     pub const fn database_policy(&self) -> Option<AssetCachePolicy> {
         match self {
@@ -694,7 +916,10 @@ impl AssetArchiveConfig {
             | Self::S3 { policy, .. }
             | Self::Oss { policy, .. }
             | Self::Gcs { policy, .. }
-            | Self::Azure { policy, .. } => Some(*policy),
+            | Self::Azure { policy, .. }
+            | Self::Ftp { policy, .. }
+            | Self::Sftp { policy, .. }
+            | Self::Webdav { policy, .. } => Some(*policy),
         }
     }
 
@@ -707,7 +932,10 @@ impl AssetArchiveConfig {
             | Self::S3 { repair_policy, .. }
             | Self::Oss { repair_policy, .. }
             | Self::Gcs { repair_policy, .. }
-            | Self::Azure { repair_policy, .. } => Some(*repair_policy),
+            | Self::Azure { repair_policy, .. }
+            | Self::Ftp { repair_policy, .. }
+            | Self::Sftp { repair_policy, .. }
+            | Self::Webdav { repair_policy, .. } => Some(*repair_policy),
         }
     }
 
@@ -1123,6 +1351,9 @@ impl AppConfig {
                     | AssetArchiveConfig::Oss { .. }
                     | AssetArchiveConfig::Gcs { .. }
                     | AssetArchiveConfig::Azure { .. }
+                    | AssetArchiveConfig::Ftp { .. }
+                    | AssetArchiveConfig::Sftp { .. }
+                    | AssetArchiveConfig::Webdav { .. }
             )
             && server_root_url.is_none()
         {
@@ -1358,6 +1589,18 @@ struct RawConfig {
     asset_azure_account_name: Option<String>,
     asset_azure_account_key: Option<String>,
     asset_azure_skip_signature: Option<String>,
+    asset_ftp_endpoint: Option<String>,
+    asset_ftp_root: Option<String>,
+    asset_ftp_user: Option<String>,
+    asset_ftp_password: Option<String>,
+    asset_sftp_endpoint: Option<String>,
+    asset_sftp_root: Option<String>,
+    asset_sftp_user: Option<String>,
+    asset_sftp_key: Option<String>,
+    asset_webdav_endpoint: Option<String>,
+    asset_webdav_root: Option<String>,
+    asset_webdav_user: Option<String>,
+    asset_webdav_password: Option<String>,
     asset_cache_max_size_mb: Option<u64>,
     asset_cache_max_age_days: Option<u64>,
     asset_use_absolute_urls: Option<String>,
@@ -1807,11 +2050,145 @@ fn asset_archive_config(raw: &RawConfig) -> Result<AssetArchiveConfig, ConfigErr
                 repair_policy: asset_repair_policy(raw)?,
             })
         }
+        "ftp" => {
+            let endpoint = protocol_endpoint(
+                raw.asset_ftp_endpoint.clone(),
+                "ASSET_FTP_ENDPOINT",
+                &["ftp", "ftps"],
+                true,
+                true,
+            )?;
+            let root = optional_non_empty(raw.asset_ftp_root.clone());
+            let user = optional_secret(raw.asset_ftp_user.clone());
+            let password = optional_secret(raw.asset_ftp_password.clone());
+            if user.is_some() != password.is_some() {
+                return Err(ConfigError::InvalidValue {
+                    variable: if user.is_some() { "ASSET_FTP_PASSWORD" } else { "ASSET_FTP_USER" },
+                    reason: "FTP user and password must be configured together",
+                });
+            }
+            Ok(AssetArchiveConfig::Ftp {
+                storage: AssetFtpConfig {
+                    endpoint,
+                    root,
+                    user: user.map(|value| SecretString::new(value.into_boxed_str())),
+                    password: password.map(|value| SecretString::new(value.into_boxed_str())),
+                },
+                policy,
+                repair_policy: asset_repair_policy(raw)?,
+            })
+        }
+        "sftp" => {
+            let endpoint = protocol_endpoint(
+                raw.asset_sftp_endpoint.clone(),
+                "ASSET_SFTP_ENDPOINT",
+                &["sftp"],
+                true,
+                true,
+            )?;
+            let user = required(raw.asset_sftp_user.clone(), "ASSET_SFTP_USER")?;
+            if user.trim().is_empty() {
+                return Err(ConfigError::Missing {
+                    variable: "ASSET_SFTP_USER",
+                });
+            }
+            let key = required(raw.asset_sftp_key.clone(), "ASSET_SFTP_KEY")?;
+            let key = key.trim().to_owned();
+            if !std::path::Path::new(&key).is_absolute() {
+                return Err(ConfigError::InvalidValue {
+                    variable: "ASSET_SFTP_KEY",
+                    reason: "must be an absolute path to a mounted private-key file",
+                });
+            }
+            Ok(AssetArchiveConfig::Sftp {
+                storage: AssetSftpConfig {
+                    endpoint,
+                    root: optional_non_empty(raw.asset_sftp_root.clone()),
+                    user: SecretString::new(user.into_boxed_str()),
+                    key: SecretString::new(key.into_boxed_str()),
+                },
+                policy,
+                repair_policy: asset_repair_policy(raw)?,
+            })
+        }
+        "webdav" => {
+            let endpoint = protocol_endpoint(
+                raw.asset_webdav_endpoint.clone(),
+                "ASSET_WEBDAV_ENDPOINT",
+                &["http", "https"],
+                false,
+                true,
+            )?;
+            let root = optional_non_empty(raw.asset_webdav_root.clone());
+            let user = optional_secret(raw.asset_webdav_user.clone());
+            let password = optional_secret(raw.asset_webdav_password.clone());
+            if user.is_some() != password.is_some() {
+                return Err(ConfigError::InvalidValue {
+                    variable: if user.is_some() { "ASSET_WEBDAV_PASSWORD" } else { "ASSET_WEBDAV_USER" },
+                    reason: "WebDAV user and password must be configured together",
+                });
+            }
+            Ok(AssetArchiveConfig::Webdav {
+                storage: AssetWebdavConfig {
+                    endpoint,
+                    root,
+                    user: user.map(|value| SecretString::new(value.into_boxed_str())),
+                    password: password.map(|value| SecretString::new(value.into_boxed_str())),
+                },
+                policy,
+                repair_policy: asset_repair_policy(raw)?,
+            })
+        }
         _ => Err(ConfigError::InvalidValue {
             variable: "ASSET_ARCHIVE_BACKEND",
-            reason: "expected disabled, database, local, s3, oss, gcs, or azure (postgres and azblob are aliases)",
+            reason: "expected disabled, database, local, s3, oss, gcs, azure, ftp, sftp, or webdav (postgres and azblob are aliases)",
         }),
     }
+}
+
+fn optional_non_empty(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+fn optional_secret(value: Option<String>) -> Option<String> {
+    value.filter(|value| !value.trim().is_empty())
+}
+
+fn protocol_endpoint(
+    value: Option<String>,
+    variable: &'static str,
+    schemes: &[&str],
+    forbid_path: bool,
+    forbid_query: bool,
+) -> Result<String, ConfigError> {
+    let endpoint = required(value, variable)?.trim().to_owned();
+    let parsed = Url::parse(&endpoint).map_err(|_| ConfigError::InvalidValue {
+        variable,
+        reason: "expected an absolute URL using the required protocol",
+    })?;
+    let authority_has_userinfo = endpoint.split_once("://").is_some_and(|(_, authority)| {
+        authority
+            .split(['/', '?', '#'])
+            .next()
+            .is_some_and(|host| host.contains('@'))
+    });
+    if !schemes.contains(&parsed.scheme())
+        || parsed.host_str().is_none()
+        || authority_has_userinfo
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.fragment().is_some()
+        || (forbid_path && !matches!(parsed.path(), "" | "/"))
+        || (forbid_query && parsed.query().is_some())
+    {
+        return Err(ConfigError::InvalidValue {
+            variable,
+            reason: "endpoint has an unsupported protocol or contains credentials, path, query, or fragment",
+        });
+    }
+    Ok(endpoint.trim_end_matches('/').to_owned())
 }
 
 fn asset_repair_policy(raw: &RawConfig) -> Result<AssetRepairPolicy, ConfigError> {
@@ -2416,15 +2793,13 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unimplemented_asset_backends() {
-        let mut environment = valid_environment();
-        environment.push(("ASSET_ARCHIVE_BACKEND".to_owned(), "ftp".to_owned()));
+    fn ftp_asset_mode_requires_an_endpoint() {
+        let environment = replace_environment(valid_environment(), "ASSET_ARCHIVE_BACKEND", "ftp");
 
         assert!(matches!(
             AppConfig::from_env_iter(environment),
-            Err(ConfigError::InvalidValue {
-                variable: "ASSET_ARCHIVE_BACKEND",
-                ..
+            Err(ConfigError::Missing {
+                variable: "ASSET_FTP_ENDPOINT"
             })
         ));
     }
@@ -3197,6 +3572,418 @@ mod tests {
         let storage = config.asset_archive.gcs_storage().unwrap();
         assert_eq!(storage.credential(), None);
         assert!(storage.skip_signature());
+    }
+
+    #[test]
+    fn parses_ftp_asset_mode_and_redacts_connection_details() {
+        let mut environment =
+            replace_environment(valid_environment(), "ASSET_ARCHIVE_BACKEND", "ftp");
+        environment.extend([
+            (
+                "SERVER_ROOT_URL".to_owned(),
+                "https://rss.example.test".to_owned(),
+            ),
+            (
+                "ASSET_FTP_ENDPOINT".to_owned(),
+                " ftps://ftp.example.test/ ".to_owned(),
+            ),
+            ("ASSET_FTP_ROOT".to_owned(), "/assets".to_owned()),
+            ("ASSET_FTP_USER".to_owned(), "ftp-user-secret".to_owned()),
+            (
+                "ASSET_FTP_PASSWORD".to_owned(),
+                " ftp-password-secret ".to_owned(),
+            ),
+        ]);
+
+        let config = AppConfig::from_env_iter(environment).unwrap();
+        let storage = config.asset_archive.ftp_storage().unwrap();
+        let debug = format!("{storage:?}");
+        assert_eq!(storage.endpoint(), "ftps://ftp.example.test");
+        assert_eq!(storage.root(), Some("/assets"));
+        assert_eq!(storage.user(), Some("ftp-user-secret"));
+        assert_eq!(storage.password(), Some(" ftp-password-secret "));
+        assert!(!debug.contains("ftp.example.test"));
+        assert!(!debug.contains("ftp-user-secret"));
+        assert!(!debug.contains("ftp-password-secret"));
+    }
+
+    #[test]
+    fn parses_sftp_asset_mode_and_redacts_connection_details() {
+        let mut environment =
+            replace_environment(valid_environment(), "ASSET_ARCHIVE_BACKEND", "sftp");
+        environment.extend([
+            (
+                "SERVER_ROOT_URL".to_owned(),
+                "https://rss.example.test".to_owned(),
+            ),
+            (
+                "ASSET_SFTP_ENDPOINT".to_owned(),
+                "sftp://sftp.example.test:2222".to_owned(),
+            ),
+            ("ASSET_SFTP_ROOT".to_owned(), "/assets".to_owned()),
+            ("ASSET_SFTP_USER".to_owned(), "sftp-user".to_owned()),
+            (
+                "ASSET_SFTP_KEY".to_owned(),
+                "/run/secrets/ssh_key".to_owned(),
+            ),
+        ]);
+
+        let config = AppConfig::from_env_iter(environment).unwrap();
+        let storage = config.asset_archive.sftp_storage().unwrap();
+        let debug = format!("{storage:?}");
+        assert_eq!(storage.endpoint(), "sftp://sftp.example.test:2222");
+        assert_eq!(storage.root(), Some("/assets"));
+        assert_eq!(storage.user(), "sftp-user");
+        assert_eq!(storage.key(), "/run/secrets/ssh_key");
+        assert!(!debug.contains("sftp.example.test"));
+        assert!(!debug.contains("sftp-user"));
+        assert!(!debug.contains("/run/secrets/ssh_key"));
+    }
+
+    #[test]
+    fn parses_webdav_asset_mode_with_mount_path_and_redacts_credentials() {
+        let mut environment =
+            replace_environment(valid_environment(), "ASSET_ARCHIVE_BACKEND", "webdav");
+        environment.extend([
+            (
+                "SERVER_ROOT_URL".to_owned(),
+                "https://rss.example.test".to_owned(),
+            ),
+            (
+                "ASSET_WEBDAV_ENDPOINT".to_owned(),
+                "https://dav.example.test/remote.php/dav/files".to_owned(),
+            ),
+            ("ASSET_WEBDAV_ROOT".to_owned(), "/assets".to_owned()),
+            ("ASSET_WEBDAV_USER".to_owned(), "dav-user-secret".to_owned()),
+            (
+                "ASSET_WEBDAV_PASSWORD".to_owned(),
+                "dav-password-secret".to_owned(),
+            ),
+        ]);
+
+        let config = AppConfig::from_env_iter(environment).unwrap();
+        let storage = config.asset_archive.webdav_storage().unwrap();
+        let debug = format!("{storage:?}");
+        assert_eq!(
+            storage.endpoint(),
+            "https://dav.example.test/remote.php/dav/files"
+        );
+        assert_eq!(storage.root(), Some("/assets"));
+        assert_eq!(storage.user(), Some("dav-user-secret"));
+        assert_eq!(storage.password(), Some("dav-password-secret"));
+        assert!(!debug.contains("dav.example.test"));
+        assert!(!debug.contains("dav-user-secret"));
+        assert!(!debug.contains("dav-password-secret"));
+    }
+
+    #[test]
+    fn rejects_invalid_protocol_endpoints_and_partial_credentials() {
+        let invalid_cases = [
+            (
+                "ftp",
+                "ASSET_FTP_ENDPOINT",
+                "http://ftp.example.test",
+                None,
+                None,
+            ),
+            (
+                "ftp",
+                "ASSET_FTP_ENDPOINT",
+                "ftp://user:pass@ftp.example.test",
+                None,
+                None,
+            ),
+            (
+                "ftp",
+                "ASSET_FTP_ENDPOINT",
+                "ftp://@ftp.example.test",
+                None,
+                None,
+            ),
+            (
+                "ftp",
+                "ASSET_FTP_ENDPOINT",
+                "ftp://ftp.example.test/#fragment",
+                None,
+                None,
+            ),
+            (
+                "ftp",
+                "ASSET_FTP_ENDPOINT",
+                "ftp://ftp.example.test/assets",
+                None,
+                None,
+            ),
+            (
+                "ftp",
+                "ASSET_FTP_ENDPOINT",
+                "ftp://ftp.example.test?passive=true",
+                None,
+                None,
+            ),
+            (
+                "ftp",
+                "ASSET_FTP_PASSWORD",
+                "ftp://ftp.example.test",
+                Some(("ASSET_FTP_USER", "only-user")),
+                None,
+            ),
+            (
+                "sftp",
+                "ASSET_SFTP_ENDPOINT",
+                "https://sftp.example.test",
+                Some(("ASSET_SFTP_USER", "user")),
+                Some(("ASSET_SFTP_KEY", "/key")),
+            ),
+            (
+                "sftp",
+                "ASSET_SFTP_ENDPOINT",
+                "sftp://user@sftp.example.test",
+                Some(("ASSET_SFTP_USER", "user")),
+                Some(("ASSET_SFTP_KEY", "/key")),
+            ),
+            (
+                "sftp",
+                "ASSET_SFTP_ENDPOINT",
+                "sftp://sftp.example.test/assets",
+                Some(("ASSET_SFTP_USER", "user")),
+                Some(("ASSET_SFTP_KEY", "/key")),
+            ),
+            (
+                "webdav",
+                "ASSET_WEBDAV_ENDPOINT",
+                "ftp://dav.example.test",
+                None,
+                None,
+            ),
+            (
+                "webdav",
+                "ASSET_WEBDAV_ENDPOINT",
+                "https://user:pass@dav.example.test/dav",
+                None,
+                None,
+            ),
+            (
+                "webdav",
+                "ASSET_WEBDAV_ENDPOINT",
+                "https://dav.example.test/dav#fragment",
+                None,
+                None,
+            ),
+            (
+                "webdav",
+                "ASSET_WEBDAV_ENDPOINT",
+                "https://dav.example.test/dav?tenant=one",
+                None,
+                None,
+            ),
+            (
+                "webdav",
+                "ASSET_WEBDAV_PASSWORD",
+                "https://dav.example.test/dav",
+                Some(("ASSET_WEBDAV_USER", "only-user")),
+                None,
+            ),
+            (
+                "ftp",
+                "ASSET_FTP_USER",
+                "ftps://ftp.example.test",
+                None,
+                Some(("ASSET_FTP_PASSWORD", "only-password")),
+            ),
+            (
+                "webdav",
+                "ASSET_WEBDAV_USER",
+                "https://dav.example.test/dav",
+                None,
+                Some(("ASSET_WEBDAV_PASSWORD", "only-password")),
+            ),
+        ];
+
+        for (backend, variable, endpoint, first_credential, second_credential) in invalid_cases {
+            let mut environment =
+                replace_environment(valid_environment(), "ASSET_ARCHIVE_BACKEND", backend);
+            environment.push((
+                "SERVER_ROOT_URL".to_owned(),
+                "https://rss.example.test".to_owned(),
+            ));
+            environment.push((
+                match backend {
+                    "ftp" => "ASSET_FTP_ENDPOINT",
+                    "sftp" => "ASSET_SFTP_ENDPOINT",
+                    _ => "ASSET_WEBDAV_ENDPOINT",
+                }
+                .to_owned(),
+                endpoint.to_owned(),
+            ));
+            if let Some((name, value)) = first_credential {
+                environment.push((name.to_owned(), value.to_owned()));
+            }
+            if let Some((name, value)) = second_credential {
+                environment.push((name.to_owned(), value.to_owned()));
+            }
+            if backend == "sftp"
+                && !environment
+                    .iter()
+                    .any(|(name, _)| name == "ASSET_SFTP_USER")
+            {
+                environment.extend([
+                    ("ASSET_SFTP_USER".to_owned(), "user".to_owned()),
+                    ("ASSET_SFTP_KEY".to_owned(), "/key".to_owned()),
+                ]);
+            }
+
+            assert!(
+                matches!(
+                    AppConfig::from_env_iter(environment),
+                    Err(ConfigError::InvalidValue { variable: actual, .. }) if actual == variable
+                ),
+                "backend {backend} should reject endpoint {endpoint} or partial credentials"
+            );
+        }
+    }
+
+    #[test]
+    fn requires_protocol_specific_values() {
+        for (backend, variable) in [
+            ("ftp", "ASSET_FTP_ENDPOINT"),
+            ("sftp", "ASSET_SFTP_ENDPOINT"),
+            ("webdav", "ASSET_WEBDAV_ENDPOINT"),
+        ] {
+            let environment =
+                replace_environment(valid_environment(), "ASSET_ARCHIVE_BACKEND", backend);
+            assert!(matches!(
+                AppConfig::from_env_iter(environment),
+                Err(ConfigError::Missing { variable: actual }) if actual == variable
+            ));
+        }
+
+        let mut sftp = replace_environment(valid_environment(), "ASSET_ARCHIVE_BACKEND", "sftp");
+        sftp.extend([
+            (
+                "SERVER_ROOT_URL".to_owned(),
+                "https://rss.example.test".to_owned(),
+            ),
+            (
+                "ASSET_SFTP_ENDPOINT".to_owned(),
+                "sftp://sftp.example.test".to_owned(),
+            ),
+        ]);
+        assert!(matches!(
+            AppConfig::from_env_iter(sftp),
+            Err(ConfigError::Missing {
+                variable: "ASSET_SFTP_USER"
+            })
+        ));
+    }
+
+    #[test]
+    fn rejects_unknown_asset_protocol_environment_names() {
+        let environment =
+            replace_environment(valid_environment(), "ASSET_FTP_ENDPOINT_TYPO", "ftp://host");
+        assert!(matches!(
+            AppConfig::from_env_iter(environment),
+            Err(ConfigError::UnknownVariable { variable }) if variable == "ASSET_FTP_ENDPOINT_TYPO"
+        ));
+    }
+
+    #[test]
+    fn rejects_blank_sftp_usernames() {
+        let mut environment =
+            replace_environment(valid_environment(), "ASSET_ARCHIVE_BACKEND", "sftp");
+        environment.extend([
+            (
+                "SERVER_ROOT_URL".to_owned(),
+                "https://rss.example.test".to_owned(),
+            ),
+            (
+                "ASSET_SFTP_ENDPOINT".to_owned(),
+                "sftp://sftp.example.test".to_owned(),
+            ),
+            ("ASSET_SFTP_USER".to_owned(), "   ".to_owned()),
+            ("ASSET_SFTP_KEY".to_owned(), "/mounted/key".to_owned()),
+        ]);
+
+        assert!(matches!(
+            AppConfig::from_env_iter(environment),
+            Err(ConfigError::Missing {
+                variable: "ASSET_SFTP_USER"
+            })
+        ));
+    }
+
+    #[test]
+    fn rejects_webdav_endpoint_queries() {
+        let mut environment =
+            replace_environment(valid_environment(), "ASSET_ARCHIVE_BACKEND", "webdav");
+        environment.extend([
+            (
+                "SERVER_ROOT_URL".to_owned(),
+                "https://rss.example.test".to_owned(),
+            ),
+            (
+                "ASSET_WEBDAV_ENDPOINT".to_owned(),
+                "https://dav.example.test/dav?tenant=one".to_owned(),
+            ),
+        ]);
+
+        assert!(matches!(
+            AppConfig::from_env_iter(environment),
+            Err(ConfigError::InvalidValue {
+                variable: "ASSET_WEBDAV_ENDPOINT",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn rejects_missing_sftp_key_path() {
+        let mut environment =
+            replace_environment(valid_environment(), "ASSET_ARCHIVE_BACKEND", "sftp");
+        environment.extend([
+            (
+                "SERVER_ROOT_URL".to_owned(),
+                "https://rss.example.test".to_owned(),
+            ),
+            (
+                "ASSET_SFTP_ENDPOINT".to_owned(),
+                "sftp://sftp.example.test".to_owned(),
+            ),
+            ("ASSET_SFTP_USER".to_owned(), "user".to_owned()),
+        ]);
+
+        assert!(matches!(
+            AppConfig::from_env_iter(environment),
+            Err(ConfigError::Missing {
+                variable: "ASSET_SFTP_KEY"
+            })
+        ));
+    }
+
+    #[test]
+    fn rejects_relative_sftp_key_paths() {
+        let mut environment =
+            replace_environment(valid_environment(), "ASSET_ARCHIVE_BACKEND", "sftp");
+        environment.extend([
+            (
+                "SERVER_ROOT_URL".to_owned(),
+                "https://rss.example.test".to_owned(),
+            ),
+            (
+                "ASSET_SFTP_ENDPOINT".to_owned(),
+                "sftp://sftp.example.test".to_owned(),
+            ),
+            ("ASSET_SFTP_USER".to_owned(), "user".to_owned()),
+            ("ASSET_SFTP_KEY".to_owned(), "relative/key".to_owned()),
+        ]);
+
+        assert!(matches!(
+            AppConfig::from_env_iter(environment),
+            Err(ConfigError::InvalidValue {
+                variable: "ASSET_SFTP_KEY",
+                ..
+            })
+        ));
     }
 
     #[test]

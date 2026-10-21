@@ -66,7 +66,7 @@ The current and target contracts must not be confused:
 | Configuration | Environment-only `AppConfig` with role, lease, cache, public RSS URL, admin, and optional-asset validation; unknown owned settings are rejected and legacy archive names fail with a migration hint; the supervisor consumes the parsed role and policy values | QR-attempt policy is currently bounded in the application manager; durable multi-replica attempt storage remains future work |
 | Persistence | Job/source-scheduling/article/sync-run/feed-cache/feed-token tables, their PostgreSQL repositories, shared job/source/article/sync-run/feed-cache transaction boundary, account leases, feed-build leases, and encrypted WeRead account credential records with optimistic versions | QR attempts are intentionally process-local; durable encrypted attempt storage and remaining transaction-scoped views are future work |
 | Acquisition/web/RSS | Public WeChat identity resolution, a validated public article URL, capability-typed browser sessions, concrete public Thirtyfour navigation/extraction with bounded pacing/scroll and expected-timezone validation, authenticated WeRead article-list transport through an admin-enrolled cookie and account lease, source-sync finalization through an injected acquisition port, feed rebuild orchestration plus its atomic worker handler, pure RSS renderer, public tokenized feed route, API liveness/readiness and browser-worker readiness routes, single-admin source/panel routes, and the WeRead QR login transport | Login/QR exchange is executable; durable multi-replica QR attempt storage remains future work |
-| Archive | Conservative HTML allowlist sanitizer, deterministic content hashing, bounded anonymous image acquisition with article `Referer`/`Origin`/User-Agent, PostgreSQL metadata and default binary persistence, the backend-neutral `AssetBlobStore` contract with injectable repository/unit-of-work wiring, add-time checksum/raw-byte deduplication, stable URL rewriting, asset serving, missing-asset repair, and age/size/orphan maintenance; OpenDAL-backed local-directory, S3, OSS, GCS, and Azure Blob backends are also available | Signed-URL refresh lineages and later OpenDAL providers remain future work; the storage contract is documented in [docs/ASSET_CACHING.md](docs/ASSET_CACHING.md) |
+| Archive | Conservative HTML allowlist sanitizer, deterministic content hashing, bounded anonymous image acquisition with article `Referer`/`Origin`/User-Agent, PostgreSQL metadata and default binary persistence, the backend-neutral `AssetBlobStore` contract with injectable repository/unit-of-work wiring, add-time checksum/raw-byte deduplication, stable URL rewriting, asset serving, missing-asset repair, and age/size/orphan maintenance; OpenDAL-backed local-directory, S3, OSS, GCS, Azure Blob, FTP, SFTP, and WebDAV backends are also available | Signed-URL refresh lineages and later providers remain future work; the storage contract is documented in [docs/ASSET_CACHING.md](docs/ASSET_CACHING.md) |
 
 Environment variables in this document are parsed into `AppConfig`, and
 `application::runtime::RuntimePlan` is the side-effect-free boundary that
@@ -859,8 +859,8 @@ RSS_CACHE_MISS_WAIT_MS / SERVER_ROOT_URL
 FEED_BUILD_LEASE_SECONDS / FEED_BUILD_HEARTBEAT_SECONDS
 PACING_* / SCROLL_*
 ASSET_ARCHIVE_BACKEND / ASSET_LOCAL_ROOT / ASSET_S3_* / ASSET_GCS_* /
-ASSET_OSS_* / ASSET_OSS_VERSIONING /
-ASSET_AZURE_* /
+ASSET_OSS_* / ASSET_OSS_VERSIONING / ASSET_AZURE_* /
+ASSET_FTP_* / ASSET_SFTP_* / ASSET_WEBDAV_* /
 ASSET_CACHE_MAX_SIZE_MB / ASSET_CACHE_MAX_AGE_DAYS / ASSET_MAX_SIZE_MB /
 ASSET_USE_ABSOLUTE_URLS /
 ASSET_MAX_COUNT_PER_ARTICLE / ASSET_MAX_FETCH_BYTES_PER_ARTICLE_MB /
@@ -870,10 +870,12 @@ ADMIN_ENABLED / ADMIN_USERNAME / ADMIN_PASSWORD / SESSION_SIGNING_KEY /
 CREDENTIAL_ENCRYPTION_KEY
 ```
 
-`ASSET_ARCHIVE_BACKEND` accepts `disabled`, `database`, `local`, `s3`, `oss`, `gcs`, and
-`azure`, plus the compatible `postgres` and `azblob` aliases. The OSS, GCS, and Azure
-skip-signature settings are explicit opt-ins for unauthenticated emulators.
-Automatic missing-asset repair is
+`ASSET_ARCHIVE_BACKEND` accepts `disabled`, `database`, `local`, `s3`, `oss`, `gcs`,
+`azure`, `ftp`, `sftp`, and `webdav`, plus the compatible `postgres` and `azblob`
+aliases. FTP/WebDAV writes and deletes use transaction-scoped PostgreSQL
+advisory locks; SFTP uses strict known-host verification and OpenDAL's
+conditional writes. The OSS, GCS, and Azure skip-signature settings are explicit
+opt-ins for unauthenticated emulators. Automatic missing-asset repair is
 implemented; signed-URL refresh settings remain roadmap items and are not
 accepted environment variables in the current runtime.
 

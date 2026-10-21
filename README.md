@@ -236,14 +236,11 @@ cookies are never sent to asset hosts. Feed delivery detects an existing cache
 with the wrong asset URL form and rebuilds it before serving. Missing cached
 bytes enqueue a deduplicated anonymous repair job and retain the same asset URL
 while the worker restores the data.
-The local-directory, S3-compatible, Aliyun OSS, Google Cloud Storage, and Azure Blob backends use a
-shared `AssetBlobStore` boundary backed by Apache OpenDAL. PostgreSQL will
-continue to own asset metadata, relationships, deduplication, leases, repair
-jobs, and eviction state.
+The local-directory, S3-compatible, Aliyun OSS, Google Cloud Storage, Azure Blob, FTP, SFTP, and WebDAV backends use a shared `AssetBlobStore` boundary backed by Apache OpenDAL. PostgreSQL continues to own asset metadata, relationships, deduplication, leases, repair jobs, and eviction state.
 
 | Variable | Default | Explanation |
 | --- | --- | --- |
-| `ASSET_ARCHIVE_BACKEND` | `disabled` | `disabled` keeps approved external URLs. `database` (or `postgres`) stores bytes and URL/version metadata in PostgreSQL. `local`, `s3`, `oss`, `gcs`, and `azure` (or `azblob`) use their configured OpenDAL backend. |
+| `ASSET_ARCHIVE_BACKEND` | `disabled` | `disabled` keeps approved external URLs. `database` (or `postgres`) stores bytes and URL/version metadata in PostgreSQL. `local`, `s3`, `oss`, `gcs`, `azure` (or `azblob`), `ftp`, `sftp`, and `webdav` select their configured storage backend. |
 | `ASSET_LOCAL_ROOT` | — | Root directory for the local OpenDAL filesystem backend; required when the backend is `local`. |
 | `ASSET_S3_BUCKET` | — | S3-compatible bucket; required when the backend is `s3`. |
 | `ASSET_S3_ENDPOINT` | — | Optional S3-compatible endpoint, such as MinIO. |
@@ -267,6 +264,16 @@ jobs, and eviction state.
 | `ASSET_AZURE_ACCOUNT_NAME` | — | Secret-backed Azure Storage account name; required for signed Azure requests. |
 | `ASSET_AZURE_ACCOUNT_KEY` | — | Base64-encoded secret-backed Azure Storage account key; required for signed Azure requests. |
 | `ASSET_AZURE_SKIP_SIGNATURE` | `false` | Sends unsigned Azure requests for an explicitly configured emulator; account credentials may then be omitted. |
+| `ASSET_FTP_ENDPOINT` | — | Required `ftp://` or `ftps://` host endpoint without embedded credentials, path, query, or fragment. Use FTPS to encrypt credentials and data in transit. |
+| `ASSET_FTP_ROOT` | — | Optional FTP directory root. |
+| `ASSET_FTP_USER` / `ASSET_FTP_PASSWORD` | — | Optional secret-backed FTP credentials; both must be supplied together. |
+| `ASSET_SFTP_ENDPOINT` | — | Required `sftp://host[:port]` endpoint without credentials, path, query, or fragment. Host keys are checked using the process's strict known-hosts configuration. |
+| `ASSET_SFTP_ROOT` | — | Optional SFTP directory root. |
+| `ASSET_SFTP_USER` | — | Required SFTP username. |
+| `ASSET_SFTP_KEY` | — | Required absolute path to a mounted SSH private-key file; the key contents are not loaded by application configuration. |
+| `ASSET_WEBDAV_ENDPOINT` | — | Required `http://` or `https://` endpoint with optional DAV mount path and no embedded credentials, query, or fragment. Prefer HTTPS when credentials are used. |
+| `ASSET_WEBDAV_ROOT` | — | Optional WebDAV directory root. |
+| `ASSET_WEBDAV_USER` / `ASSET_WEBDAV_PASSWORD` | — | Optional secret-backed WebDAV Basic credentials; both must be supplied together. |
 | `ASSET_USE_ABSOLUTE_URLS` | `true` | When database asset caching is enabled, emits cached image links as full URLs rooted at `SERVER_ROOT_URL` in generated feeds. Set to `false` to keep `/assets/{id}` links relative; the default requires `SERVER_ROOT_URL`. |
 | `ASSET_CACHE_MAX_SIZE_MB` | `5000` | Aggregate limit for cached raw binary bytes, in decimal megabytes. `0` disables size-based eviction. |
 | `ASSET_CACHE_MAX_AGE_DAYS` | `30` | Maximum idle age since the last successful asset read before bytes are evicted. `0` disables age-based eviction. |
@@ -280,6 +287,10 @@ jobs, and eviction state.
 | `ASSET_REPAIR_PUBLIC_MAX_PENDING` | `50` | PostgreSQL-wide maximum active repairs admitted by public asset requests; `0` disables public admission. |
 | `ASSET_REPAIR_REQUEUE_SECONDS` | `60` | Backoff after a failed repair before another public admission. |
 | `ASSET_REPAIR_MAX_ATTEMPTS` | `3` | Maximum repair admissions for one stable asset record before it becomes terminal. |
+
+`ASSET_SFTP_KEY` should point to a mounted private key, and the server host key must already be trusted by the process's strict known-hosts configuration. FTP without TLS does not encrypt credentials or data; prefer `ftps://`. Use HTTPS for authenticated WebDAV. FTP and WebDAV writes and deletes require PostgreSQL advisory-lock coordination; their independent lock pool, shared by the runtime's API and worker roles, allows up to the configured application-pool maximum in additional connections and has a 30-second acquisition/lock-wait limit. External FTP/WebDAV clients are not covered by that lock.
+
+The live protocol contract tests are ignored by default and require operator-provided test servers. Run one with `cargo test --locked --test asset_blob_store_protocols -- --ignored <test_name> --exact`; configure `WERRSS_TEST_FTP_ENDPOINT`, optional `WERRSS_TEST_FTP_ROOT`, `WERRSS_TEST_FTP_USER` and `WERRSS_TEST_FTP_PASSWORD` for FTP; `WERRSS_TEST_SFTP_ENDPOINT`, `WERRSS_TEST_SFTP_ROOT`, `WERRSS_TEST_SFTP_USER` and `WERRSS_TEST_SFTP_KEY` for SFTP; or `WERRSS_TEST_WEBDAV_ENDPOINT`, `WERRSS_TEST_WEBDAV_ROOT`, `WERRSS_TEST_WEBDAV_USER` and `WERRSS_TEST_WEBDAV_PASSWORD` for WebDAV. FTP and WebDAV also require `DATABASE_URL` for advisory-lock coordination. The tests use unique generated keys and delete their objects after each run.
 
 The database backend runs a best-effort maintenance pass hourly in the runtime
 supervisor. Age and size eviction clear only binary data and mark the retained
@@ -341,14 +352,11 @@ adapts the existing PostgreSQL binary table without a migration. Both
 `PostgresAssetStore::with_blob_store` and
 `UnitOfWorkFactory::with_blob_store` accept an injected
 `Arc<dyn AssetBlobStore>`; their default constructors continue to use the
-database backend. Azure Blob and Aliyun OSS are now available alongside the
-local, S3, and GCS adapters. The remaining roadmap items are future work:
+database backend. Azure Blob, Aliyun OSS, and the newer FTP, SFTP, and WebDAV
+adapters are available alongside the local, S3, and GCS adapters. PGMQ remains
+the next possible storage-adjacent optimization:
 
-1. **Add FTP, SFTP, and WebDAV only after the common contract is stable.**
-   The local, S3-compatible, OSS, GCS, and Azure Blob adapters pass the shared
-   contract boundary; each remaining backend must add provider-appropriate
-   integration tests before its configuration is accepted.
-2. **Evaluate PGMQ as a queue transport optimization.** The current custom
+1. **Evaluate PGMQ as a queue transport optimization.** The current custom
    `jobs` table remains the version-one transport; PGMQ can be evaluated later
    if queue throughput or operational overhead becomes a demonstrated
    bottleneck.
