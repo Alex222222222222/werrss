@@ -965,6 +965,7 @@ async fn combined_import_retains_binding_to_newly_created_placeholder(pool: PgPo
     let repo = PostgresConfigTransferRepository::new(pool.clone());
     let new_account_id = Uuid::new_v4();
     let new_source_id = Uuid::new_v4();
+    let risk_source_id = Uuid::new_v4();
 
     let account = sample_portable_account(new_account_id, "Placeholder Bound Account", true);
     let source = sample_portable_source(
@@ -973,8 +974,34 @@ async fn combined_import_retains_binding_to_newly_created_placeholder(pool: PgPo
         "Source Bound To New",
         Some(new_account_id),
     );
+    let mut risk_source = sample_portable_source(
+        risk_source_id,
+        "book-risk-bound-to-new",
+        "Risk Source Bound To New",
+        Some(new_account_id),
+    );
+    risk_source.enabled = true;
+    seed_source_full(
+        &pool,
+        risk_source_id,
+        &risk_source.book_id,
+        &risk_source.display_name,
+        None,
+        Some(new_account_id),
+        0,
+        true,
+        "risk_controlled",
+        at(500),
+        Some(at(900)),
+        Some(at(900)),
+        3600,
+        20,
+        0,
+        3,
+    )
+    .await;
 
-    let bundle = make_validated_bundle(Some(vec![source]), Some(vec![account]));
+    let bundle = make_validated_bundle(Some(vec![source, risk_source]), Some(vec![account]));
 
     let preview = repo.preview(&bundle).await.expect("preview should succeed");
     assert_eq!(preview.placeholders_created, 1);
@@ -986,12 +1013,26 @@ async fn combined_import_retains_binding_to_newly_created_placeholder(pool: PgPo
     assert_eq!(result.account_bindings_preserved, 1);
     assert_eq!(result.account_bindings_cleared, 0);
 
-    let bound_id: Option<Uuid> = sqlx::query_scalar("SELECT account_id FROM sources WHERE id = $1")
-        .bind(new_source_id)
+    let (bound_id, scheduling_gate): (Option<Uuid>, String) =
+        sqlx::query_as("SELECT account_id, scheduling_gate FROM sources WHERE id = $1")
+            .bind(new_source_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(bound_id, Some(new_account_id));
+    assert_eq!(scheduling_gate, "authentication_required");
+    let risk_gate: String = sqlx::query_scalar("SELECT scheduling_gate FROM sources WHERE id = $1")
+        .bind(risk_source_id)
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(bound_id, Some(new_account_id));
+    assert_eq!(risk_gate, "risk_controlled");
+    let risk_gate: String = sqlx::query_scalar("SELECT scheduling_gate FROM sources WHERE id = $1")
+        .bind(risk_source_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(risk_gate, "risk_controlled");
 }
 
 #[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]

@@ -434,21 +434,30 @@ async fn apply_transaction(
     }
 
     if let Some(sources) = &raw.sources {
-        let account_rows = sqlx::query("SELECT account_id FROM weread_accounts")
-            .fetch_all(&mut **tx)
-            .await
-            .map_err(storage_error)?;
+        let account_rows = sqlx::query(
+            "SELECT account_id, NOT disabled AND NOT setup_required \
+             AND access_expires_at > clock_timestamp() AS usable FROM weread_accounts",
+        )
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(storage_error)?;
 
-        let valid_account_ids: HashSet<Uuid> = account_rows
+        let account_states: HashMap<Uuid, bool> = account_rows
             .into_iter()
-            .map(|r| r.try_get::<Uuid, _>("account_id"))
-            .collect::<Result<_, _>>()
+            .map(|row| {
+                Ok((
+                    row.try_get::<Uuid, _>("account_id")?,
+                    row.try_get::<bool, _>("usable")?,
+                ))
+            })
+            .collect::<Result<_, sqlx::Error>>()
             .map_err(storage_error)?;
+        let known_account_ids: HashSet<Uuid> = account_states.keys().copied().collect();
 
         for source in sources {
             let resolved_account_id = match source.account_id {
                 Some(aid) => {
-                    if valid_account_ids.contains(&aid) {
+                    if known_account_ids.contains(&aid) {
                         result.account_bindings_preserved += 1;
                         Some(aid)
                     } else {
@@ -458,9 +467,15 @@ async fn apply_transaction(
                 }
                 None => None,
             };
+            let requires_authentication =
+                resolved_account_id.is_some_and(|account_id| !account_states[&account_id]);
+            let new_gate = imported_source_gate(
+                None,
+                resolved_account_id.map(|account_id| account_states[&account_id]),
+            );
 
             let existing_row = sqlx::query(
-                "SELECT id, book_id, display_name, article_url, rss_item_limit, feed_revision \
+                "SELECT id, book_id, display_name, article_url, rss_item_limit, feed_revision, scheduling_gate \
                  FROM sources \
                  WHERE id = $1 \
                  FOR UPDATE",
@@ -499,6 +514,15 @@ async fn apply_transaction(
                     row.try_get("rss_item_limit").map_err(storage_error)?;
                 let existing_feed_revision: i64 =
                     row.try_get("feed_revision").map_err(storage_error)?;
+                let existing_gate: String =
+                    row.try_get("scheduling_gate").map_err(storage_error)?;
+                let resumes_authentication = existing_gate == "authentication_required"
+                    && resolved_account_id.is_some()
+                    && !requires_authentication;
+                let scheduling_gate = imported_source_gate(
+                    Some(&existing_gate),
+                    resolved_account_id.map(|account_id| account_states[&account_id]),
+                );
 
                 let feed_visible_changed = existing_book_id != source.book_id
                     || existing_display_name != source.display_name
@@ -518,8 +542,13 @@ async fn apply_transaction(
                 sqlx::query(
                     "UPDATE sources \
                      SET book_id = $2, display_name = $3, article_url = $4, account_id = $5, \
-                         feed_revision = $6, enabled = $7, sync_interval_seconds = $8, \
-                         rss_item_limit = $9, priority = $10, max_attempts = $11, \
+                         scheduling_gate = $6, \
+                         next_fetch_at = CASE WHEN $7 AND scheduling_gate = 'authentication_required' \
+                             THEN clock_timestamp() ELSE next_fetch_at END, \
+                         failure_cooldown_until = CASE WHEN $7 THEN NULL ELSE failure_cooldown_until END, \
+                         schedule_reserved_until = CASE WHEN $7 THEN NULL ELSE schedule_reserved_until END, \
+                         feed_revision = $8, enabled = $9, sync_interval_seconds = $10, \
+                         rss_item_limit = $11, priority = $12, max_attempts = $13, \
                          updated_at = clock_timestamp() \
                      WHERE id = $1",
                 )
@@ -528,6 +557,8 @@ async fn apply_transaction(
                 .bind(&source.display_name)
                 .bind(source.article_url.as_deref())
                 .bind(resolved_account_id)
+                .bind(scheduling_gate)
+                .bind(resumes_authentication)
                 .bind(new_feed_revision)
                 .bind(source.enabled)
                 .bind(source.sync_interval_seconds)
@@ -564,7 +595,7 @@ async fn apply_transaction(
                          next_fetch_at, failure_cooldown_until, schedule_reserved_until, \
                          priority, max_attempts, created_at, updated_at \
                      ) VALUES ( \
-                         $1, $2, $3, $4, $5, 0, $6, 'ready', $7, $8, clock_timestamp(), \
+                         $1, $2, $3, $4, $5, 0, $6, $11, $7, $8, clock_timestamp(), \
                          NULL, NULL, $9, $10, clock_timestamp(), clock_timestamp() \
                      )",
                 )
@@ -578,6 +609,7 @@ async fn apply_transaction(
                 .bind(i64::from(source.rss_item_limit))
                 .bind(source.priority)
                 .bind(i64::from(source.max_attempts))
+                .bind(new_gate)
                 .execute(&mut **tx)
                 .await
                 .map_err(storage_error)?;
@@ -611,6 +643,19 @@ async fn resume_authentication_gated_sources(
     Ok(())
 }
 
+fn imported_source_gate(existing_gate: Option<&str>, account_usable: Option<bool>) -> &'static str {
+    if existing_gate == Some("risk_controlled") {
+        return "risk_controlled";
+    }
+    if account_usable == Some(false) {
+        return "authentication_required";
+    }
+    if existing_gate == Some("authentication_required") && account_usable != Some(true) {
+        return "authentication_required";
+    }
+    "ready"
+}
+
 fn storage_error(error: sqlx::Error) -> ConfigTransferRepositoryError {
     if matches!(&error, sqlx::Error::Database(database_error) if database_error.code().as_deref() == Some("23505"))
     {
@@ -619,4 +664,31 @@ fn storage_error(error: sqlx::Error) -> ConfigTransferRepositoryError {
         );
     }
     ConfigTransferRepositoryError::Storage(error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::imported_source_gate;
+
+    #[test]
+    fn import_gates_unusable_bindings_and_only_resumes_auth_gates() {
+        assert_eq!(
+            imported_source_gate(None, Some(false)),
+            "authentication_required"
+        );
+        assert_eq!(imported_source_gate(None, Some(true)), "ready");
+        assert_eq!(imported_source_gate(None, None), "ready");
+        assert_eq!(
+            imported_source_gate(Some("authentication_required"), Some(true)),
+            "ready"
+        );
+        assert_eq!(
+            imported_source_gate(Some("authentication_required"), None),
+            "authentication_required"
+        );
+        assert_eq!(
+            imported_source_gate(Some("risk_controlled"), Some(false)),
+            "risk_controlled"
+        );
+    }
 }
