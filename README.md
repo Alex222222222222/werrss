@@ -362,8 +362,8 @@ the next possible storage-adjacent optimization:
    bottleneck.
 
 The release image is built by `.github/workflows/container.yml`. Push a
-semantic-version tag such as `v0.1.13` to build and publish
-`ghcr.io/<owner>/<repository>:v0.1.13` and `:latest`; branch and pull-request
+semantic-version tag such as `v0.1.14` to build and publish
+`ghcr.io/<owner>/<repository>:v0.1.14` and `:latest`; branch and pull-request
 builds validate the Dockerfile without publishing. The image expects the same
 environment variables described in [DEPLOYMENT.md](DEPLOYMENT.md), including
 `DATABASE_URL`; no credentials are baked into the image. The Dockerfile keeps
