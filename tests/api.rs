@@ -238,6 +238,7 @@ async fn admin_config_import_preview_does_not_mutate_database(pool: PgPool) {
         .await
         .expect("configuration preview should complete");
     assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     let preview: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(preview["sources_created"], 1);
@@ -266,6 +267,7 @@ async fn admin_config_import_applies_valid_bundle_without_secrets_in_response(po
         .await
         .expect("configuration import should complete");
     assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     let result: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(result["sources_created"], 1);

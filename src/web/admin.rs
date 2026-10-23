@@ -408,7 +408,11 @@ async fn preview_config_import(
                 conflicts = preview.conflicts.len(),
                 "administrator previewed configuration import"
             );
-            Json(preview).into_response()
+            let mut response = Json(preview).into_response();
+            response
+                .headers_mut()
+                .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            response
         }
         Err(error) => config_transfer_error_response(error),
     }
@@ -442,7 +446,11 @@ async fn apply_config_import(
                 accounts = account_count,
                 "administrator applied configuration import"
             );
-            Json(result).into_response()
+            let mut response = Json(result).into_response();
+            response
+                .headers_mut()
+                .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            response
         }
         Err(error) => config_transfer_error_response(error),
     }
@@ -1702,7 +1710,11 @@ fn config_transfer_error_response(error: ConfigTransferRepositoryError) -> Respo
             )
         }
     };
-    (status, Json(json!({ "error": message }))).into_response()
+    let mut response = (status, Json(json!({ "error": message }))).into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
 }
 
 fn validation_error(message: impl Into<String>) -> Response {
@@ -1868,6 +1880,7 @@ mod tests {
             "postgres://user:password@internal/db private-data".to_owned(),
         ));
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
         let body = to_bytes(response.into_body(), usize::MAX)
             .await
             .expect("error response should be readable");

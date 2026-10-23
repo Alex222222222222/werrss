@@ -244,7 +244,7 @@ impl ValidatedConfigBundle {
 impl TryFrom<ConfigBundle> for ValidatedConfigBundle {
     type Error = ConfigTransferValidationError;
 
-    fn try_from(bundle: ConfigBundle) -> Result<Self, Self::Error> {
+    fn try_from(mut bundle: ConfigBundle) -> Result<Self, Self::Error> {
         if bundle.format != CONFIG_BUNDLE_FORMAT {
             return Err(ConfigTransferValidationError::UnsupportedFormat(
                 bundle.format,
@@ -259,7 +259,7 @@ impl TryFrom<ConfigBundle> for ValidatedConfigBundle {
             return Err(ConfigTransferValidationError::NoSectionsPresent);
         }
 
-        if let Some(sources) = &bundle.sources {
+        if let Some(sources) = &mut bundle.sources {
             if sources.len() > MAX_SECTION_RECORDS {
                 return Err(ConfigTransferValidationError::SectionTooLarge {
                     section: "sources",
@@ -281,6 +281,11 @@ impl TryFrom<ConfigBundle> for ValidatedConfigBundle {
                 if source.book_id.trim().is_empty() {
                     return Err(ConfigTransferValidationError::EmptyField { field: "book_id" });
                 }
+                if source.book_id != source.book_id.trim() {
+                    return Err(ConfigTransferValidationError::NonCanonicalBookId(
+                        source.book_id.clone(),
+                    ));
+                }
                 if !seen_book_ids.insert(source.book_id.clone()) {
                     return Err(ConfigTransferValidationError::DuplicateBookId(
                         source.book_id.clone(),
@@ -301,16 +306,19 @@ impl TryFrom<ConfigBundle> for ValidatedConfigBundle {
                     }
                 }
 
-                if let Some(url_str) = &source.article_url {
-                    VerifiedWechatArticleUrl::parse(url_str).map_err(|e| {
+                if let Some(url_str) = source.article_url.as_mut() {
+                    let canonical = VerifiedWechatArticleUrl::parse(url_str).map_err(|e| {
                         ConfigTransferValidationError::InvalidArticleUrl(e.to_string())
                     })?;
+                    *url_str = canonical.as_str().to_owned();
                 }
 
-                if source.sync_interval_seconds <= 0 {
+                if source.sync_interval_seconds <= 0
+                    || chrono::Duration::try_seconds(source.sync_interval_seconds).is_none()
+                {
                     return Err(ConfigTransferValidationError::InvalidNumericBound {
                         field: "sync_interval_seconds",
-                        message: "must be positive",
+                        message: "must be positive and representable as a duration",
                     });
                 }
 
@@ -540,6 +548,10 @@ pub enum ConfigTransferValidationError {
         /// Human-readable bound explanation.
         message: &'static str,
     },
+
+    /// A book identifier contains leading or trailing whitespace and is not canonical.
+    #[error("book id '{0}' must not contain surrounding whitespace")]
+    NonCanonicalBookId(String),
 
     /// Multiple sources within the bundle share the same source ID.
     #[error("duplicate source id '{0}' within bundle")]
@@ -1160,7 +1172,7 @@ mod tests {
             err,
             ConfigTransferValidationError::InvalidNumericBound {
                 field: "sync_interval_seconds",
-                message: "must be positive"
+                message: "must be positive and representable as a duration"
             }
         );
 
@@ -1190,7 +1202,7 @@ mod tests {
             err,
             ConfigTransferValidationError::InvalidNumericBound {
                 field: "sync_interval_seconds",
-                message: "must be positive"
+                message: "must be positive and representable as a duration"
             }
         );
 
@@ -1692,6 +1704,90 @@ mod tests {
             ValidatedConfigBundle::try_from(bundle),
             Err(ConfigTransferValidationError::PayloadTooLarge { .. })
         ));
+    }
+
+    #[test]
+    fn test_sync_interval_must_fit_domain_duration() {
+        let payload = json!({
+            "format": "werrss-config",
+            "version": 1,
+            "exported_at": Utc::now().to_rfc3339(),
+            "sources": [{
+                "id": Uuid::new_v4(),
+                "book_id": "book_duration_overflow",
+                "display_name": "Duration overflow",
+                "article_url": null,
+                "account_id": null,
+                "enabled": true,
+                "sync_interval_seconds": i64::MAX,
+                "rss_item_limit": 20,
+                "priority": 0,
+                "max_attempts": 3
+            }]
+        });
+        let bytes = serde_json::to_vec(&payload).unwrap();
+        assert!(matches!(
+            ValidatedConfigBundle::parse_limited(&bytes),
+            Err(ConfigTransferValidationError::InvalidNumericBound {
+                field: "sync_interval_seconds",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn test_article_url_is_canonicalized_by_domain_parser() {
+        let payload = json!({
+            "format": "werrss-config",
+            "version": 1,
+            "exported_at": Utc::now().to_rfc3339(),
+            "sources": [{
+                "id": Uuid::new_v4(),
+                "book_id": "book_url_canonical",
+                "display_name": "Canonical URL",
+                "article_url": " https://mp.weixin.qq.com:443/s?mid=1 ",
+                "account_id": null,
+                "enabled": true,
+                "sync_interval_seconds": 3600,
+                "rss_item_limit": 20,
+                "priority": 0,
+                "max_attempts": 3
+            }]
+        });
+        let bytes = serde_json::to_vec(&payload).unwrap();
+        let bundle = ValidatedConfigBundle::parse_limited(&bytes).unwrap();
+        assert_eq!(
+            bundle.sources().unwrap()[0].article_url.as_deref(),
+            Some("https://mp.weixin.qq.com/s?mid=1")
+        );
+    }
+
+    #[test]
+    fn test_book_ids_with_surrounding_whitespace_are_rejected() {
+        for book_id in [" book_trimmed", "book_trimmed ", " book_trimmed "] {
+            let payload = json!({
+                "format": "werrss-config",
+                "version": 1,
+                "exported_at": Utc::now().to_rfc3339(),
+                "sources": [{
+                    "id": Uuid::new_v4(),
+                    "book_id": book_id,
+                    "display_name": "Non-canonical book id",
+                    "article_url": null,
+                    "account_id": null,
+                    "enabled": true,
+                    "sync_interval_seconds": 3600,
+                    "rss_item_limit": 20,
+                    "priority": 0,
+                    "max_attempts": 3
+                }]
+            });
+            let bytes = serde_json::to_vec(&payload).unwrap();
+            assert!(
+                ValidatedConfigBundle::parse_limited(&bytes).is_err(),
+                "book ID {book_id:?} must not contain surrounding whitespace"
+            );
+        }
     }
 
     #[test]
