@@ -137,6 +137,10 @@ impl ConfigTransferRepository for PostgresConfigTransferRepository {
         selection.validate()?;
 
         let mut tx = self.pool.begin().await.map_err(storage_error)?;
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            .execute(&mut *tx)
+            .await
+            .map_err(storage_error)?;
 
         let sources = if selection.sources {
             let limit = (MAX_SECTION_RECORDS + 1) as i64;
@@ -608,5 +612,11 @@ async fn resume_authentication_gated_sources(
 }
 
 fn storage_error(error: sqlx::Error) -> ConfigTransferRepositoryError {
+    if matches!(&error, sqlx::Error::Database(database_error) if database_error.code().as_deref() == Some("23505"))
+    {
+        return ConfigTransferRepositoryError::Conflict(
+            ConfigTransferConflict::unique_constraint_violation(),
+        );
+    }
     ConfigTransferRepositoryError::Storage(error.to_string())
 }

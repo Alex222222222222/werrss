@@ -179,6 +179,35 @@ async fn seed_job(pool: &PgPool, job_id: Uuid, source_id: Uuid, dedupe_key: &str
     .expect("job seed should succeed");
 }
 
+async fn snapshot_table(pool: &PgPool, table: &str) -> (i64, String) {
+    let query = format!(
+        "SELECT COUNT(*)::BIGINT AS row_count, \
+                COALESCE(MD5(STRING_AGG(to_jsonb(t)::text, E'\\n' ORDER BY to_jsonb(t)::text)), MD5('')) AS digest \
+         FROM \"{table}\" AS t"
+    );
+    let row = sqlx::query(&query)
+        .fetch_one(pool)
+        .await
+        .expect("table snapshot should succeed");
+    (row.get("row_count"), row.get("digest"))
+}
+
+async fn snapshot_database(pool: &PgPool) -> Vec<(String, i64, String)> {
+    let tables: Vec<String> = sqlx::query_scalar(
+        "SELECT tablename FROM pg_tables WHERE schemaname = 'public' ORDER BY tablename",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("public table names should be readable");
+
+    let mut snapshot = Vec::with_capacity(tables.len());
+    for table in tables {
+        let (count, digest) = snapshot_table(pool, &table).await;
+        snapshot.push((table, count, digest));
+    }
+    snapshot
+}
+
 #[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
 async fn export_sources_only_includes_configuration_columns_and_omits_accounts(pool: PgPool) {
     let repo = PostgresConfigTransferRepository::new(pool.clone());
@@ -353,6 +382,176 @@ async fn export_both_sections_includes_both_consistently(pool: PgPool) {
 
     assert_eq!(bundle.sources.as_ref().map(Vec::len), Some(1));
     assert_eq!(bundle.weread_accounts.as_ref().map(Vec::len), Some(1));
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn preview_is_read_only_for_every_database_table(pool: PgPool) {
+    let repo = PostgresConfigTransferRepository::new(pool.clone());
+    let account_id = Uuid::new_v4();
+    let source_id = Uuid::new_v4();
+    seed_enrolled_account(
+        &pool,
+        account_id,
+        "Preview Account",
+        false,
+        b"preview-secret-ciphertext",
+        at(1_800_000_000),
+    )
+    .await;
+    seed_source_full(
+        &pool,
+        source_id,
+        "book-preview-read-only",
+        "Preview Source",
+        None,
+        Some(account_id),
+        0,
+        true,
+        "ready",
+        at(1_000),
+        None,
+        None,
+        3600,
+        20,
+        0,
+        3,
+    )
+    .await;
+    seed_article(&pool, source_id, "preview-article", "Preview article").await;
+    seed_job(&pool, Uuid::new_v4(), source_id, "preview-job").await;
+
+    let blob_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO asset_blobs (id, checksum_algorithm, checksum, byte_size, media_type, data) \
+         VALUES ($1, 'sha256', repeat('a', 64), 4, 'image/png', $2)",
+    )
+    .bind(blob_id)
+    .bind(b"data".as_slice())
+    .execute(&pool)
+    .await
+    .expect("asset blob seed should succeed");
+    sqlx::query(
+        "INSERT INTO asset_records (id, source_url, version, final_url, blob_id) \
+         VALUES ($1, 'https://example.test/preview.png', 1, 'https://example.test/preview.png', $2)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(blob_id)
+    .execute(&pool)
+    .await
+    .expect("asset record seed should succeed");
+    sqlx::query("INSERT INTO feed_tokens (source_id, token_hash) VALUES ($1, $2)")
+        .bind(source_id)
+        .bind([7_u8; 32].as_slice())
+        .execute(&pool)
+        .await
+        .expect("feed token seed should succeed");
+    sqlx::query(
+        "INSERT INTO account_leases (account_id, lease_owner, lease_token, lease_until, heartbeat_at) \
+         VALUES ($1, 'preview-test', $2, $3, $3)",
+    )
+    .bind(account_id)
+    .bind(Uuid::new_v4())
+    .bind(at(1_900_000_000))
+    .execute(&pool)
+    .await
+    .expect("account lease seed should succeed");
+
+    let before = snapshot_database(&pool).await;
+    let bundle = make_validated_bundle(
+        Some(vec![sample_portable_source(
+            source_id,
+            "book-preview-updated",
+            "Updated Preview Source",
+            Some(account_id),
+        )]),
+        Some(vec![sample_portable_account(
+            account_id,
+            "Updated Preview Account",
+            false,
+        )]),
+    );
+
+    repo.preview(&bundle).await.expect("preview should succeed");
+
+    let after = snapshot_database(&pool).await;
+    assert_eq!(before, after, "preview must not modify any database table");
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn export_fails_cleanly_when_a_section_exceeds_its_record_cap(pool: PgPool) {
+    sqlx::query(
+        "INSERT INTO sources (id, book_id, display_name) \
+         SELECT md5('export-cap-' || n::text)::uuid, \
+                'export-cap-book-' || n::text, 'Export cap source ' || n::text \
+         FROM generate_series(1, 1001) AS n",
+    )
+    .execute(&pool)
+    .await
+    .expect("source cap fixtures should insert");
+
+    let repo = PostgresConfigTransferRepository::new(pool);
+    let selection = ConfigExportSelection::new(true, false).expect("selection should be valid");
+    let error = repo
+        .export(selection)
+        .await
+        .expect_err("export must enforce cap");
+    assert!(matches!(
+        error,
+        ConfigTransferRepositoryError::Validation(
+            werrss::application::config_transfer::ConfigTransferValidationError::SectionTooLarge {
+                section: "sources",
+                count: 1001,
+                limit: 1000,
+            }
+        )
+    ));
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn unique_constraint_race_returns_structured_conflict(pool: PgPool) {
+    sqlx::query(
+        "CREATE FUNCTION inject_source_book_id_race() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN \
+             IF pg_trigger_depth() = 1 THEN \
+                 INSERT INTO sources (id, book_id, display_name) \
+                 VALUES (md5(NEW.id::text || '-race')::uuid, NEW.book_id, 'Racing source'); \
+             END IF; \
+             RETURN NEW; \
+         END; \
+         $$",
+    )
+    .execute(&pool)
+    .await
+    .expect("race trigger function should be created");
+    sqlx::query(
+        "CREATE TRIGGER inject_source_book_id_race \
+         BEFORE INSERT ON sources FOR EACH ROW EXECUTE FUNCTION inject_source_book_id_race()",
+    )
+    .execute(&pool)
+    .await
+    .expect("race trigger should be created");
+
+    let repo = PostgresConfigTransferRepository::new(pool);
+    let incoming_id = Uuid::new_v4();
+    let bundle = make_validated_bundle(
+        Some(vec![sample_portable_source(
+            incoming_id,
+            "book-race-conflict",
+            "Racing incoming source",
+            None,
+        )]),
+        None,
+    );
+
+    let error = repo
+        .apply(bundle)
+        .await
+        .expect_err("unique-constraint race should conflict");
+    assert!(matches!(
+        error,
+        ConfigTransferRepositoryError::Conflict(conflict)
+            if conflict.kind == "unique_constraint_violation"
+    ));
 }
 
 #[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
@@ -981,6 +1180,50 @@ async fn mixed_import_conflict_rolls_back_all_mutations_atomically(pool: PgPool)
         "job-dedupe-original",
     )
     .await;
+    let blob_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO asset_blobs (id, checksum_algorithm, checksum, byte_size, media_type, data) \
+         VALUES ($1, 'sha256', repeat('b', 64), 7, 'image/png', $2)",
+    )
+    .bind(blob_id)
+    .bind(b"asset-data".as_slice())
+    .execute(&pool)
+    .await
+    .expect("rollback asset blob seed should succeed");
+    sqlx::query(
+        "INSERT INTO asset_records (id, source_url, version, final_url, blob_id) \
+         VALUES ($1, 'https://example.test/rollback.png', 1, 'https://example.test/rollback.png', $2)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(blob_id)
+    .execute(&pool)
+    .await
+    .expect("rollback asset record seed should succeed");
+    sqlx::query("INSERT INTO feed_tokens (source_id, token_hash) VALUES ($1, $2)")
+        .bind(existing_source_id)
+        .bind([8_u8; 32].as_slice())
+        .execute(&pool)
+        .await
+        .expect("rollback feed token seed should succeed");
+    sqlx::query(
+        "INSERT INTO account_leases (account_id, lease_owner, lease_token, lease_until, heartbeat_at) \
+         VALUES ($1, 'rollback-test', $2, $3, $3)",
+    )
+    .bind(existing_acct_id)
+    .bind(Uuid::new_v4())
+    .bind(at(1_900_000_000))
+    .execute(&pool)
+    .await
+    .expect("rollback account lease seed should succeed");
+    let mut collateral_before_rows = Vec::new();
+    for table in [
+        "asset_records",
+        "asset_blobs",
+        "feed_tokens",
+        "account_leases",
+    ] {
+        collateral_before_rows.push((table, snapshot_table(&pool, table).await));
+    }
 
     // Bundle contains:
     // 1. New account (to be created as placeholder)
@@ -1072,4 +1315,12 @@ async fn mixed_import_conflict_rolls_back_all_mutations_atomically(pool: PgPool)
             .await
             .unwrap();
     assert_eq!(job_count, 1);
+
+    for (table, before) in collateral_before_rows {
+        assert_eq!(
+            snapshot_table(&pool, table).await,
+            before,
+            "{table} unchanged"
+        );
+    }
 }

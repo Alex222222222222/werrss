@@ -360,6 +360,7 @@ impl TryFrom<ConfigBundle> for ValidatedConfigBundle {
             }
         }
 
+        bundle.serialize_limited()?;
         Ok(Self(bundle))
     }
 }
@@ -448,6 +449,18 @@ impl ConfigTransferConflict {
             book_id: Some(book_id),
             existing_source_id: Some(existing_source_id),
             message,
+        }
+    }
+
+    /// Creates a safe conflict for a unique constraint race detected by PostgreSQL.
+    pub fn unique_constraint_violation() -> Self {
+        Self {
+            kind: "unique_constraint_violation".to_string(),
+            source_id: None,
+            book_id: None,
+            existing_source_id: None,
+            message: "configuration conflicts with existing data; refresh preview and retry"
+                .to_string(),
         }
     }
 }
@@ -1661,6 +1674,24 @@ mod tests {
             ValidatedConfigBundle::try_from(bundle).unwrap_err(),
             ConfigTransferValidationError::NoSectionsPresent
         );
+    }
+
+    #[test]
+    fn test_typed_bundle_rejects_serialized_payload_over_limit() {
+        let bundle = ConfigBundle::new(
+            Utc::now(),
+            None,
+            Some(vec![PortableWeReadAccount {
+                account_id: Uuid::new_v4(),
+                display_name: "a".repeat(MAX_BUNDLE_BYTES),
+                enabled: true,
+            }]),
+        );
+
+        assert!(matches!(
+            ValidatedConfigBundle::try_from(bundle),
+            Err(ConfigTransferValidationError::PayloadTooLarge { .. })
+        ));
     }
 
     #[test]
