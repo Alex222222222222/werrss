@@ -82,7 +82,9 @@ use sqlx::PgPool;
 use thiserror::Error;
 
 use crate::{
-    archive::asset_store::{AssetBlobStore, AssetCachePolicy, AssetInput},
+    archive::asset_store::{
+        AssetBlobStore, AssetCachePolicy, AssetInput, AssetRefreshPolicy, AssetRepairPolicy,
+    },
     domain::job::{Job, NewJob},
 };
 
@@ -123,6 +125,8 @@ pub enum UnitOfWorkError {
 pub struct UnitOfWorkFactory {
     pool: PgPool,
     blob_store: Arc<dyn AssetBlobStore>,
+    refresh_policy: AssetRefreshPolicy,
+    repair_policy: AssetRepairPolicy,
 }
 
 impl fmt::Debug for UnitOfWorkFactory {
@@ -142,12 +146,29 @@ impl UnitOfWorkFactory {
 
     /// Creates a factory with an injected binary asset backend.
     pub fn with_blob_store(pool: PgPool, blob_store: Arc<dyn AssetBlobStore>) -> Self {
-        Self { pool, blob_store }
+        Self {
+            pool,
+            blob_store,
+            refresh_policy: AssetRefreshPolicy::default(),
+            repair_policy: AssetRepairPolicy::default(),
+        }
+    }
+
+    /// Uses the same lineage limits as refresh admission for terminal outcomes.
+    pub const fn with_refresh_policy(mut self, policy: AssetRefreshPolicy) -> Self {
+        self.refresh_policy = policy;
+        self
+    }
+
+    /// Uses the configured global recovery bound for complete acquisitions.
+    pub const fn with_repair_policy(mut self, policy: AssetRepairPolicy) -> Self {
+        self.repair_policy = policy;
+        self
     }
 
     /// Begins a transaction whose repository views share one commit boundary.
     pub async fn begin(&self) -> Result<UnitOfWork<'_>, UnitOfWorkError> {
-        self.begin_with_assets(&[]).await
+        self.begin_with_assets_inner(&[], false, false).await
     }
 
     /// Begins a transaction after preflighting asset digests and raw-byte
@@ -157,19 +178,65 @@ impl UnitOfWorkFactory {
         &self,
         inputs: &[AssetInput],
     ) -> Result<UnitOfWork<'_>, UnitOfWorkError> {
+        self.begin_with_assets_inner(inputs, false, false).await
+    }
+
+    /// Begins an article acquisition transaction before source/article locks,
+    /// serializing lineage reconciliation with refresh admission.
+    pub async fn begin_article_acquisition_with_assets(
+        &self,
+        inputs: &[AssetInput],
+    ) -> Result<UnitOfWork<'_>, UnitOfWorkError> {
+        self.begin_with_assets_inner(inputs, true, true).await
+    }
+
+    /// Begins a refresh transaction after reserving asset capacity, even when
+    /// the acquisition produced no asset inputs. Refresh finalization takes
+    /// source/article row locks later, so capacity must be first in that order.
+    pub async fn begin_refresh_with_assets(
+        &self,
+        inputs: &[AssetInput],
+    ) -> Result<UnitOfWork<'_>, UnitOfWorkError> {
+        self.begin_with_assets_inner(inputs, true, false).await
+    }
+
+    async fn begin_with_assets_inner(
+        &self,
+        inputs: &[AssetInput],
+        reserve_capacity: bool,
+        reserve_recovery: bool,
+    ) -> Result<UnitOfWork<'_>, UnitOfWorkError> {
         tracing::trace!("beginning PostgreSQL unit of work");
         let mut jobs = PostgresJobTransaction::begin(&self.pool)
             .await
             .map_err(UnitOfWorkError::Transaction)?;
-        let asset_preparation = prepare_asset_batch(
-            self.blob_store.as_ref(),
-            jobs.transaction_mut().map_err(|error| {
+        jobs.set_refresh_policy(self.refresh_policy);
+        let transaction = jobs.transaction_mut().map_err(|error| {
+            UnitOfWorkError::AssetPreparation(AssetRepositoryError::Storage(error.to_string()))
+        })?;
+        if reserve_capacity {
+            sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('asset-capacity', 0))")
+                .execute(&mut **transaction)
+                .await
+                .map_err(|error| {
+                    UnitOfWorkError::AssetPreparation(AssetRepositoryError::Storage(
+                        error.to_string(),
+                    ))
+                })?;
+        }
+        if reserve_recovery {
+            sqlx::query(
+                "SELECT pg_advisory_xact_lock(hashtextextended('asset-repair-admission', 0))",
+            )
+            .execute(&mut **transaction)
+            .await
+            .map_err(|error| {
                 UnitOfWorkError::AssetPreparation(AssetRepositoryError::Storage(error.to_string()))
-            })?,
-            inputs,
-        )
-        .await
-        .map_err(UnitOfWorkError::AssetPreparation)?;
+            })?;
+        }
+        let asset_preparation = prepare_asset_batch(self.blob_store.as_ref(), transaction, inputs)
+            .await
+            .map_err(UnitOfWorkError::AssetPreparation)?;
         let result = Ok(UnitOfWork {
             jobs: Some(jobs),
             asset_preparation: Some(asset_preparation),
@@ -177,6 +244,7 @@ impl UnitOfWorkFactory {
             pool: self.pool.clone(),
             mutation_state: Arc::new(Mutex::new(Default::default())),
             finished: Arc::new(AtomicBool::new(false)),
+            repair_policy: self.repair_policy,
         });
         if let Err(error) = &result {
             tracing::warn!(error = %error, "unable to begin PostgreSQL unit of work");
@@ -209,6 +277,7 @@ pub struct UnitOfWork<'a> {
     pool: PgPool,
     mutation_state: Arc<Mutex<super::repositories::asset_repository::AssetMutationState>>,
     finished: Arc<AtomicBool>,
+    repair_policy: AssetRepairPolicy,
 }
 
 /// Outcome-only view over the job transaction owned by [`UnitOfWork`].
@@ -299,6 +368,7 @@ impl<'a> UnitOfWork<'a> {
                 .expect("unit-of-work transaction is closed"),
             Arc::clone(&self.blob_store),
             self.asset_preparation.clone(),
+            self.repair_policy,
             policy,
             Arc::clone(&self.mutation_state),
         )
@@ -482,6 +552,44 @@ impl Drop for UnitOfWork<'_> {
                 "implicitly rolled back unit of work with external blobs outside an async runtime"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[sqlx::test(migrator = "crate::persistence::postgres::MIGRATOR")]
+    async fn empty_article_acquisition_reserves_capacity_and_recovery_before_rows(pool: PgPool) {
+        let factory = UnitOfWorkFactory::new(pool.clone());
+        let uow = factory
+            .begin_article_acquisition_with_assets(&[])
+            .await
+            .unwrap();
+        let mut probe = pool.begin().await.unwrap();
+        for lock in ["asset-capacity", "asset-repair-admission"] {
+            assert!(
+                !sqlx::query_scalar::<_, bool>(
+                    "SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0))",
+                )
+                .bind(lock)
+                .fetch_one(&mut *probe)
+                .await
+                .unwrap(),
+                "{lock} must be reserved before caller row locks"
+            );
+        }
+        uow.rollback().await.unwrap();
+        for lock in ["asset-capacity", "asset-repair-admission"] {
+            assert!(sqlx::query_scalar::<_, bool>(
+                "SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0))",
+            )
+            .bind(lock)
+            .fetch_one(&mut *probe)
+            .await
+            .unwrap());
+        }
+        probe.rollback().await.unwrap();
     }
 }
 

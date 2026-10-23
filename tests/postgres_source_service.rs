@@ -294,6 +294,54 @@ async fn source_service_operator_changes_report_missing_sources(pool: PgPool) {
     ));
 }
 
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn source_deletion_waits_for_asset_recovery_locks_before_locking_source(pool: PgPool) {
+    let service = service(&pool);
+    let source_id = SourceId::from_uuid(Uuid::new_v4());
+    service
+        .create(source_spec(source_id, "book-delete-lock-order"))
+        .await
+        .expect("source should be created");
+
+    let mut capacity = pool
+        .begin()
+        .await
+        .expect("capacity transaction should begin");
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('asset-capacity', 0))")
+        .execute(&mut *capacity)
+        .await
+        .expect("capacity lock should be acquired");
+
+    let delete = tokio::spawn(async move { service.delete(source_id).await });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(
+        !delete.is_finished(),
+        "deletion must wait on asset capacity before locking the source"
+    );
+
+    let mut source_probe = pool.begin().await.expect("source probe should begin");
+    let source_locked: Option<Uuid> =
+        sqlx::query_scalar("SELECT id FROM sources WHERE id = $1 FOR UPDATE NOWAIT")
+            .bind(source_id.as_uuid())
+            .fetch_optional(&mut *source_probe)
+            .await
+            .expect("deletion must not hold the source row while waiting for capacity");
+    assert_eq!(source_locked, Some(source_id.as_uuid()));
+    source_probe
+        .rollback()
+        .await
+        .expect("source probe should roll back");
+
+    capacity
+        .commit()
+        .await
+        .expect("capacity lock should release");
+    delete
+        .await
+        .expect("delete task should finish")
+        .expect("source deletion should complete");
+}
+
 fn service(pool: &PgPool) -> SourceService {
     SourceService::new(
         werrss::persistence::repositories::source_repository::PostgresSourceRepository::new(

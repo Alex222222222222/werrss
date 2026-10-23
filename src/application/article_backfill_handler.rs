@@ -423,7 +423,7 @@ where
         let mut unit_of_work = self
             .dependencies
             .unit_of_work
-            .begin_with_assets(&asset_inputs)
+            .begin_article_acquisition_with_assets(&asset_inputs)
             .await
             .map_err(|_| ())?;
         // Source-owned writes use the source row as their first lock. Source
@@ -463,12 +463,16 @@ where
                 let current_has_cached_representation = current_article
                     .as_ref()
                     .is_some_and(|current| current.content_html().contains("/assets/"));
+                let complete_assets = crate::application::sync_service::complete_asset_set(
+                    prepared.external_assets(),
+                    &fetched_assets,
+                );
                 let preserve_cached_representation = should_preserve_cached_asset_representation(
                     current_article
                         .as_ref()
                         .map(|current| current.content_html()),
-                    prepared.external_assets().len(),
-                    fetched_assets.len(),
+                    prepared.external_assets(),
+                    &fetched_assets,
                 );
                 if preserve_cached_representation {
                     if let Some(current) = current_article.as_ref() {
@@ -512,6 +516,16 @@ where
                                     Some(crate::application::archive_service::sha256_hex(
                                         article_to_persist.content_html.as_bytes(),
                                     ));
+                            }
+                            if complete_assets {
+                                let mut assets = unit_of_work.assets(archiver.policy());
+                                assets
+                                    .reset_article_refresh_lineage(
+                                        article.source_id,
+                                        &article.review_id,
+                                    )
+                                    .await
+                                    .map_err(|_| ())?;
                             }
                         }
                         Err(
@@ -561,6 +575,7 @@ where
                     let mut articles = unit_of_work.articles();
                     articles.upsert(article_to_persist).await.map_err(|_| ())?
                 };
+
                 result.feed_visible_change()
             }
         } else {

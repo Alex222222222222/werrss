@@ -23,12 +23,15 @@ use uuid::Uuid;
 
 use crate::archive::asset_store::{
     AssetBlob, AssetBlobKey, AssetBlobMetadata, AssetBlobStore, AssetBlobStoreError,
-    AssetCachePolicy, AssetInput, AssetMaintenanceResult, AssetRead, AssetRepairPolicy,
-    AssetRepairTarget, StoredAsset,
+    AssetCachePolicy, AssetInput, AssetMaintenanceResult, AssetRead, AssetRefreshPolicy,
+    AssetRepairPolicy, AssetRepairTarget, StoredAsset,
 };
 use crate::domain::job::{JobType, NewJob};
+use crate::domain::url_policy::has_provider_signature;
 
-use super::job_repository::{JobLease, JobRepositoryError, PostgresJobTransaction};
+use super::job_repository::{
+    JobLease, JobRepositoryError, JobRepositoryTransaction, PostgresJobTransaction,
+};
 
 // Keep one queue-level retry independent from the per-asset admission budget:
 // an expired lease must be claimable by another worker even when the public
@@ -109,6 +112,67 @@ pub enum AssetRepairEnqueueResult {
     Backoff,
     /// The bounded repair-attempt budget is exhausted.
     Exhausted,
+    /// A refresh chain is active or pending without an eligible snapshot entry.
+    Retryable,
+}
+
+/// Immutable target persisted on one admitted whole-article refresh job.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArticleRefreshTarget {
+    /// Article source identity.
+    pub source_id: crate::domain::source::SourceId,
+    /// Article provider identity.
+    pub review_id: String,
+    /// Asset record whose expiry triggered this generation.
+    pub expired_asset_record_id: Uuid,
+    /// Active serial chain identity.
+    pub chain_id: Uuid,
+    /// Entry ordinal, also the active chain's forward cursor.
+    pub chain_ordinal: i64,
+    /// Generation captured by this immutable snapshot.
+    pub served_generation: i64,
+}
+
+/// Terminal result for a whole-article refresh attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArticleRefreshOutcome {
+    /// Full article and all required assets were acquired and committed.
+    Succeeded,
+    /// The page or one or more required assets were incomplete.
+    Inconclusive,
+    /// A newer observation superseded this refresh.
+    Superseded,
+    /// The article was deleted before this refresh committed.
+    Deleted,
+}
+
+/// Result of a terminal refresh transition and serial successor admission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RefreshFinishResult {
+    /// Successor refresh job admitted into the same capacity slot, if any.
+    pub next_job_id: Option<Uuid>,
+    /// Whether this generation no longer has unfinished entries.
+    pub generation_completed: bool,
+}
+
+/// Result of routing a confirmed asset expiry through the refresh snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssetRefreshAdmissionResult {
+    /// No article from the selected snapshot is eligible now.
+    NoEligibleArticle,
+    /// One refresh was admitted using the triggering job's capacity slot.
+    Enqueued {
+        /// Inserted durable job.
+        job_id: Uuid,
+        /// Serial chain identity.
+        chain_id: Uuid,
+        /// Snapshot generation.
+        generation: i64,
+        /// Selected article ordinal.
+        ordinal: i64,
+    },
+    /// This repair job had already been completed or refunded.
+    AlreadyHandled,
 }
 
 /// Result of restoring bytes into an existing stable asset record.
@@ -153,6 +217,38 @@ pub trait AssetTransactionRepository {
         review_id: &str,
         inputs: &[AssetInput],
     ) -> Result<Vec<StoredAsset>, AssetRepositoryError>;
+
+    /// Locks and returns the persisted target for a live, fenced refresh job.
+    async fn begin_article_refresh(
+        &mut self,
+        lease: &JobLease,
+    ) -> Result<Option<ArticleRefreshTarget>, AssetRepositoryError>;
+
+    /// Applies one refresh outcome and admits a serial successor when eligible.
+    async fn finish_article_refresh(
+        &mut self,
+        lease: &JobLease,
+        outcome: ArticleRefreshOutcome,
+        policy: AssetRefreshPolicy,
+    ) -> Result<RefreshFinishResult, AssetRepositoryError>;
+
+    /// Fenced-succeeds a refresh job whose persisted target cannot be validated.
+    async fn complete_unresolvable_article_refresh(
+        &mut self,
+        lease: &JobLease,
+    ) -> Result<(), AssetRepositoryError>;
+
+    /// Clears article refresh lineage after a complete usable normal acquisition.
+    ///
+    /// The caller's unit of work must already hold the asset-capacity and
+    /// recovery-admission locks (for example
+    /// `UnitOfWorkFactory::begin_article_acquisition_with_assets`) because this
+    /// method reconciles generations and may admit a successor refresh job.
+    async fn reset_article_refresh_lineage(
+        &mut self,
+        source_id: crate::domain::source::SourceId,
+        review_id: &str,
+    ) -> Result<(), AssetRepositoryError>;
 }
 
 /// PostgreSQL implementation of the backend-neutral binary storage port.
@@ -466,6 +562,7 @@ pub struct PostgresAssetStore {
     blob_store: Arc<dyn AssetBlobStore>,
     policy: AssetCachePolicy,
     repair_policy: AssetRepairPolicy,
+    refresh_policy: AssetRefreshPolicy,
 }
 
 impl fmt::Debug for PostgresAssetStore {
@@ -475,6 +572,7 @@ impl fmt::Debug for PostgresAssetStore {
             .field("pool", &"<postgres pool>")
             .field("policy", &self.policy)
             .field("repair_policy", &self.repair_policy)
+            .field("refresh_policy", &self.refresh_policy)
             .finish()
     }
 }
@@ -505,6 +603,7 @@ impl PostgresAssetStore {
             pool,
             policy,
             repair_policy: AssetRepairPolicy::default(),
+            refresh_policy: AssetRefreshPolicy::default(),
         }
     }
 
@@ -527,6 +626,17 @@ impl PostgresAssetStore {
     /// Returns the repair admission policy used by this store.
     pub const fn repair_policy(&self) -> AssetRepairPolicy {
         self.repair_policy
+    }
+
+    /// Applies the bounded article-lineage policy for refresh admission.
+    pub const fn with_refresh_policy(mut self, refresh_policy: AssetRefreshPolicy) -> Self {
+        self.refresh_policy = refresh_policy;
+        self
+    }
+
+    /// Returns the article-lineage refresh policy used by this store.
+    pub const fn refresh_policy(&self) -> AssetRefreshPolicy {
+        self.refresh_policy
     }
 
     /// Reads one referenced asset and touches its last-accessed timestamp.
@@ -688,9 +798,109 @@ impl PostgresAssetStore {
             &mut transaction,
             self.blob_store.as_ref(),
             self.repair_policy,
+            self.refresh_policy,
             asset_id,
         )
         .await?;
+        transaction.commit_inner().await.map_err(storage_error)?;
+        Ok(result)
+    }
+
+    /// Atomically refunds confirmed public expiry and transfers the repair slot
+    /// to one eligible whole-article refresh job.
+    pub async fn finish_confirmed_expiry(
+        &self,
+        lease: &JobLease,
+        asset_id: Uuid,
+    ) -> Result<AssetRefreshAdmissionResult, AssetRepositoryError> {
+        if lease.job.job_type() != JobType::AssetRepair {
+            return Err(AssetRepositoryError::InvalidMetadata);
+        }
+        let owner = lease
+            .job
+            .lease_owner()
+            .ok_or(AssetRepositoryError::LeaseLost)?;
+        let mut transaction = PostgresJobTransaction::begin(&self.pool)
+            .await
+            .map_err(storage_error)?;
+        {
+            let sql_transaction = transaction
+                .transaction_mut()
+                .map_err(job_transaction_error)?;
+            lock_asset_capacity(sql_transaction).await?;
+            lock_asset_recovery_admission(sql_transaction).await?;
+            lock_live_repair_lease(sql_transaction, lease).await?;
+        }
+        let repair = sqlx::query(
+            "SELECT admission_class, asset_record_id, expired_asset_record_id, expiry_refunded
+             FROM asset_repair_jobs WHERE job_id = $1 FOR UPDATE",
+        )
+        .bind(lease.job.id())
+        .fetch_optional(
+            &mut **transaction
+                .transaction_mut()
+                .map_err(job_transaction_error)?,
+        )
+        .await
+        .map_err(storage_error)?
+        .ok_or(AssetRepositoryError::InvalidMetadata)?;
+        let admission_class: String = repair.try_get("admission_class").map_err(storage_error)?;
+        let repair_asset_id: Option<Uuid> =
+            repair.try_get("asset_record_id").map_err(storage_error)?;
+        if repair_asset_id.is_some_and(|current| current != asset_id) {
+            return Err(AssetRepositoryError::InvalidMetadata);
+        }
+        if admission_class == "public_repair"
+            && !repair
+                .try_get::<bool, _>("expiry_refunded")
+                .map_err(storage_error)?
+        {
+            let cooldown = i64::try_from(self.repair_policy.requeue_after().as_secs())
+                .map_err(|_| AssetRepositoryError::InvalidMetadata)?;
+            let sql_transaction = transaction
+                .transaction_mut()
+                .map_err(job_transaction_error)?;
+            sqlx::query(
+                "UPDATE asset_repair_states
+                 SET admitted_attempts = GREATEST(admitted_attempts - 1, 0),
+                     next_allowed_at = clock_timestamp()
+                         + make_interval(secs => $2::double precision),
+                     exhausted = FALSE, last_error = NULL,
+                     updated_at = clock_timestamp()
+                 WHERE asset_record_id = $1",
+            )
+            .bind(asset_id)
+            .bind(cooldown)
+            .execute(&mut **sql_transaction)
+            .await
+            .map_err(storage_error)?;
+            sqlx::query(
+                "UPDATE asset_repair_jobs SET expiry_refunded = TRUE
+                 WHERE job_id = $1 AND admission_class = 'public_repair'
+                   AND expiry_refunded = FALSE",
+            )
+            .bind(lease.job.id())
+            .execute(&mut **sql_transaction)
+            .await
+            .map_err(storage_error)?;
+        }
+        let result = route_confirmed_expiry(
+            &mut transaction,
+            self.blob_store.as_ref(),
+            asset_id,
+            self.repair_policy,
+            self.refresh_policy,
+        )
+        .await?;
+        JobRepositoryTransaction::succeed(
+            &mut transaction,
+            lease.job.id(),
+            owner,
+            lease.token,
+            Utc::now(),
+        )
+        .await
+        .map_err(job_transaction_error)?;
         transaction.commit_inner().await.map_err(storage_error)?;
         Ok(result)
     }
@@ -968,6 +1178,59 @@ impl PostgresAssetStore {
         Ok(())
     }
 
+    /// Resumes a bounded pass of durable pending generations without a request.
+    pub async fn resume_pending_refreshes(&self) -> Result<(), AssetRepositoryError> {
+        let mut jobs = PostgresJobTransaction::begin(&self.pool)
+            .await
+            .map_err(storage_error)?;
+        let transaction = jobs.transaction_mut().map_err(job_transaction_error)?;
+        lock_asset_capacity(transaction).await?;
+        lock_asset_recovery_admission(transaction).await?;
+        // Oldest-first with a per-scan touch keeps the bounded window rotating,
+        // so a permanently cooling generation cannot starve later assets. An
+        // asset with an active repair keeps the repair slot and is skipped.
+        // The window is deliberately small: each candidate may stat a network
+        // blob backend while this transaction holds the global capacity lock
+        // that public asset reads also take.
+        const PENDING_SCAN_LIMIT: i64 = 16;
+        let assets = sqlx::query_scalar::<_, Uuid>(
+            "SELECT s.asset_record_id FROM asset_record_refresh_state AS s
+             WHERE s.active_chain_id IS NULL
+               AND s.requested_generation > s.completed_generation
+               AND NOT EXISTS (
+                   SELECT 1 FROM asset_repair_jobs AS arj
+                   JOIN jobs AS j ON j.id = arj.job_id
+                   WHERE arj.asset_record_id = s.asset_record_id
+                     AND j.status IN ('queued', 'running', 'retry_wait', 'deferred')
+               )
+             ORDER BY s.updated_at, s.asset_record_id LIMIT $1",
+        )
+        .bind(PENDING_SCAN_LIMIT)
+        .fetch_all(&mut **transaction)
+        .await
+        .map_err(storage_error)?;
+        for asset_id in assets {
+            resume_refresh_after_cache_miss(
+                &mut jobs,
+                self.blob_store.as_ref(),
+                asset_id,
+                self.repair_policy,
+                self.refresh_policy,
+            )
+            .await?;
+            let transaction = jobs.transaction_mut().map_err(job_transaction_error)?;
+            sqlx::query(
+                "UPDATE asset_record_refresh_state SET updated_at = clock_timestamp()
+                 WHERE asset_record_id = $1",
+            )
+            .bind(asset_id)
+            .execute(&mut **transaction)
+            .await
+            .map_err(storage_error)?;
+        }
+        jobs.commit_inner().await.map_err(storage_error)
+    }
+
     /// Evicts stale/old binary data and removes rows without article
     /// relationships. This operation never deletes a referenced URL record.
     pub async fn maintenance(&self) -> Result<AssetMaintenanceResult, AssetRepositoryError> {
@@ -1155,23 +1418,25 @@ async fn enqueue_repair_in_transaction(
     job_transaction: &mut PostgresJobTransaction<'_>,
     blob_store: &dyn AssetBlobStore,
     policy: AssetRepairPolicy,
+    refresh_policy: AssetRefreshPolicy,
     asset_id: Uuid,
 ) -> Result<AssetRepairEnqueueResult, AssetRepositoryError> {
-    let sql_transaction = job_transaction
-        .transaction_mut()
-        .map_err(job_transaction_error)?;
-    // Coordinate admission with maintenance's orphan deletion. Capacity is
-    // the first lock in the asset write order; without it, maintenance can
-    // snapshot this record as an orphan, wait for its row lock, and delete it
-    // after the repair job commits.
-    lock_asset_capacity(sql_transaction).await?;
-    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('asset-repair-admission', 0))")
-        .execute(&mut **sql_transaction)
-        .await
-        .map_err(storage_error)?;
+    {
+        let sql_transaction = job_transaction
+            .transaction_mut()
+            .map_err(job_transaction_error)?;
+        // Coordinate admission with maintenance's orphan deletion. Capacity is
+        // the first lock in the asset write order; without it, maintenance can
+        // snapshot this record as an orphan, wait for its row lock, and delete it
+        // after the repair job commits.
+        lock_asset_capacity(sql_transaction).await?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('asset-repair-admission', 0))")
+            .execute(&mut **sql_transaction)
+            .await
+            .map_err(storage_error)?;
 
-    let target = sqlx::query(
-        "SELECT r.blob_id
+        let target = sqlx::query(
+            "SELECT r.blob_id
          FROM asset_records AS r
          WHERE r.id = $1
            AND EXISTS (
@@ -1179,104 +1444,168 @@ async fn enqueue_repair_in_transaction(
                WHERE aa.asset_record_id = r.id
            )
          FOR UPDATE OF r",
-    )
-    .bind(asset_id)
-    .fetch_optional(&mut **sql_transaction)
-    .await
-    .map_err(storage_error)?;
-    let Some(target) = target else {
-        return Ok(AssetRepairEnqueueResult::NotFound);
-    };
-    if let Some(blob_id) = target
-        .try_get::<Option<Uuid>, _>("blob_id")
-        .map_err(storage_error)?
-    {
-        if !blob_deletion_pending(sql_transaction, blob_id).await?
-            && blob_stat_in_transaction(
+        )
+        .bind(asset_id)
+        .fetch_optional(&mut **sql_transaction)
+        .await
+        .map_err(storage_error)?;
+        let Some(target) = target else {
+            if let Some(result) = resume_refresh_after_cache_miss(
+                job_transaction,
                 blob_store,
-                sql_transaction,
-                &AssetBlobKey::for_blob_id(blob_id),
+                asset_id,
+                policy,
+                refresh_policy,
             )
             .await?
-            .is_some_and(|metadata| metadata.is_present())
+            {
+                return Ok(result);
+            }
+            return Ok(AssetRepairEnqueueResult::NotFound);
+        };
+        if let Some(blob_id) = target
+            .try_get::<Option<Uuid>, _>("blob_id")
+            .map_err(storage_error)?
         {
-            return Ok(AssetRepairEnqueueResult::AlreadyAvailable);
+            if !blob_deletion_pending(sql_transaction, blob_id).await?
+                && blob_stat_in_transaction(
+                    blob_store,
+                    sql_transaction,
+                    &AssetBlobKey::for_blob_id(blob_id),
+                )
+                .await?
+                .is_some_and(|metadata| metadata.is_present())
+            {
+                return Ok(AssetRepairEnqueueResult::AlreadyAvailable);
+            }
         }
-    }
 
-    let active = sqlx::query(
-        "SELECT j.id
+        let active = sqlx::query(
+            "SELECT j.id
          FROM asset_repair_jobs AS arj
          JOIN jobs AS j ON j.id = arj.job_id
          WHERE arj.asset_record_id = $1
            AND j.status IN ('queued', 'running', 'retry_wait', 'deferred')
          ORDER BY j.created_at ASC
          LIMIT 1",
-    )
-    .bind(asset_id)
-    .fetch_optional(&mut **sql_transaction)
-    .await
-    .map_err(storage_error)?;
-    if let Some(active) = active {
-        return Ok(AssetRepairEnqueueResult::AlreadyActive {
-            job_id: active.try_get("id").map_err(storage_error)?,
-        });
+        )
+        .bind(asset_id)
+        .fetch_optional(&mut **sql_transaction)
+        .await
+        .map_err(storage_error)?;
+        if let Some(active) = active {
+            return Ok(AssetRepairEnqueueResult::AlreadyActive {
+                job_id: active.try_get("id").map_err(storage_error)?,
+            });
+        }
     }
 
-    let state = sqlx::query(
-        "SELECT admitted_attempts, next_allowed_at, exhausted
+    if let Some(result) = resume_refresh_after_cache_miss(
+        job_transaction,
+        blob_store,
+        asset_id,
+        policy,
+        refresh_policy,
+    )
+    .await?
+    {
+        return Ok(result);
+    }
+
+    {
+        let sql_transaction = job_transaction
+            .transaction_mut()
+            .map_err(job_transaction_error)?;
+        // No active or pending generation is left, so a live article's refresh
+        // lineage decides the miss: all exhausted is terminal, a cooling
+        // article is retryable, and only an eligible one may admit a repair.
+        let (live, exhausted, cooling) = sqlx::query_as::<_, (i64, i64, i64)>(
+            "SELECT count(*)::bigint,
+                    count(*) FILTER (
+                        WHERE COALESCE(l.exhausted, FALSE)
+                           OR COALESCE(l.attempts, 0) >= $2
+                    )::bigint,
+                    count(*) FILTER (
+                        WHERE NOT (COALESCE(l.exhausted, FALSE)
+                                   OR COALESCE(l.attempts, 0) >= $2)
+                          AND l.next_allowed_at > clock_timestamp()
+                    )::bigint
+             FROM article_assets AS aa
+             JOIN articles AS a
+               ON a.source_id = aa.source_id AND a.review_id = aa.review_id
+             LEFT JOIN asset_article_refresh_lineage AS l
+               ON l.source_id = aa.source_id AND l.review_id = aa.review_id
+             WHERE aa.asset_record_id = $1",
+        )
+        .bind(asset_id)
+        .bind(i64::from(refresh_policy.max_attempts()))
+        .fetch_one(&mut **sql_transaction)
+        .await
+        .map_err(storage_error)?;
+        if live > 0 && exhausted == live {
+            return Ok(AssetRepairEnqueueResult::Exhausted);
+        }
+        if live > 0 && exhausted + cooling == live {
+            return Ok(AssetRepairEnqueueResult::Retryable);
+        }
+
+        let state = sqlx::query(
+            "SELECT admitted_attempts, next_allowed_at, exhausted
          FROM asset_repair_states
          WHERE asset_record_id = $1
          FOR UPDATE",
-    )
-    .bind(asset_id)
-    .fetch_optional(&mut **sql_transaction)
-    .await
-    .map_err(storage_error)?;
-    if let Some(state) = &state {
-        let exhausted: bool = state.try_get("exhausted").map_err(storage_error)?;
-        if exhausted {
-            return Ok(AssetRepairEnqueueResult::Exhausted);
+        )
+        .bind(asset_id)
+        .fetch_optional(&mut **sql_transaction)
+        .await
+        .map_err(storage_error)?;
+        if let Some(state) = &state {
+            let exhausted: bool = state.try_get("exhausted").map_err(storage_error)?;
+            if exhausted {
+                return Ok(AssetRepairEnqueueResult::Exhausted);
+            }
+            let next_allowed_at = state
+                .try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("next_allowed_at")
+                .map_err(storage_error)?;
+            let db_now: chrono::DateTime<chrono::Utc> =
+                sqlx::query_scalar("SELECT clock_timestamp()")
+                    .fetch_one(&mut **sql_transaction)
+                    .await
+                    .map_err(storage_error)?;
+            if next_allowed_at.is_some_and(|next| next > db_now) {
+                return Ok(AssetRepairEnqueueResult::Backoff);
+            }
+            let admitted_attempts: i64 =
+                state.try_get("admitted_attempts").map_err(storage_error)?;
+            if admitted_attempts >= i64::from(policy.max_attempts()) {
+                return Ok(AssetRepairEnqueueResult::Exhausted);
+            }
         }
-        let next_allowed_at = state
-            .try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("next_allowed_at")
-            .map_err(storage_error)?;
-        let db_now: chrono::DateTime<chrono::Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
-            .fetch_one(&mut **sql_transaction)
-            .await
-            .map_err(storage_error)?;
-        if next_allowed_at.is_some_and(|next| next > db_now) {
-            return Ok(AssetRepairEnqueueResult::Backoff);
-        }
-        let admitted_attempts: i64 = state.try_get("admitted_attempts").map_err(storage_error)?;
-        if admitted_attempts >= i64::from(policy.max_attempts()) {
-            return Ok(AssetRepairEnqueueResult::Exhausted);
-        }
-    }
 
-    let global_pending: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*)::bigint
+        let global_pending: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)::bigint
          FROM asset_repair_jobs AS arj
          JOIN jobs AS j ON j.id = arj.job_id
          WHERE j.status IN ('queued', 'running', 'retry_wait', 'deferred')",
-    )
-    .fetch_one(&mut **sql_transaction)
-    .await
-    .map_err(storage_error)?;
-    let public_pending: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*)::bigint
+        )
+        .fetch_one(&mut **sql_transaction)
+        .await
+        .map_err(storage_error)?;
+        let public_pending: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)::bigint
          FROM asset_repair_jobs AS arj
          JOIN jobs AS j ON j.id = arj.job_id
          WHERE arj.admission_class = 'public_repair'
            AND j.status IN ('queued', 'running', 'retry_wait', 'deferred')",
-    )
-    .fetch_one(&mut **sql_transaction)
-    .await
-    .map_err(storage_error)?;
-    if global_pending >= i64::from(policy.max_pending())
-        || public_pending >= i64::from(policy.public_max_pending())
-    {
-        return Ok(AssetRepairEnqueueResult::CapacityFull);
+        )
+        .fetch_one(&mut **sql_transaction)
+        .await
+        .map_err(storage_error)?;
+        if global_pending >= i64::from(policy.max_pending())
+            || public_pending >= i64::from(policy.public_max_pending())
+        {
+            return Ok(AssetRepairEnqueueResult::CapacityFull);
+        }
     }
 
     let now = Utc::now();
@@ -1463,6 +1792,7 @@ pub struct PostgresAssetTransaction<'borrow, 'pool> {
     job_transaction: &'borrow mut PostgresJobTransaction<'pool>,
     blob_store: Arc<dyn AssetBlobStore>,
     preparation: Option<AssetBatchPreparation>,
+    repair_policy: AssetRepairPolicy,
     policy: AssetCachePolicy,
     mutation_state: Arc<Mutex<AssetMutationState>>,
 }
@@ -1502,6 +1832,7 @@ impl<'borrow, 'pool> PostgresAssetTransaction<'borrow, 'pool> {
         job_transaction: &'borrow mut PostgresJobTransaction<'pool>,
         blob_store: Arc<dyn AssetBlobStore>,
         preparation: Option<AssetBatchPreparation>,
+        repair_policy: AssetRepairPolicy,
         policy: AssetCachePolicy,
         mutation_state: Arc<Mutex<AssetMutationState>>,
     ) -> Self {
@@ -1509,6 +1840,7 @@ impl<'borrow, 'pool> PostgresAssetTransaction<'borrow, 'pool> {
             job_transaction,
             blob_store,
             preparation,
+            repair_policy,
             policy,
             mutation_state,
         }
@@ -1697,6 +2029,362 @@ impl AssetTransactionRepository for PostgresAssetTransaction<'_, '_> {
             }
         }
     }
+
+    async fn begin_article_refresh(
+        &mut self,
+        lease: &JobLease,
+    ) -> Result<Option<ArticleRefreshTarget>, AssetRepositoryError> {
+        let transaction = self.transaction()?;
+        lock_asset_capacity(transaction).await?;
+        lock_asset_recovery_admission(transaction).await?;
+        lock_live_repair_lease(transaction, lease).await?;
+        if lease.job.job_type() != JobType::AssetRefresh {
+            return Err(AssetRepositoryError::InvalidMetadata);
+        }
+        let Some(target) = lock_current_refresh_target(transaction, lease.job.id()).await? else {
+            return Ok(None);
+        };
+        let payload = lease.job.payload();
+        let payload_matches = payload["source_id"].as_str()
+            == Some(target.source_id.as_uuid().to_string().as_str())
+            && payload["review_id"].as_str() == Some(target.review_id.as_str())
+            && payload["expired_asset_record_id"].as_str()
+                == Some(target.expired_asset_record_id.to_string().as_str())
+            && payload["chain_id"].as_str() == Some(target.chain_id.to_string().as_str())
+            && payload["generation"].as_i64() == Some(target.served_generation)
+            && payload["ordinal"].as_i64() == Some(target.chain_ordinal);
+        // The entry this job owns must still be the in-flight snapshot identity
+        // the payload names; anything else is a superseded association.
+        let entry_is_current = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (
+                 SELECT 1 FROM asset_refresh_generation_entries
+                 WHERE asset_record_id = $1 AND generation = $2 AND ordinal = $3
+                   AND source_id = $4 AND review_id = $5 AND state = 'in_flight'
+             )",
+        )
+        .bind(target.expired_asset_record_id)
+        .bind(target.served_generation)
+        .bind(target.chain_ordinal)
+        .bind(target.source_id.as_uuid())
+        .bind(&target.review_id)
+        .fetch_one(&mut **transaction)
+        .await
+        .map_err(storage_error)?;
+        if !payload_matches
+            || !entry_is_current
+            || target.chain_ordinal <= 0
+            || target.served_generation <= 0
+        {
+            return Err(AssetRepositoryError::InvalidMetadata);
+        }
+        Ok(Some(target))
+    }
+
+    async fn finish_article_refresh(
+        &mut self,
+        lease: &JobLease,
+        outcome: ArticleRefreshOutcome,
+        policy: AssetRefreshPolicy,
+    ) -> Result<RefreshFinishResult, AssetRepositoryError> {
+        let Some(target) = self.begin_article_refresh(lease).await? else {
+            return Err(AssetRepositoryError::InvalidMetadata);
+        };
+        finish_article_refresh_in_transaction(
+            self.job_transaction,
+            lease,
+            &target,
+            self.blob_store.as_ref(),
+            outcome,
+            policy,
+        )
+        .await
+    }
+
+    async fn complete_unresolvable_article_refresh(
+        &mut self,
+        lease: &JobLease,
+    ) -> Result<(), AssetRepositoryError> {
+        if lease.job.job_type() != JobType::AssetRefresh {
+            return Err(AssetRepositoryError::InvalidMetadata);
+        }
+        let transaction = self.transaction()?;
+        lock_asset_capacity(transaction).await?;
+        lock_asset_recovery_admission(transaction).await?;
+        lock_live_repair_lease(transaction, lease).await?;
+        // Only persisted metadata can identify the association to terminalize;
+        // a malformed payload never guesses. Every update stays guarded on this
+        // chain's served generation so a newer unrelated chain is untouched.
+        // Pending work keeps its slot for the periodic selector.
+        if let Some(target) = lock_current_refresh_target(transaction, lease.job.id()).await? {
+            sqlx::query(
+                "UPDATE asset_refresh_generation_entries
+                 SET state = 'done', not_before = NULL
+                 WHERE asset_record_id = $1 AND generation = $2 AND ordinal = $3
+                   AND state = 'in_flight'",
+            )
+            .bind(target.expired_asset_record_id)
+            .bind(target.served_generation)
+            .bind(target.chain_ordinal)
+            .execute(&mut **transaction)
+            .await
+            .map_err(storage_error)?;
+            complete_refresh_generation_if_terminal(
+                transaction,
+                target.expired_asset_record_id,
+                target.served_generation,
+            )
+            .await?;
+            sqlx::query(
+                "UPDATE asset_record_refresh_state
+                 SET active_chain_id = NULL, updated_at = clock_timestamp()
+                 WHERE asset_record_id = $1 AND active_chain_id = $2
+                   AND served_generation = $3",
+            )
+            .bind(target.expired_asset_record_id)
+            .bind(target.chain_id)
+            .bind(target.served_generation)
+            .execute(&mut **transaction)
+            .await
+            .map_err(storage_error)?;
+        }
+        let owner = lease
+            .job
+            .lease_owner()
+            .ok_or(AssetRepositoryError::LeaseLost)?;
+        JobRepositoryTransaction::succeed(
+            self.job_transaction,
+            lease.job.id(),
+            owner,
+            lease.token,
+            Utc::now(),
+        )
+        .await
+        .map_err(job_transaction_error)?;
+        Ok(())
+    }
+
+    async fn reset_article_refresh_lineage(
+        &mut self,
+        source_id: crate::domain::source::SourceId,
+        review_id: &str,
+    ) -> Result<(), AssetRepositoryError> {
+        validate_article_identity(source_id, review_id)?;
+        let affected = {
+            let transaction = self.transaction()?;
+            sqlx::query(
+                "INSERT INTO asset_article_refresh_lineage
+                     (source_id, review_id, attempts, next_allowed_at, exhausted,
+                      last_outcome, updated_at)
+                 SELECT source_id, review_id, 0, NULL, FALSE, 'succeeded', clock_timestamp()
+                 FROM articles WHERE source_id = $1 AND review_id = $2
+                 ON CONFLICT (source_id, review_id) DO UPDATE
+                 SET attempts = 0, next_allowed_at = NULL, exhausted = FALSE,
+                     last_outcome = 'succeeded', updated_at = clock_timestamp()",
+            )
+            .bind(source_id.as_uuid())
+            .bind(review_id.trim())
+            .execute(&mut **transaction)
+            .await
+            .map_err(storage_error)?;
+            reconcile_article_refresh_entries(transaction, source_id.as_uuid(), review_id.trim())
+                .await?
+        };
+        // Reevaluate the affected generations in this same unit of work: complete
+        // terminal ones, then admit pending work while global capacity allows.
+        let blob_store = Arc::clone(&self.blob_store);
+        let refresh_policy = self.job_transaction.refresh_policy();
+        let repair_policy = self.repair_policy;
+        for (asset_id, generation) in affected {
+            let selection = {
+                let transaction = self.transaction()?;
+                if !refresh_capacity_available(transaction, repair_policy).await?
+                    || !refresh_generation_pending(transaction, asset_id, generation).await?
+                {
+                    None
+                } else {
+                    select_refresh_entry(
+                        transaction,
+                        blob_store.as_ref(),
+                        asset_id,
+                        generation,
+                        None,
+                        refresh_policy,
+                    )
+                    .await?
+                }
+            };
+            let Some(entry) = selection else {
+                let transaction = self.transaction()?;
+                complete_refresh_generation_if_terminal(transaction, asset_id, generation).await?;
+                continue;
+            };
+            admit_refresh_entry(
+                self.job_transaction,
+                asset_id,
+                generation,
+                Uuid::new_v4(),
+                entry,
+                refresh_policy,
+                true,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+}
+
+async fn reconcile_article_refresh_entries(
+    transaction: &mut Transaction<'_, Postgres>,
+    source_id: Uuid,
+    review_id: &str,
+) -> Result<Vec<(Uuid, i64)>, AssetRepositoryError> {
+    // Only the generations this article supersedes are reevaluated; unrelated
+    // per-asset high-water rows stay untouched.
+    let mut affected = sqlx::query_as::<_, (Uuid, i64)>(
+        "UPDATE asset_refresh_generation_entries
+         SET state = 'done', not_before = NULL
+         WHERE source_id = $1 AND review_id = $2 AND state IN ('unseen', 'cooling')
+         RETURNING asset_record_id, generation",
+    )
+    .bind(source_id)
+    .bind(review_id)
+    .fetch_all(&mut **transaction)
+    .await
+    .map_err(storage_error)?;
+    affected.sort_unstable();
+    affected.dedup();
+    for (asset_id, generation) in &affected {
+        complete_refresh_generation_if_terminal(transaction, *asset_id, *generation).await?;
+    }
+    Ok(affected)
+}
+
+/// Reports whether one more recovery job fits the cluster-wide bound.
+async fn refresh_capacity_available(
+    transaction: &mut Transaction<'_, Postgres>,
+    policy: AssetRepairPolicy,
+) -> Result<bool, AssetRepositoryError> {
+    let active = sqlx::query_scalar::<_, i64>(
+        "SELECT count(*)::bigint FROM asset_repair_jobs AS arj
+         JOIN jobs AS j ON j.id = arj.job_id
+         WHERE j.status IN ('queued', 'running', 'retry_wait', 'deferred')",
+    )
+    .fetch_one(&mut **transaction)
+    .await
+    .map_err(storage_error)?;
+    Ok(active < i64::from(policy.max_pending()))
+}
+
+/// Reports whether a generation still has work the selector may admit.
+async fn refresh_generation_pending(
+    transaction: &mut Transaction<'_, Postgres>,
+    asset_id: Uuid,
+    generation: i64,
+) -> Result<bool, AssetRepositoryError> {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (
+             SELECT 1 FROM asset_record_refresh_state
+             WHERE asset_record_id = $1 AND served_generation = $2
+               AND active_chain_id IS NULL
+               AND requested_generation > completed_generation
+         )",
+    )
+    .bind(asset_id)
+    .bind(generation)
+    .fetch_one(&mut **transaction)
+    .await
+    .map_err(storage_error)
+}
+
+/// Reads the persisted refresh association for one fenced job.
+///
+/// `for_update` locks the job's recovery-metadata row and the per-asset
+/// generation-state row. Callers lock those only after the source and article
+/// rows so finalization keeps the documented lock order.
+async fn read_refresh_target(
+    transaction: &mut Transaction<'_, Postgres>,
+    job_id: Uuid,
+    for_update: bool,
+) -> Result<Option<ArticleRefreshTarget>, AssetRepositoryError> {
+    let lock = if for_update {
+        " FOR UPDATE OF arj, ars"
+    } else {
+        ""
+    };
+    let row = sqlx::query(&format!(
+        "SELECT arj.refresh_source_id, arj.refresh_review_id,
+                arj.expired_asset_record_id, arj.chain_id, arj.chain_ordinal,
+                ars.served_generation
+         FROM asset_repair_jobs AS arj
+         JOIN asset_record_refresh_state AS ars
+           ON ars.asset_record_id = arj.expired_asset_record_id
+         WHERE arj.job_id = $1 AND arj.admission_class = 'internal_refresh'
+           AND arj.refresh_source_id IS NOT NULL
+           AND arj.refresh_review_id IS NOT NULL
+           AND arj.expired_asset_record_id IS NOT NULL
+           AND arj.chain_id IS NOT NULL AND arj.chain_ordinal IS NOT NULL
+           AND ars.active_chain_id = arj.chain_id{lock}",
+    ))
+    .bind(job_id)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(storage_error)?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    Ok(Some(ArticleRefreshTarget {
+        source_id: crate::domain::source::SourceId::from_uuid(
+            row.try_get("refresh_source_id").map_err(storage_error)?,
+        ),
+        review_id: row.try_get("refresh_review_id").map_err(storage_error)?,
+        expired_asset_record_id: row
+            .try_get("expired_asset_record_id")
+            .map_err(storage_error)?,
+        chain_id: row.try_get("chain_id").map_err(storage_error)?,
+        chain_ordinal: row.try_get("chain_ordinal").map_err(storage_error)?,
+        served_generation: row.try_get("served_generation").map_err(storage_error)?,
+    }))
+}
+
+/// Locks the source then article rows that a refresh mutation will touch.
+async fn lock_refresh_article_rows(
+    transaction: &mut Transaction<'_, Postgres>,
+    source_id: crate::domain::source::SourceId,
+    review_id: &str,
+) -> Result<(), AssetRepositoryError> {
+    sqlx::query("SELECT id FROM sources WHERE id = $1 FOR UPDATE")
+        .bind(source_id.as_uuid())
+        .fetch_optional(&mut **transaction)
+        .await
+        .map_err(storage_error)?;
+    sqlx::query(
+        "SELECT review_id FROM articles WHERE source_id = $1 AND review_id = $2 FOR UPDATE",
+    )
+    .bind(source_id.as_uuid())
+    .bind(review_id)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(storage_error)?;
+    Ok(())
+}
+
+/// Locks the current refresh association in the finalization lock order.
+///
+/// The unlocked read only learns which source/article rows to lock first; the
+/// association is re-read under its metadata locks and must be unchanged, so a
+/// concurrent terminalization never yields a stale target.
+async fn lock_current_refresh_target(
+    transaction: &mut Transaction<'_, Postgres>,
+    job_id: Uuid,
+) -> Result<Option<ArticleRefreshTarget>, AssetRepositoryError> {
+    let Some(peeked) = read_refresh_target(transaction, job_id, false).await? else {
+        return Ok(None);
+    };
+    lock_refresh_article_rows(transaction, peeked.source_id, &peeked.review_id).await?;
+    let Some(locked) = read_refresh_target(transaction, job_id, true).await? else {
+        return Ok(None);
+    };
+    Ok((locked == peeked).then_some(locked))
 }
 
 fn validate_input_count(
@@ -2449,6 +3137,1129 @@ async fn enforce_cache_limit(
     Ok(evicted)
 }
 
+async fn lock_asset_recovery_admission(
+    transaction: &mut Transaction<'_, Postgres>,
+) -> Result<(), AssetRepositoryError> {
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('asset-repair-admission', 0))")
+        .execute(&mut **transaction)
+        .await
+        .map_err(storage_error)?;
+    Ok(())
+}
+
+async fn snapshot_asset_generation(
+    transaction: &mut Transaction<'_, Postgres>,
+    asset_id: Uuid,
+    generation: i64,
+) -> Result<i64, AssetRepositoryError> {
+    sqlx::query(
+        "INSERT INTO asset_refresh_generation_entries
+             (asset_record_id, generation, ordinal, source_id, review_id, state)
+         SELECT $1, $2, row_number() OVER (ORDER BY source_id, review_id),
+                source_id, review_id, 'unseen'
+         FROM (
+             SELECT DISTINCT source_id, review_id
+             FROM article_assets WHERE asset_record_id = $1
+         ) AS live_articles",
+    )
+    .bind(asset_id)
+    .bind(generation)
+    .execute(&mut **transaction)
+    .await
+    .map_err(storage_error)?;
+    sqlx::query_scalar::<_, i64>(
+        "SELECT count(*)::bigint FROM asset_refresh_generation_entries
+         WHERE asset_record_id = $1 AND generation = $2",
+    )
+    .bind(asset_id)
+    .bind(generation)
+    .fetch_one(&mut **transaction)
+    .await
+    .map_err(storage_error)
+}
+
+async fn complete_refresh_generation_if_terminal(
+    transaction: &mut Transaction<'_, Postgres>,
+    asset_id: Uuid,
+    generation: i64,
+) -> Result<(), AssetRepositoryError> {
+    let unfinished = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (
+             SELECT 1 FROM asset_refresh_generation_entries
+             WHERE asset_record_id = $1 AND generation = $2 AND state <> 'done'
+         )",
+    )
+    .bind(asset_id)
+    .bind(generation)
+    .fetch_one(&mut **transaction)
+    .await
+    .map_err(storage_error)?;
+    if !unfinished {
+        sqlx::query(
+            "UPDATE asset_record_refresh_state
+             SET completed_generation = GREATEST(completed_generation, $2),
+                 updated_at = clock_timestamp()
+             WHERE asset_record_id = $1",
+        )
+        .bind(asset_id)
+        .bind(generation)
+        .execute(&mut **transaction)
+        .await
+        .map_err(storage_error)?;
+    }
+    Ok(())
+}
+
+async fn mark_exhausted_refresh_entries(
+    transaction: &mut Transaction<'_, Postgres>,
+    asset_id: Uuid,
+    generation: i64,
+    policy: AssetRefreshPolicy,
+) -> Result<(), AssetRepositoryError> {
+    sqlx::query(
+        "UPDATE asset_refresh_generation_entries AS e
+         SET state = 'done', not_before = NULL
+         FROM asset_article_refresh_lineage AS l
+         WHERE e.asset_record_id = $1 AND e.generation = $2
+           AND e.state IN ('unseen', 'cooling')
+           AND l.source_id = e.source_id AND l.review_id = e.review_id
+           AND (l.exhausted OR l.attempts >= $3)",
+    )
+    .bind(asset_id)
+    .bind(generation)
+    .bind(i64::from(policy.max_attempts()))
+    .execute(&mut **transaction)
+    .await
+    .map_err(storage_error)?;
+    Ok(())
+}
+
+/// Selects the next admissible snapshot entry for one generation.
+///
+/// Runs under the capacity and recovery-admission locks. The article, live
+/// relationship, blob, article-scoped dedupe key, and lineage are rechecked
+/// after the source and article rows are locked, so only a still-current entry
+/// becomes `in_flight`; a collision or stale entry is skipped without reserving
+/// an attempt.
+async fn select_refresh_entry(
+    transaction: &mut Transaction<'_, Postgres>,
+    blob_store: &dyn AssetBlobStore,
+    asset_id: Uuid,
+    generation: i64,
+    after_ordinal: Option<i64>,
+    policy: AssetRefreshPolicy,
+) -> Result<Option<(i64, Uuid, String)>, AssetRepositoryError> {
+    // Entries whose article or live relationship disappeared can never run.
+    sqlx::query(
+        "UPDATE asset_refresh_generation_entries AS e
+         SET state = 'done', not_before = NULL
+         WHERE e.asset_record_id = $1 AND e.generation = $2
+           AND e.state IN ('unseen', 'cooling')
+           AND NOT EXISTS (
+               SELECT 1 FROM article_assets aa JOIN articles a
+                 ON a.source_id = aa.source_id AND a.review_id = aa.review_id
+               WHERE aa.asset_record_id = e.asset_record_id
+                 AND aa.source_id = e.source_id AND aa.review_id = e.review_id
+           )",
+    )
+    .bind(asset_id)
+    .bind(generation)
+    .execute(&mut **transaction)
+    .await
+    .map_err(storage_error)?;
+    let blob_id =
+        sqlx::query_scalar::<_, Option<Uuid>>("SELECT blob_id FROM asset_records WHERE id = $1")
+            .bind(asset_id)
+            .fetch_optional(&mut **transaction)
+            .await
+            .map_err(storage_error)?
+            .flatten();
+    let mut blob_present = false;
+    if let Some(blob_id) = blob_id {
+        blob_present = !blob_deletion_pending(transaction, blob_id).await?
+            && blob_stat_in_transaction(
+                blob_store,
+                transaction,
+                &AssetBlobKey::for_blob_id(blob_id),
+            )
+            .await?
+            .is_some_and(|metadata| metadata.is_present());
+    }
+    if blob_present {
+        // A restored body makes every pending entry superseded.
+        sqlx::query(
+            "UPDATE asset_refresh_generation_entries
+             SET state = 'done', not_before = NULL
+             WHERE asset_record_id = $1 AND generation = $2
+               AND state IN ('unseen', 'cooling')",
+        )
+        .bind(asset_id)
+        .bind(generation)
+        .execute(&mut **transaction)
+        .await
+        .map_err(storage_error)?;
+    }
+    let mut cursor = after_ordinal;
+    loop {
+        let candidate = sqlx::query(
+            "SELECT e.ordinal, e.source_id, e.review_id
+             FROM asset_refresh_generation_entries AS e
+             LEFT JOIN asset_article_refresh_lineage AS l
+               ON l.source_id = e.source_id AND l.review_id = e.review_id
+             WHERE e.asset_record_id = $1 AND e.generation = $2
+               AND ($3::bigint IS NULL OR e.ordinal > $3)
+               AND (e.state = 'unseen' OR
+                    (e.state = 'cooling' AND e.not_before <= clock_timestamp()))
+               AND COALESCE(l.exhausted, FALSE) = FALSE
+               AND COALESCE(l.attempts, 0) < $4
+               AND (l.next_allowed_at IS NULL OR l.next_allowed_at <= clock_timestamp())
+               AND NOT EXISTS (
+                   SELECT 1 FROM jobs j
+                   WHERE j.dedupe_key = 'asset-refresh:' || e.source_id || ':' || e.review_id
+                     AND j.status IN ('queued', 'running', 'retry_wait', 'deferred')
+               )
+             ORDER BY e.ordinal
+             LIMIT 1",
+        )
+        .bind(asset_id)
+        .bind(generation)
+        .bind(cursor)
+        .bind(i64::from(policy.max_attempts()))
+        .fetch_optional(&mut **transaction)
+        .await
+        .map_err(storage_error)?;
+        let Some(candidate) = candidate else {
+            return Ok(None);
+        };
+        let ordinal: i64 = candidate.try_get("ordinal").map_err(storage_error)?;
+        let source_id: Uuid = candidate.try_get("source_id").map_err(storage_error)?;
+        let review_id: String = candidate.try_get("review_id").map_err(storage_error)?;
+        // Source then article locks precede every entry and lineage mutation.
+        lock_refresh_article_rows(
+            transaction,
+            crate::domain::source::SourceId::from_uuid(source_id),
+            &review_id,
+        )
+        .await?;
+        let still_live = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (
+                 SELECT 1 FROM articles a
+                 JOIN article_assets aa
+                   ON aa.source_id = a.source_id AND aa.review_id = a.review_id
+                 WHERE a.source_id = $1 AND a.review_id = $2
+                   AND aa.asset_record_id = $3
+             )",
+        )
+        .bind(source_id)
+        .bind(&review_id)
+        .bind(asset_id)
+        .fetch_one(&mut **transaction)
+        .await
+        .map_err(storage_error)?;
+        if !still_live {
+            sqlx::query(
+                "UPDATE asset_refresh_generation_entries
+                 SET state = 'done', not_before = NULL
+                 WHERE asset_record_id = $1 AND generation = $2 AND ordinal = $3
+                   AND state IN ('unseen', 'cooling')",
+            )
+            .bind(asset_id)
+            .bind(generation)
+            .bind(ordinal)
+            .execute(&mut **transaction)
+            .await
+            .map_err(storage_error)?;
+            cursor = Some(ordinal);
+            continue;
+        }
+        let entry_still_eligible = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (
+                 SELECT 1 FROM asset_refresh_generation_entries
+                 WHERE asset_record_id = $1 AND generation = $2 AND ordinal = $3
+                   AND (state = 'unseen' OR
+                        (state = 'cooling' AND not_before <= clock_timestamp()))
+             )",
+        )
+        .bind(asset_id)
+        .bind(generation)
+        .bind(ordinal)
+        .fetch_one(&mut **transaction)
+        .await
+        .map_err(storage_error)?;
+        if !entry_still_eligible {
+            cursor = Some(ordinal);
+            continue;
+        }
+        return Ok(Some((ordinal, source_id, review_id)));
+    }
+}
+
+async fn reserve_refresh_lineage(
+    transaction: &mut Transaction<'_, Postgres>,
+    source_id: Uuid,
+    review_id: &str,
+    policy: AssetRefreshPolicy,
+) -> Result<bool, AssetRepositoryError> {
+    let attempts = sqlx::query_scalar::<_, i64>(
+        "INSERT INTO asset_article_refresh_lineage
+             (source_id, review_id, attempts, next_allowed_at, exhausted,
+              last_outcome, updated_at)
+         VALUES ($1, $2, 1, NULL, FALSE, NULL, clock_timestamp())
+         ON CONFLICT (source_id, review_id) DO UPDATE
+         SET attempts = asset_article_refresh_lineage.attempts + 1,
+             next_allowed_at = NULL, last_outcome = NULL,
+             updated_at = clock_timestamp()
+         WHERE asset_article_refresh_lineage.exhausted = FALSE
+           AND asset_article_refresh_lineage.attempts < $3
+           AND (asset_article_refresh_lineage.next_allowed_at IS NULL OR
+                asset_article_refresh_lineage.next_allowed_at <= clock_timestamp())
+         RETURNING attempts",
+    )
+    .bind(source_id)
+    .bind(review_id)
+    .bind(i64::from(policy.max_attempts()))
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(storage_error)?;
+    Ok(attempts.is_some())
+}
+
+async fn insert_refresh_job(
+    job_transaction: &mut PostgresJobTransaction<'_>,
+    asset_id: Uuid,
+    generation: i64,
+    chain_id: Uuid,
+    ordinal: i64,
+    source_id: Uuid,
+    review_id: &str,
+) -> Result<Option<Uuid>, AssetRepositoryError> {
+    let now = Utc::now();
+    let result = job_transaction
+        .enqueue_internal(
+            NewJob {
+                job_type: JobType::AssetRefresh,
+                source_id: None,
+                priority: 0,
+                run_after: now,
+                max_attempts: REPAIR_JOB_MAX_ATTEMPTS,
+                payload: json!({
+                    "source_id": source_id,
+                    "review_id": review_id,
+                    "expired_asset_record_id": asset_id,
+                    "chain_id": chain_id,
+                    "generation": generation,
+                    "ordinal": ordinal,
+                }),
+                dedupe_key: format!("asset-refresh:{source_id}:{review_id}"),
+                now,
+            },
+            true,
+        )
+        .await
+        .map_err(job_transaction_error)?;
+    match result {
+        crate::persistence::repositories::job_repository::EnqueueResult::Inserted(job) => {
+            let transaction = job_transaction
+                .transaction_mut()
+                .map_err(job_transaction_error)?;
+            sqlx::query(
+                "INSERT INTO asset_repair_jobs
+                     (job_id, asset_record_id, admission_class, refresh_source_id,
+                      refresh_review_id, chain_id, chain_ordinal,
+                      expired_asset_record_id, expiry_refunded)
+                 VALUES ($1, NULL, 'internal_refresh', $2, $3, $4, $5, $6, FALSE)",
+            )
+            .bind(job.id())
+            .bind(source_id)
+            .bind(review_id)
+            .bind(chain_id)
+            .bind(ordinal)
+            .bind(asset_id)
+            .execute(&mut **transaction)
+            .await
+            .map_err(storage_error)?;
+            Ok(Some(job.id()))
+        }
+        // The article-scoped dedupe key already owns this article's refresh.
+        // The caller leaves the entry unseen so a later ordinal can be tried.
+        crate::persistence::repositories::job_repository::EnqueueResult::AlreadyActive {
+            ..
+        } => Ok(None),
+    }
+}
+
+async fn admit_refresh_entry(
+    job_transaction: &mut PostgresJobTransaction<'_>,
+    asset_id: Uuid,
+    generation: i64,
+    chain_id: Uuid,
+    entry: (i64, Uuid, String),
+    policy: AssetRefreshPolicy,
+    resume: bool,
+) -> Result<Option<Uuid>, AssetRepositoryError> {
+    let (ordinal, source_id, review_id) = entry;
+    let Some(job_id) = insert_refresh_job(
+        job_transaction,
+        asset_id,
+        generation,
+        chain_id,
+        ordinal,
+        source_id,
+        &review_id,
+    )
+    .await?
+    else {
+        return Ok(None);
+    };
+    let reserved = {
+        let transaction = job_transaction
+            .transaction_mut()
+            .map_err(job_transaction_error)?;
+        reserve_refresh_lineage(transaction, source_id, &review_id, policy).await?
+    };
+    if !reserved {
+        // The attempt is only consumed by an inserted job, so drop the job and
+        // its metadata together and terminalize the entry only when lineage is
+        // actually exhausted; a raced cooldown keeps it pending.
+        let transaction = job_transaction
+            .transaction_mut()
+            .map_err(job_transaction_error)?;
+        sqlx::query("DELETE FROM jobs WHERE id = $1")
+            .bind(job_id)
+            .execute(&mut **transaction)
+            .await
+            .map_err(storage_error)?;
+        sqlx::query(
+            "UPDATE asset_refresh_generation_entries AS e
+             SET state = 'done', not_before = NULL
+             FROM asset_article_refresh_lineage AS l
+             WHERE e.asset_record_id = $1 AND e.generation = $2 AND e.ordinal = $3
+               AND l.source_id = e.source_id AND l.review_id = e.review_id
+               AND (l.exhausted OR l.attempts >= $4)",
+        )
+        .bind(asset_id)
+        .bind(generation)
+        .bind(ordinal)
+        .bind(i64::from(policy.max_attempts()))
+        .execute(&mut **transaction)
+        .await
+        .map_err(storage_error)?;
+        return Ok(None);
+    }
+    let transaction = job_transaction
+        .transaction_mut()
+        .map_err(job_transaction_error)?;
+    let activated = sqlx::query(
+        "UPDATE asset_refresh_generation_entries
+         SET state = 'in_flight', not_before = NULL
+         WHERE asset_record_id = $1 AND generation = $2 AND ordinal = $3
+           AND state IN ('unseen', 'cooling')",
+    )
+    .bind(asset_id)
+    .bind(generation)
+    .bind(ordinal)
+    .execute(&mut **transaction)
+    .await
+    .map_err(storage_error)?;
+    if activated.rows_affected() == 0 {
+        sqlx::query("DELETE FROM asset_repair_jobs WHERE job_id = $1")
+            .bind(job_id)
+            .execute(&mut **transaction)
+            .await
+            .map_err(storage_error)?;
+        sqlx::query("DELETE FROM jobs WHERE id = $1")
+            .bind(job_id)
+            .execute(&mut **transaction)
+            .await
+            .map_err(storage_error)?;
+        return Ok(None);
+    }
+    if resume {
+        sqlx::query(
+            "UPDATE asset_record_refresh_state
+             SET active_chain_id = $2, updated_at = clock_timestamp()
+             WHERE asset_record_id = $1
+               AND (active_chain_id IS NULL OR active_chain_id = $2)",
+        )
+        .bind(asset_id)
+        .bind(chain_id)
+        .execute(&mut **transaction)
+        .await
+        .map_err(storage_error)?;
+    }
+    Ok(Some(job_id))
+}
+
+async fn resume_refresh_after_cache_miss(
+    job_transaction: &mut PostgresJobTransaction<'_>,
+    blob_store: &dyn AssetBlobStore,
+    asset_id: Uuid,
+    repair_policy: AssetRepairPolicy,
+    refresh_policy: AssetRefreshPolicy,
+) -> Result<Option<AssetRepairEnqueueResult>, AssetRepositoryError> {
+    let state = {
+        let transaction = job_transaction
+            .transaction_mut()
+            .map_err(job_transaction_error)?;
+        sqlx::query(
+            "SELECT requested_generation, completed_generation, served_generation, active_chain_id
+             FROM asset_record_refresh_state WHERE asset_record_id = $1 FOR UPDATE",
+        )
+        .bind(asset_id)
+        .fetch_optional(&mut **transaction)
+        .await
+        .map_err(storage_error)?
+    };
+    let Some(state) = state else {
+        return Ok(None);
+    };
+    let requested: i64 = state
+        .try_get("requested_generation")
+        .map_err(storage_error)?;
+    let completed: i64 = state
+        .try_get("completed_generation")
+        .map_err(storage_error)?;
+    let served: i64 = state.try_get("served_generation").map_err(storage_error)?;
+    let active_chain: Option<Uuid> = state.try_get("active_chain_id").map_err(storage_error)?;
+    if active_chain.is_some() {
+        let transaction = job_transaction
+            .transaction_mut()
+            .map_err(job_transaction_error)?;
+        sqlx::query(
+            "UPDATE asset_record_refresh_state
+             SET requested_generation = GREATEST(requested_generation, served_generation + 1),
+                 updated_at = clock_timestamp() WHERE asset_record_id = $1",
+        )
+        .bind(asset_id)
+        .execute(&mut **transaction)
+        .await
+        .map_err(storage_error)?;
+        return Ok(Some(AssetRepairEnqueueResult::Retryable));
+    }
+    if requested <= completed || served == 0 {
+        return Ok(None);
+    }
+
+    let transaction = job_transaction
+        .transaction_mut()
+        .map_err(job_transaction_error)?;
+    let global_pending: i64 = sqlx::query_scalar(
+        "SELECT count(*)::bigint FROM asset_repair_jobs arj
+         JOIN jobs j ON j.id = arj.job_id
+         WHERE j.status IN ('queued', 'running', 'retry_wait', 'deferred')",
+    )
+    .fetch_one(&mut **transaction)
+    .await
+    .map_err(storage_error)?;
+    if global_pending >= i64::from(repair_policy.max_pending()) {
+        return Ok(Some(AssetRepairEnqueueResult::Retryable));
+    }
+    if served <= completed {
+        let job_id = start_follow_up_generation(
+            job_transaction,
+            blob_store,
+            asset_id,
+            requested,
+            refresh_policy,
+        )
+        .await?;
+        return Ok(Some(
+            job_id.map_or(AssetRepairEnqueueResult::Retryable, |job_id| {
+                AssetRepairEnqueueResult::Enqueued { job_id }
+            }),
+        ));
+    }
+    mark_exhausted_refresh_entries(transaction, asset_id, served, refresh_policy).await?;
+    let entry = select_refresh_entry(
+        transaction,
+        blob_store,
+        asset_id,
+        served,
+        None,
+        refresh_policy,
+    )
+    .await?;
+    let Some(entry) = entry else {
+        // Nothing in this snapshot is admissible yet; complete it when every
+        // entry is done and otherwise keep it pending for the next pass.
+        let transaction = job_transaction
+            .transaction_mut()
+            .map_err(job_transaction_error)?;
+        complete_refresh_generation_if_terminal(transaction, asset_id, served).await?;
+        return Ok(Some(
+            resume_follow_up_generation(
+                job_transaction,
+                blob_store,
+                asset_id,
+                served,
+                refresh_policy,
+            )
+            .await?,
+        ));
+    };
+    let chain_id = Uuid::new_v4();
+    let job_id = admit_refresh_entry(
+        job_transaction,
+        asset_id,
+        served,
+        chain_id,
+        entry,
+        refresh_policy,
+        true,
+    )
+    .await?;
+    let Some(job_id) = job_id else {
+        return Ok(Some(AssetRepairEnqueueResult::Retryable));
+    };
+    Ok(Some(AssetRepairEnqueueResult::Enqueued { job_id }))
+}
+
+/// Starts a coalesced follow-up after a pending generation completes.
+async fn resume_follow_up_generation(
+    job_transaction: &mut PostgresJobTransaction<'_>,
+    blob_store: &dyn AssetBlobStore,
+    asset_id: Uuid,
+    served: i64,
+    policy: AssetRefreshPolicy,
+) -> Result<AssetRepairEnqueueResult, AssetRepositoryError> {
+    let completed = refresh_generation_completed(job_transaction, asset_id, served).await?;
+    if !completed {
+        return Ok(AssetRepairEnqueueResult::Retryable);
+    }
+    let (requested, current) = {
+        let transaction = job_transaction
+            .transaction_mut()
+            .map_err(job_transaction_error)?;
+        sqlx::query_as::<_, (i64, i64)>(
+            "SELECT requested_generation, served_generation
+             FROM asset_record_refresh_state
+             WHERE asset_record_id = $1 FOR UPDATE",
+        )
+        .bind(asset_id)
+        .fetch_optional(&mut **transaction)
+        .await
+        .map_err(storage_error)?
+        .unwrap_or((0, 0))
+    };
+    if requested <= current {
+        return Ok(AssetRepairEnqueueResult::Retryable);
+    }
+    Ok(
+        start_follow_up_generation(job_transaction, blob_store, asset_id, requested, policy)
+            .await?
+            .map_or(AssetRepairEnqueueResult::Retryable, |job_id| {
+                AssetRepairEnqueueResult::Enqueued { job_id }
+            }),
+    )
+}
+
+async fn finish_article_refresh_in_transaction(
+    job_transaction: &mut PostgresJobTransaction<'_>,
+    lease: &JobLease,
+    target: &ArticleRefreshTarget,
+    blob_store: &dyn AssetBlobStore,
+    outcome: ArticleRefreshOutcome,
+    policy: AssetRefreshPolicy,
+) -> Result<RefreshFinishResult, AssetRepositoryError> {
+    let transaction = job_transaction
+        .transaction_mut()
+        .map_err(job_transaction_error)?;
+    let cooldown = i64::try_from(policy.cooldown().as_secs())
+        .map_err(|_| AssetRepositoryError::InvalidMetadata)?;
+    match outcome {
+        ArticleRefreshOutcome::Succeeded => {
+            sqlx::query(
+                "UPDATE asset_article_refresh_lineage
+                 SET attempts = 0, next_allowed_at = NULL, exhausted = FALSE,
+                     last_outcome = 'succeeded', updated_at = clock_timestamp()
+                 WHERE source_id = $1 AND review_id = $2",
+            )
+            .bind(target.source_id.as_uuid())
+            .bind(&target.review_id)
+            .execute(&mut **transaction)
+            .await
+            .map_err(storage_error)?;
+            set_refresh_entry_done(transaction, target).await?;
+            reconcile_article_refresh_entries(
+                transaction,
+                target.source_id.as_uuid(),
+                &target.review_id,
+            )
+            .await?;
+        }
+        ArticleRefreshOutcome::Inconclusive => {
+            let exhausted = sqlx::query_scalar::<_, bool>(
+                "UPDATE asset_article_refresh_lineage
+                 SET next_allowed_at = clock_timestamp()
+                         + make_interval(secs => $3::double precision),
+                     exhausted = attempts >= $4,
+                     last_outcome = CASE WHEN attempts >= $4 THEN 'exhausted' ELSE 'inconclusive' END,
+                     updated_at = clock_timestamp()
+                 WHERE source_id = $1 AND review_id = $2
+                 RETURNING exhausted",
+            )
+            .bind(target.source_id.as_uuid())
+            .bind(&target.review_id)
+            .bind(cooldown)
+            .bind(i64::from(policy.max_attempts()))
+            .fetch_optional(&mut **transaction)
+            .await
+            .map_err(storage_error)?
+            .unwrap_or(true);
+            if exhausted {
+                set_refresh_entry_done(transaction, target).await?;
+                reconcile_article_refresh_entries(
+                    transaction,
+                    target.source_id.as_uuid(),
+                    &target.review_id,
+                )
+                .await?;
+            } else {
+                sqlx::query(
+                    "UPDATE asset_refresh_generation_entries
+                     SET state = 'cooling',
+                         not_before = clock_timestamp()
+                             + make_interval(secs => $4::double precision)
+                     WHERE asset_record_id = $1 AND generation = $2 AND ordinal = $3",
+                )
+                .bind(target.expired_asset_record_id)
+                .bind(target.served_generation)
+                .bind(target.chain_ordinal)
+                .bind(cooldown)
+                .execute(&mut **transaction)
+                .await
+                .map_err(storage_error)?;
+            }
+        }
+        ArticleRefreshOutcome::Superseded => {
+            set_refresh_entry_done(transaction, target).await?;
+        }
+        ArticleRefreshOutcome::Deleted => {
+            set_refresh_entry_done(transaction, target).await?;
+        }
+    }
+
+    let owner = lease
+        .job
+        .lease_owner()
+        .ok_or(AssetRepositoryError::LeaseLost)?;
+    JobRepositoryTransaction::succeed(
+        job_transaction,
+        lease.job.id(),
+        owner,
+        lease.token,
+        Utc::now(),
+    )
+    .await
+    .map_err(job_transaction_error)?;
+
+    // The selector can retire later entries, so completion is measured after
+    // continuation rather than before it.
+    let mut next_job_id =
+        continue_refresh_chain(job_transaction, blob_store, target, policy).await?;
+    let (requested, served) = {
+        let transaction = job_transaction
+            .transaction_mut()
+            .map_err(job_transaction_error)?;
+        complete_refresh_generation_if_terminal(
+            transaction,
+            target.expired_asset_record_id,
+            target.served_generation,
+        )
+        .await?;
+        sqlx::query_as::<_, (i64, i64)>(
+            "SELECT requested_generation, served_generation
+             FROM asset_record_refresh_state
+             WHERE asset_record_id = $1 FOR UPDATE",
+        )
+        .bind(target.expired_asset_record_id)
+        .fetch_one(&mut **transaction)
+        .await
+        .map_err(storage_error)?
+    };
+    let generation_completed = refresh_generation_completed(
+        job_transaction,
+        target.expired_asset_record_id,
+        target.served_generation,
+    )
+    .await?;
+    // A coalesced follow-up starts only once its generation is complete, and
+    // never re-snapshots the generation that just finished.
+    if next_job_id.is_none() && generation_completed && requested > served {
+        next_job_id = start_follow_up_generation(
+            job_transaction,
+            blob_store,
+            target.expired_asset_record_id,
+            requested,
+            policy,
+        )
+        .await?;
+    }
+    Ok(RefreshFinishResult {
+        next_job_id,
+        generation_completed,
+    })
+}
+
+/// Reports whether a generation is complete: its high-water mark passed or
+/// every snapshot entry is `done`.
+async fn refresh_generation_completed(
+    job_transaction: &mut PostgresJobTransaction<'_>,
+    asset_id: Uuid,
+    generation: i64,
+) -> Result<bool, AssetRepositoryError> {
+    let transaction = job_transaction
+        .transaction_mut()
+        .map_err(job_transaction_error)?;
+    sqlx::query_scalar::<_, bool>(
+        "SELECT s.completed_generation >= $2 OR NOT EXISTS (
+             SELECT 1 FROM asset_refresh_generation_entries e
+             WHERE e.asset_record_id = s.asset_record_id
+               AND e.generation = $2 AND e.state <> 'done'
+         )
+         FROM asset_record_refresh_state s
+         WHERE s.asset_record_id = $1",
+    )
+    .bind(asset_id)
+    .bind(generation)
+    .fetch_one(&mut **transaction)
+    .await
+    .map_err(storage_error)
+}
+
+async fn start_follow_up_generation(
+    job_transaction: &mut PostgresJobTransaction<'_>,
+    blob_store: &dyn AssetBlobStore,
+    asset_id: Uuid,
+    generation: i64,
+    policy: AssetRefreshPolicy,
+) -> Result<Option<Uuid>, AssetRepositoryError> {
+    let transaction = job_transaction
+        .transaction_mut()
+        .map_err(job_transaction_error)?;
+    // Advance to a strictly newer generation so a completed snapshot is never
+    // re-created under the same identity.
+    let advanced = sqlx::query(
+        "UPDATE asset_record_refresh_state
+         SET served_generation = $2, updated_at = clock_timestamp()
+         WHERE asset_record_id = $1 AND requested_generation >= $2
+           AND served_generation < $2 AND active_chain_id IS NULL",
+    )
+    .bind(asset_id)
+    .bind(generation)
+    .execute(&mut **transaction)
+    .await
+    .map_err(storage_error)?
+    .rows_affected();
+    if advanced == 0 {
+        return Ok(None);
+    }
+    let count = snapshot_asset_generation(transaction, asset_id, generation).await?;
+    if count == 0 {
+        let transaction = job_transaction
+            .transaction_mut()
+            .map_err(job_transaction_error)?;
+        sqlx::query(
+            "UPDATE asset_record_refresh_state
+             SET completed_generation = $2, updated_at = clock_timestamp()
+             WHERE asset_record_id = $1",
+        )
+        .bind(asset_id)
+        .bind(generation)
+        .execute(&mut **transaction)
+        .await
+        .map_err(storage_error)?;
+        return Ok(None);
+    }
+    let transaction = job_transaction
+        .transaction_mut()
+        .map_err(job_transaction_error)?;
+    mark_exhausted_refresh_entries(transaction, asset_id, generation, policy).await?;
+    complete_refresh_generation_if_terminal(transaction, asset_id, generation).await?;
+    let entry =
+        select_refresh_entry(transaction, blob_store, asset_id, generation, None, policy).await?;
+    let Some(entry) = entry else {
+        return Ok(None);
+    };
+    let chain_id = Uuid::new_v4();
+    admit_refresh_entry(
+        job_transaction,
+        asset_id,
+        generation,
+        chain_id,
+        entry,
+        policy,
+        true,
+    )
+    .await
+}
+
+async fn set_refresh_entry_done(
+    transaction: &mut Transaction<'_, Postgres>,
+    target: &ArticleRefreshTarget,
+) -> Result<(), AssetRepositoryError> {
+    sqlx::query(
+        "UPDATE asset_refresh_generation_entries
+         SET state = 'done', not_before = NULL
+         WHERE asset_record_id = $1 AND generation = $2 AND ordinal = $3",
+    )
+    .bind(target.expired_asset_record_id)
+    .bind(target.served_generation)
+    .bind(target.chain_ordinal)
+    .execute(&mut **transaction)
+    .await
+    .map_err(storage_error)?;
+    Ok(())
+}
+
+async fn continue_refresh_chain(
+    job_transaction: &mut PostgresJobTransaction<'_>,
+    blob_store: &dyn AssetBlobStore,
+    target: &ArticleRefreshTarget,
+    policy: AssetRefreshPolicy,
+) -> Result<Option<Uuid>, AssetRepositoryError> {
+    {
+        let transaction = job_transaction
+            .transaction_mut()
+            .map_err(job_transaction_error)?;
+        mark_exhausted_refresh_entries(
+            transaction,
+            target.expired_asset_record_id,
+            target.served_generation,
+            policy,
+        )
+        .await?;
+    }
+    let entry = {
+        let transaction = job_transaction
+            .transaction_mut()
+            .map_err(job_transaction_error)?;
+        select_refresh_entry(
+            transaction,
+            blob_store,
+            target.expired_asset_record_id,
+            target.served_generation,
+            Some(target.chain_ordinal),
+            policy,
+        )
+        .await?
+    };
+    if let Some(entry) = entry {
+        if let Some(job_id) = admit_refresh_entry(
+            job_transaction,
+            target.expired_asset_record_id,
+            target.served_generation,
+            target.chain_id,
+            entry,
+            policy,
+            false,
+        )
+        .await?
+        {
+            return Ok(Some(job_id));
+        }
+    }
+    let transaction = job_transaction
+        .transaction_mut()
+        .map_err(job_transaction_error)?;
+    sqlx::query(
+        "UPDATE asset_record_refresh_state
+         SET active_chain_id = NULL, updated_at = clock_timestamp()
+         WHERE asset_record_id = $1 AND active_chain_id = $2",
+    )
+    .bind(target.expired_asset_record_id)
+    .bind(target.chain_id)
+    .execute(&mut **transaction)
+    .await
+    .map_err(storage_error)?;
+    Ok(None)
+}
+
+async fn route_confirmed_expiry(
+    transaction: &mut PostgresJobTransaction<'_>,
+    blob_store: &dyn AssetBlobStore,
+    asset_id: Uuid,
+    repair_policy: AssetRepairPolicy,
+    refresh_policy: AssetRefreshPolicy,
+) -> Result<AssetRefreshAdmissionResult, AssetRepositoryError> {
+    let state = {
+        let sql_transaction = transaction
+            .transaction_mut()
+            .map_err(job_transaction_error)?;
+        sqlx::query(
+            "SELECT requested_generation, completed_generation, served_generation, active_chain_id
+             FROM asset_record_refresh_state WHERE asset_record_id = $1 FOR UPDATE",
+        )
+        .bind(asset_id)
+        .fetch_optional(&mut **sql_transaction)
+        .await
+        .map_err(storage_error)?
+    };
+    let requested = state
+        .as_ref()
+        .map(|row| row.try_get::<i64, _>("requested_generation"))
+        .transpose()
+        .map_err(storage_error)?
+        .unwrap_or(0);
+    let completed = state
+        .as_ref()
+        .map(|row| row.try_get::<i64, _>("completed_generation"))
+        .transpose()
+        .map_err(storage_error)?
+        .unwrap_or(0);
+    let served = state
+        .as_ref()
+        .map(|row| row.try_get::<i64, _>("served_generation"))
+        .transpose()
+        .map_err(storage_error)?
+        .unwrap_or(0);
+    let active_chain = state
+        .as_ref()
+        .map(|row| row.try_get::<Option<Uuid>, _>("active_chain_id"))
+        .transpose()
+        .map_err(storage_error)?
+        .flatten();
+
+    let sql_transaction = transaction
+        .transaction_mut()
+        .map_err(job_transaction_error)?;
+    if active_chain.is_some() {
+        sqlx::query(
+            "UPDATE asset_record_refresh_state
+             SET requested_generation = GREATEST(requested_generation, served_generation + 1),
+                 updated_at = clock_timestamp() WHERE asset_record_id = $1",
+        )
+        .bind(asset_id)
+        .execute(&mut **sql_transaction)
+        .await
+        .map_err(storage_error)?;
+        return Ok(AssetRefreshAdmissionResult::AlreadyHandled);
+    }
+
+    if served > completed {
+        sqlx::query(
+            "UPDATE asset_record_refresh_state
+             SET requested_generation = GREATEST(requested_generation, served_generation + 1),
+                 updated_at = clock_timestamp() WHERE asset_record_id = $1",
+        )
+        .bind(asset_id)
+        .execute(&mut **sql_transaction)
+        .await
+        .map_err(storage_error)?;
+        mark_exhausted_refresh_entries(sql_transaction, asset_id, served, refresh_policy).await?;
+        let entry = select_refresh_entry(
+            sql_transaction,
+            blob_store,
+            asset_id,
+            served,
+            None,
+            refresh_policy,
+        )
+        .await?;
+        let Some(entry) = entry else {
+            complete_refresh_generation_if_terminal(sql_transaction, asset_id, served).await?;
+            return Ok(AssetRefreshAdmissionResult::NoEligibleArticle);
+        };
+        let chain_id = Uuid::new_v4();
+        let ordinal = entry.0;
+        let Some(job_id) = admit_refresh_entry(
+            transaction,
+            asset_id,
+            served,
+            chain_id,
+            entry,
+            refresh_policy,
+            true,
+        )
+        .await?
+        else {
+            return Ok(AssetRefreshAdmissionResult::NoEligibleArticle);
+        };
+        return Ok(AssetRefreshAdmissionResult::Enqueued {
+            job_id,
+            chain_id,
+            generation: served,
+            ordinal,
+        });
+    }
+
+    // Reuse an already-requested but not-yet-served generation so a coalesced
+    // follow-up is never skipped.
+    let generation = if requested > completed {
+        requested
+    } else {
+        requested
+            .checked_add(1)
+            .ok_or(AssetRepositoryError::InvalidMetadata)?
+    };
+    sqlx::query(
+        "INSERT INTO asset_record_refresh_state
+             (asset_record_id, requested_generation, completed_generation,
+              served_generation, active_chain_id)
+         VALUES ($1, $2, $3, $4, NULL)
+         ON CONFLICT (asset_record_id) DO UPDATE
+         SET requested_generation = $2, served_generation = $4,
+             updated_at = clock_timestamp()",
+    )
+    .bind(asset_id)
+    .bind(generation)
+    .bind(completed)
+    .bind(generation)
+    .execute(&mut **sql_transaction)
+    .await
+    .map_err(storage_error)?;
+    let entry_count = snapshot_asset_generation(sql_transaction, asset_id, generation).await?;
+    if entry_count == 0 {
+        sqlx::query(
+            "UPDATE asset_record_refresh_state
+             SET completed_generation = $2, updated_at = clock_timestamp()
+             WHERE asset_record_id = $1",
+        )
+        .bind(asset_id)
+        .bind(generation)
+        .execute(&mut **sql_transaction)
+        .await
+        .map_err(storage_error)?;
+        return Ok(AssetRefreshAdmissionResult::NoEligibleArticle);
+    }
+    mark_exhausted_refresh_entries(sql_transaction, asset_id, generation, refresh_policy).await?;
+    let entry = select_refresh_entry(
+        sql_transaction,
+        blob_store,
+        asset_id,
+        generation,
+        None,
+        refresh_policy,
+    )
+    .await?;
+    let Some(entry) = entry else {
+        complete_refresh_generation_if_terminal(sql_transaction, asset_id, generation).await?;
+        return Ok(AssetRefreshAdmissionResult::NoEligibleArticle);
+    };
+    let ordinal = entry.0;
+    let chain_id = Uuid::new_v4();
+    let Some(job_id) = admit_refresh_entry(
+        transaction,
+        asset_id,
+        generation,
+        chain_id,
+        entry,
+        refresh_policy,
+        true,
+    )
+    .await?
+    else {
+        return Ok(AssetRefreshAdmissionResult::NoEligibleArticle);
+    };
+    let _ = repair_policy;
+    Ok(AssetRefreshAdmissionResult::Enqueued {
+        job_id,
+        chain_id,
+        generation,
+        ordinal,
+    })
+}
+
 async fn lock_asset_capacity(
     transaction: &mut Transaction<'_, Postgres>,
 ) -> Result<(), AssetRepositoryError> {
@@ -2506,6 +4317,11 @@ fn validate_input(
 ) -> Result<(), AssetRepositoryError> {
     if !input.checksum_matches_bytes() {
         return Err(AssetRepositoryError::ChecksumMismatch);
+    }
+    for url in [&input.source_url, &input.final_url, &input.referer_url] {
+        if has_provider_signature(url) {
+            return Err(AssetRepositoryError::InvalidUrl);
+        }
     }
     normalize_url(input.source_url.clone())?;
     normalize_url(input.final_url.clone())?;

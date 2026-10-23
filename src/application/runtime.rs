@@ -226,6 +226,7 @@ impl RuntimePlan {
             let mut allowed_job_types = EXECUTABLE_WORKER_JOB_TYPES.to_vec();
             if config.asset_archive.database_policy().is_some() {
                 allowed_job_types.push(JobType::AssetRepair);
+                allowed_job_types.push(JobType::AssetRefresh);
             }
             let source_sync_enabled = true;
             let execution_timeout =
@@ -433,6 +434,10 @@ mod tests {
             .worker_config()
             .allowed_job_types()
             .contains(&JobType::AssetRepair));
+        assert!(worker
+            .worker_config()
+            .allowed_job_types()
+            .contains(&JobType::AssetRefresh));
     }
 
     #[test]

@@ -567,7 +567,7 @@ where
         let mut unit_of_work = self
             .dependencies
             .unit_of_work
-            .begin_with_assets(&asset_inputs)
+            .begin_article_acquisition_with_assets(&asset_inputs)
             .await
             .map_err(|_| ())?;
         // Source-owned writes use the source row as their first lock. Source
@@ -615,9 +615,10 @@ where
                             current_article
                                 .as_ref()
                                 .map(|current| current.content_html()),
-                            prepared.external_assets().len(),
-                            fetched_assets.len(),
+                            prepared.external_assets(),
+                            &fetched_assets,
                         );
+                    let mut reset_lineage = false;
                     if preserve_cached_representation {
                         if let Some(current) = current_article.as_ref() {
                             tracing::warn!(
@@ -632,6 +633,10 @@ where
                                 current.content_hash().map(str::to_owned);
                         }
                     } else if should_reconcile_assets(&article, article.observation_version) {
+                        reset_lineage = crate::application::sync_service::complete_asset_set(
+                            prepared.external_assets(),
+                            &fetched_assets,
+                        );
                         let stored = {
                             let mut assets = unit_of_work.assets(archiver.policy());
                             assets
@@ -671,6 +676,7 @@ where
                                 | AssetRepositoryError::AssetTooLarge { .. }
                                 | AssetRepositoryError::TooManyAssets { .. }),
                             ) => {
+                                reset_lineage = false;
                                 if current_has_cached_representation {
                                     if let Some(current) = current_article.as_ref() {
                                         article_to_persist.content_html =
@@ -713,6 +719,13 @@ where
                         let mut articles = unit_of_work.articles();
                         articles.upsert(article_to_persist).await.map_err(|_| ())?
                     };
+                    if reset_lineage {
+                        let mut assets = unit_of_work.assets(archiver.policy());
+                        assets
+                            .reset_article_refresh_lineage(article.source_id, &article.review_id)
+                            .await
+                            .map_err(|_| ())?;
+                    }
                     (result.created(), result.feed_visible_change())
                 }
             } else {

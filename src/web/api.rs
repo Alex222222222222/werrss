@@ -358,6 +358,10 @@ where
                 tracing::debug!(asset_id = %asset_id, "asset repair is in backoff");
                 None
             }
+            Ok(AssetRepairEnqueueResult::Retryable) => {
+                tracing::debug!(asset_id = %asset_id, "asset refresh chain has no eligible article yet");
+                None
+            }
             Err(error) => {
                 tracing::warn!(asset_id = %asset_id, error = %error, "asset repair admission failed");
                 None

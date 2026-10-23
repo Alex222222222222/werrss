@@ -112,7 +112,9 @@ pub enum SourceError {
     #[error("source article_url must not be empty")]
     EmptyArticleUrl,
     /// The source article URL must identify an allowed public WeChat page.
-    #[error("source article_url must be an https mp.weixin.qq.com URL without credentials, fragments, or a non-default port")]
+    #[error(
+        "source article_url must be an https mp.weixin.qq.com URL without credentials, fragments, or a non-default port"
+    )]
     InvalidArticleUrl,
     /// Source synchronization must have a positive interval.
     #[error("source sync_interval must be positive")]
@@ -165,6 +167,7 @@ impl VerifiedWechatArticleUrl {
             || url.password().is_some()
             || url.fragment().is_some()
             || url.port().is_some_and(|port| port != 443)
+            || crate::domain::url_policy::has_provider_signature(&url)
         {
             return Err(SourceError::InvalidArticleUrl);
         }
@@ -909,6 +912,25 @@ mod tests {
                 "URL should be rejected: {value}"
             );
         }
+    }
+
+    #[test]
+    fn verified_article_url_rejects_signed_referer_credentials() {
+        assert_eq!(
+            VerifiedWechatArticleUrl::parse(
+                "https://mp.weixin.qq.com/s/page?sv=1&se=123&sig=secret"
+            ),
+            Err(SourceError::InvalidArticleUrl),
+        );
+    }
+
+    #[test]
+    fn verified_article_url_preserves_ordinary_query_identity() {
+        let value = "https://mp.weixin.qq.com/s/page?__biz=abc&token=resource-token&signature=chapter&x=%2f&x=2";
+        assert_eq!(
+            VerifiedWechatArticleUrl::parse(value).unwrap().as_str(),
+            value
+        );
     }
 
     #[test]

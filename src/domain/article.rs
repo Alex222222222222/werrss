@@ -43,7 +43,10 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use url::Url;
 
-use super::source::{SourceId, VerifiedWechatArticleUrl};
+use super::{
+    source::{SourceId, VerifiedWechatArticleUrl},
+    url_policy::has_provider_signature,
+};
 
 /// Errors raised while normalizing or reconstructing an article.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
@@ -150,7 +153,11 @@ impl NewArticle {
             .filter(|value| !value.is_empty());
         if cover_url.as_deref().is_some_and(|value| {
             Url::parse(value)
-                .map(|url| !matches!(url.scheme(), "http" | "https") || url.host_str().is_none())
+                .map(|url| {
+                    !matches!(url.scheme(), "http" | "https")
+                        || url.host_str().is_none()
+                        || has_provider_signature(&url)
+                })
                 .unwrap_or(true)
         }) {
             return Err(ArticleError::InvalidCoverUrl);
@@ -526,6 +533,21 @@ mod tests {
         assert_eq!(merged.content_html, current.content_html);
         assert_eq!(merged.content_hash, current.content_hash);
         assert!(!feed_visible_change(&current, &merged));
+    }
+
+    #[test]
+    fn rejects_provider_signed_cover_urls_but_allows_resource_queries() {
+        let mut signed = new_article();
+        signed.cover_url = Some("https://cdn.example/image?X-Amz-Signature=secret".to_owned());
+        assert_eq!(signed.normalize(), Err(ArticleError::InvalidCoverUrl));
+
+        let mut resource_query = new_article();
+        let ordinary = "https://cdn.example/image?width=640&token=resource-token&width=320";
+        resource_query.cover_url = Some(ordinary.to_owned());
+        assert_eq!(
+            resource_query.normalize().unwrap().cover_url.as_deref(),
+            Some(ordinary)
+        );
     }
 
     #[test]
