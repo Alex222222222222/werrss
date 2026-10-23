@@ -58,6 +58,7 @@ use crate::{
         article::{ArticleError, ArticleObservationVersion, NewArticle},
         source::SourceId,
         sync::{SyncFailure, SyncFailureClass, SyncOutcome},
+        url_policy::has_provider_signature,
     },
 };
 
@@ -235,6 +236,26 @@ pub struct SyncService {
     archive: ArchiveService,
 }
 
+pub(crate) fn complete_asset_set(external_assets: &[Url], fetched_assets: &[AssetInput]) -> bool {
+    external_assets.len() == fetched_assets.len()
+        && external_assets
+            .iter()
+            .all(|url| !has_provider_signature(url))
+        && fetched_assets.iter().all(|asset| {
+            !has_provider_signature(&asset.source_url)
+                && !has_provider_signature(&asset.final_url)
+                && !has_provider_signature(&asset.referer_url)
+        })
+        && external_assets.iter().enumerate().all(|(index, url)| {
+            u32::try_from(index).is_ok_and(|occurrence| {
+                let mut matching = fetched_assets
+                    .iter()
+                    .filter(|asset| asset.occurrence == occurrence && asset.source_url == *url);
+                matching.next().is_some() && matching.next().is_none()
+            })
+        })
+}
+
 /// Returns whether a successful full-content observation may reconcile its
 /// article-to-asset relationships.
 ///
@@ -258,10 +279,10 @@ pub(crate) fn should_reconcile_assets(
 /// those two pieces of state atomic from the feed's point of view.
 pub(crate) fn should_preserve_cached_asset_representation(
     current_content_html: Option<&str>,
-    external_asset_count: usize,
-    fetched_asset_count: usize,
+    external_assets: &[Url],
+    fetched_assets: &[AssetInput],
 ) -> bool {
-    external_asset_count > fetched_asset_count
+    !complete_asset_set(external_assets, fetched_assets)
         && current_content_html.is_some_and(|html| html.contains("/assets/"))
 }
 
@@ -570,21 +591,100 @@ mod tests {
         ));
     }
 
+    fn asset_input(url: &str, occurrence: u32) -> AssetInput {
+        let url = Url::parse(url).unwrap();
+        AssetInput::new(
+            url.clone(),
+            url,
+            "image/png".to_owned(),
+            vec![1],
+            occurrence,
+            "https://mp.weixin.qq.com/s/article".parse().unwrap(),
+            None,
+            None,
+        )
+    }
+
+    #[test]
+    fn signed_images_keep_normal_acquisition_incomplete_and_preserve_cached_images() {
+        let mut page = page();
+        page.content_html =
+            r#"<p>updated</p><img src="https://cdn.example/image?X-Amz-Signature=secret">"#
+                .to_owned();
+        let prepared = SyncService::new()
+            .prepare_article(
+                source_id(),
+                &reference(),
+                page,
+                ArticleObservationVersion::from_u64(2),
+                Utc::now(),
+            )
+            .unwrap();
+
+        assert_eq!(prepared.article().content_html, "<p>updated</p>");
+        assert!(!complete_asset_set(prepared.external_assets(), &[]));
+        assert!(should_preserve_cached_asset_representation(
+            Some(r#"<p>cached</p><img src="/assets/asset-id">"#),
+            prepared.external_assets(),
+            &[],
+        ));
+    }
+
+    #[test]
+    fn signed_asset_context_never_completes_normal_acquisition() {
+        let ordinary = "https://cdn.example/image?width=640&token=resource-token";
+        let signed = Url::parse("https://cdn.example/image?X-Amz-Signature=secret").unwrap();
+        let urls = [Url::parse(ordinary).unwrap()];
+        for field in ["source", "final", "referer"] {
+            let mut input = asset_input(ordinary, 0);
+            let mut expected = urls.clone();
+            match field {
+                "source" => {
+                    input.source_url = signed.clone();
+                    expected[0] = signed.clone();
+                }
+                "final" => input.final_url = signed.clone(),
+                "referer" => input.referer_url = signed.clone(),
+                _ => unreachable!(),
+            }
+            assert!(!complete_asset_set(&expected, &[input]), "{field}");
+        }
+    }
+
+    #[test]
+    fn ordinary_query_asset_identity_completes_without_rewriting() {
+        let url = "https://cdn.example/image?width=640&token=resource-token&width=320";
+        let input = asset_input(url, 0);
+        assert!(complete_asset_set(
+            &[Url::parse(url).unwrap()],
+            std::slice::from_ref(&input)
+        ));
+        assert_eq!(input.source_url.as_str(), url);
+        assert_eq!(input.final_url.as_str(), url);
+    }
+
     #[test]
     fn preserves_cached_representation_when_asset_acquisition_is_incomplete() {
+        let urls = [
+            Url::parse("https://cdn.example/one.png").unwrap(),
+            Url::parse("https://cdn.example/two.png").unwrap(),
+        ];
+        let fetched = [asset_input("https://cdn.example/one.png", 0)];
         assert!(should_preserve_cached_asset_representation(
             Some("<p>cached</p><img src=\"/assets/asset-id\">"),
-            2,
-            1,
+            &urls,
+            &fetched,
         ));
     }
 
     #[test]
     fn does_not_preserve_cached_representation_after_complete_asset_acquisition() {
+        let urls = [Url::parse("https://cdn.example/one.png").unwrap()];
+        let fetched = [asset_input("https://cdn.example/one.png", 0)];
         assert!(!should_preserve_cached_asset_representation(
             Some("<p>cached</p><img src=\"/assets/asset-id\">"),
-            1,
-            1,
+            &urls,
+            &fetched,
         ));
     }
 

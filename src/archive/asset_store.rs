@@ -205,6 +205,57 @@ impl Default for AssetRepairPolicy {
     }
 }
 
+/// Article-lineage attempt and cooldown policy for full article refresh jobs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AssetRefreshPolicy {
+    max_attempts: u32,
+    cooldown: Duration,
+}
+
+impl AssetRefreshPolicy {
+    /// Creates a validated article refresh policy.
+    pub fn new(max_attempts: u32, cooldown: Duration) -> Result<Self, AssetRefreshPolicyError> {
+        if !(1..=10).contains(&max_attempts) {
+            return Err(AssetRefreshPolicyError::AttemptLimitOutOfRange);
+        }
+        if !(Duration::from_secs(60)..=Duration::from_secs(86_400)).contains(&cooldown) {
+            return Err(AssetRefreshPolicyError::CooldownOutOfRange);
+        }
+        Ok(Self {
+            max_attempts,
+            cooldown,
+        })
+    }
+
+    /// Maximum number of newly admitted article refresh jobs.
+    pub const fn max_attempts(self) -> u32 {
+        self.max_attempts
+    }
+
+    /// Minimum delay after a failed or incomplete article refresh.
+    pub const fn cooldown(self) -> Duration {
+        self.cooldown
+    }
+}
+
+impl Default for AssetRefreshPolicy {
+    fn default() -> Self {
+        Self::new(3, Duration::from_secs(3_600))
+            .expect("default asset refresh policy must be valid")
+    }
+}
+
+/// Invalid article refresh policy configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum AssetRefreshPolicyError {
+    /// Attempt count must be in the supported range.
+    #[error("asset refresh attempt limit must be between 1 and 10")]
+    AttemptLimitOutOfRange,
+    /// Cooldown must be between one minute and one day.
+    #[error("asset refresh cooldown must be between 60 and 86400 seconds")]
+    CooldownOutOfRange,
+}
+
 /// Invalid asset-repair admission configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum AssetRepairPolicyError {
@@ -231,6 +282,11 @@ pub enum AssetCachePolicyError {
     /// A request could outlive the per-article wall-clock budget.
     #[error("asset request timeout must not exceed the per-article fetch time budget")]
     TimeoutExceedsArticleBudget,
+}
+
+/// Returns whether the URL query contains a recognized provider signature.
+pub fn has_signed_url_query(url: &Url) -> bool {
+    crate::domain::url_policy::has_provider_signature(url)
 }
 
 /// One validated binary response ready for persistence.
@@ -675,6 +731,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn recognizes_provider_signature_sets_without_rejecting_resource_queries() {
+        for signed in [
+            "https://cdn.example.test/image?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=secret",
+            "https://cdn.example.test/image?GoogleAccessId=key&Expires=123&Signature=secret",
+            "https://cdn.example.test/image?sv=1&se=123&sig=secret",
+            "https://cdn.example.test/image?Q-Signature=secret&Q-AK=key&Q-Sign-Algorithm=sha256",
+        ] {
+            assert!(
+                has_signed_url_query(&Url::parse(signed).unwrap()),
+                "{signed}"
+            );
+        }
+        for unsigned in [
+            "https://cdn.example.test/image?size=large&fit=cover",
+            "https://cdn.example.test/image?signature=part-of-resource-name",
+            "https://cdn.example.test/image?token=resource-token",
+        ] {
+            assert!(
+                !has_signed_url_query(&Url::parse(unsigned).unwrap()),
+                "{unsigned}"
+            );
+        }
+    }
+
+    #[test]
     fn default_policy_uses_documented_database_cache_limits() {
         let policy = AssetCachePolicy::default();
 
@@ -835,6 +916,40 @@ mod tests {
                 0,
             ),
             Err(AssetCachePolicyError::TimeoutExceedsArticleBudget)
+        );
+    }
+
+    #[test]
+    fn refresh_policy_defaults_and_accepts_configured_bounds() {
+        let default = AssetRefreshPolicy::default();
+        assert_eq!(default.max_attempts(), 3);
+        assert_eq!(default.cooldown(), Duration::from_secs(3_600));
+
+        let minimum = AssetRefreshPolicy::new(1, Duration::from_secs(60)).unwrap();
+        let maximum = AssetRefreshPolicy::new(10, Duration::from_secs(86_400)).unwrap();
+        assert_eq!(minimum.max_attempts(), 1);
+        assert_eq!(minimum.cooldown(), Duration::from_secs(60));
+        assert_eq!(maximum.max_attempts(), 10);
+        assert_eq!(maximum.cooldown(), Duration::from_secs(86_400));
+    }
+
+    #[test]
+    fn refresh_policy_rejects_values_outside_configured_bounds() {
+        assert_eq!(
+            AssetRefreshPolicy::new(0, Duration::from_secs(60)),
+            Err(AssetRefreshPolicyError::AttemptLimitOutOfRange)
+        );
+        assert_eq!(
+            AssetRefreshPolicy::new(11, Duration::from_secs(60)),
+            Err(AssetRefreshPolicyError::AttemptLimitOutOfRange)
+        );
+        assert_eq!(
+            AssetRefreshPolicy::new(3, Duration::from_secs(59)),
+            Err(AssetRefreshPolicyError::CooldownOutOfRange)
+        );
+        assert_eq!(
+            AssetRefreshPolicy::new(3, Duration::from_secs(86_401)),
+            Err(AssetRefreshPolicyError::CooldownOutOfRange)
         );
     }
 

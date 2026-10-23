@@ -190,6 +190,16 @@ async fn backfill_with_asset_archiving_does_not_bump_revision_for_unchanged_arti
         first_handler.execute(&first_lease, Utc::now()).await,
         JobExecution::Committed
     );
+    sqlx::query(
+        "INSERT INTO asset_article_refresh_lineage
+             (source_id, review_id, attempts, next_allowed_at, exhausted, last_outcome)
+         VALUES ($1, $2, 2, clock_timestamp() + interval '1 hour', TRUE, 'inconclusive')",
+    )
+    .bind(source_id.as_uuid())
+    .bind("asset-idempotent-backfill")
+    .execute(&pool)
+    .await
+    .unwrap();
 
     let second_job_id = enqueue_backfill(&pool, &source, &reference).await;
     let second_lease = claim(&pool, "asset-backfill-worker", Utc::now()).await;
@@ -228,6 +238,19 @@ async fn backfill_with_asset_archiving_does_not_bump_revision_for_unchanged_arti
     .await
     .unwrap();
     assert!(article_html.contains("/assets/"));
+    assert_eq!(
+        sqlx::query_as::<_, (i64, Option<chrono::DateTime<Utc>>, bool)>(
+            "SELECT attempts, next_allowed_at, exhausted
+             FROM asset_article_refresh_lineage WHERE source_id = $1 AND review_id = $2",
+        )
+        .bind(source_id.as_uuid())
+        .bind("asset-idempotent-backfill")
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        (0, None, false),
+        "a complete accepted backfill resets refresh lineage"
+    );
 
     for job_id in [first_job_id, second_job_id] {
         assert_eq!(
@@ -285,6 +308,25 @@ async fn backfill_preserves_cached_article_when_asset_fetch_is_incomplete(pool: 
     .await
     .unwrap();
     assert!(cached_html.contains("/assets/"));
+    sqlx::query(
+        "INSERT INTO asset_article_refresh_lineage
+             (source_id, review_id, attempts, next_allowed_at, exhausted, last_outcome)
+         VALUES ($1, $2, 2, clock_timestamp() + interval '1 hour', TRUE, 'inconclusive')",
+    )
+    .bind(source_id.as_uuid())
+    .bind("asset-fetch-failure-backfill")
+    .execute(&pool)
+    .await
+    .unwrap();
+    let lineage_before = sqlx::query_as::<_, (i64, Option<chrono::DateTime<Utc>>, bool)>(
+        "SELECT attempts, next_allowed_at, exhausted
+         FROM asset_article_refresh_lineage WHERE source_id = $1 AND review_id = $2",
+    )
+    .bind(source_id.as_uuid())
+    .bind("asset-fetch-failure-backfill")
+    .fetch_one(&pool)
+    .await
+    .unwrap();
 
     enqueue_backfill(&pool, &source, &reference).await;
     let second_lease = claim(&pool, "backfill-asset-worker", Utc::now()).await;
@@ -323,6 +365,19 @@ async fn backfill_preserves_cached_article_when_asset_fetch_is_incomplete(pool: 
     .await
     .unwrap();
     assert_eq!(relationship_count, 1);
+    assert_eq!(
+        sqlx::query_as::<_, (i64, Option<chrono::DateTime<Utc>>, bool)>(
+            "SELECT attempts, next_allowed_at, exhausted
+             FROM asset_article_refresh_lineage WHERE source_id = $1 AND review_id = $2",
+        )
+        .bind(source_id.as_uuid())
+        .bind("asset-fetch-failure-backfill")
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        (2, lineage_before.1, true,),
+        "an incomplete backfill preserves the exhausted refresh lineage"
+    );
 
     asset_server
         .await

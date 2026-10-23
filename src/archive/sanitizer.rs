@@ -23,6 +23,8 @@ use ego_tree::iter::Edge;
 use scraper::{Html, Node};
 use url::Url;
 
+use crate::domain::url_policy::has_provider_signature;
+
 const SAFE_ELEMENTS: &[&str] = &[
     "a",
     "abbr",
@@ -86,7 +88,7 @@ const DROP_CONTENT_ELEMENTS: &[&str] = &[
 
 const VOID_ELEMENTS: &[&str] = &["br", "col", "hr", "img", "wbr"];
 
-/// Sanitized article HTML and the external media URLs it references.
+/// Sanitized article HTML and transient external media required for completeness.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SanitizedHtml {
     html: String,
@@ -99,7 +101,8 @@ impl SanitizedHtml {
         &self.html
     }
 
-    /// Returns approved external image URLs in first-seen order.
+    /// Returns required HTTP(S) image URLs in first-seen order.
+    /// Signed URLs remain transient here even though they are omitted from HTML.
     pub fn external_assets(&self) -> &[Url] {
         &self.external_assets
     }
@@ -195,6 +198,14 @@ impl Renderer {
                 self.omitted_depth = 1;
                 return;
             };
+            if self.seen_assets.insert(source.clone()) {
+                self.external_assets.push(source.clone());
+            }
+            // Keep required signed images transient so acquisition cannot report completeness.
+            if has_provider_signature(&source) {
+                self.omitted_depth = 1;
+                return;
+            }
             self.html.push('<');
             self.html.push_str(name);
             self.append_attributes(element, Some(&source));
@@ -225,6 +236,9 @@ impl Renderer {
                 let Some(url) = approved_http_url(value, false) else {
                     continue;
                 };
+                if has_provider_signature(&url) {
+                    continue;
+                }
                 append_attribute(&mut self.html, attribute, url.as_str());
             } else {
                 append_attribute(&mut self.html, attribute, value);
@@ -233,9 +247,6 @@ impl Renderer {
 
         if let Some(source) = image_source {
             append_attribute(&mut self.html, "src", source.as_str());
-            if self.seen_assets.insert(source.clone()) {
-                self.external_assets.push(source.clone());
-            }
         }
     }
 }
@@ -334,6 +345,28 @@ fn is_allowed_html_character(character: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn omits_provider_signed_urls_but_preserves_ordinary_query_urls() {
+        let sanitized = sanitize(
+            r#"<p><img src="https://cdn.example/image.png?X-Amz-Signature=secret&amp;X-Amz-Credential=key"><a href="https://cdn.example/file?GoogleAccessId=key&amp;Expires=123&amp;Signature=secret">signed</a><img src="https://cdn.example/resize.png?width=640&amp;fit=cover"></p>"#,
+        );
+
+        assert_eq!(
+            sanitized.html(),
+            "<p><a>signed</a><img src=\"https://cdn.example/resize.png?width=640&amp;fit=cover\" /></p>"
+        );
+        assert_eq!(
+            sanitized.external_assets(),
+            &[
+                Url::parse(
+                    "https://cdn.example/image.png?X-Amz-Signature=secret&X-Amz-Credential=key"
+                )
+                .unwrap(),
+                Url::parse("https://cdn.example/resize.png?width=640&fit=cover").unwrap(),
+            ]
+        );
+    }
 
     #[test]
     fn removes_active_content_handlers_and_unsafe_urls() {

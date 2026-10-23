@@ -41,6 +41,7 @@
 //! ASSET_MAX_REDIRECTS / ASSET_REPAIR_MAX_PENDING /
 //! ASSET_REPAIR_PUBLIC_MAX_PENDING / ASSET_REPAIR_REQUEUE_SECONDS /
 //! ASSET_REPAIR_MAX_ATTEMPTS
+//! ASSET_REFRESH_MAX_ATTEMPTS / ASSET_REFRESH_COOLDOWN_SECONDS
 //! ADMIN_ENABLED / ADMIN_USERNAME / ADMIN_PASSWORD / SESSION_SIGNING_KEY /
 //! CREDENTIAL_ENCRYPTION_KEY
 //! ```
@@ -83,7 +84,8 @@ use crate::domain::pacing::{
 };
 use crate::{
     archive::asset_store::{
-        AssetCachePolicy, AssetCachePolicyError, AssetRepairPolicy, AssetRepairPolicyError,
+        AssetCachePolicy, AssetCachePolicyError, AssetRefreshPolicy, AssetRefreshPolicyError,
+        AssetRepairPolicy, AssetRepairPolicyError,
     },
     domain::credentials::WeReadAccountId,
 };
@@ -206,6 +208,8 @@ const KNOWN_ENVIRONMENT_VARIABLES: &[&str] = &[
     "ASSET_REPAIR_PUBLIC_MAX_PENDING",
     "ASSET_REPAIR_REQUEUE_SECONDS",
     "ASSET_REPAIR_MAX_ATTEMPTS",
+    "ASSET_REFRESH_MAX_ATTEMPTS",
+    "ASSET_REFRESH_COOLDOWN_SECONDS",
     "ADMIN_ENABLED",
     "ADMIN_USERNAME",
     "ADMIN_PASSWORD",
@@ -1113,6 +1117,8 @@ pub struct AppConfig {
     pub pacing: PacingPolicy,
     /// Optional binary asset archive configuration.
     pub asset_archive: AssetArchiveConfig,
+    /// Article-lineage retry and cooldown limits for full article refreshes.
+    pub asset_refresh_policy: AssetRefreshPolicy,
     /// Whether generated feeds should use absolute URLs for cached assets.
     pub asset_use_absolute_urls: bool,
     /// Whether administrative routes should be constructed.
@@ -1157,6 +1163,7 @@ impl AppConfig {
             MAX_WORKER_CONCURRENCY,
         )?;
         let asset_archive = asset_archive_config(&raw)?;
+        let asset_refresh_policy = asset_refresh_policy(&raw)?;
 
         let database_url = required(raw.database_url, "DATABASE_URL")?;
         let credential_encryption_key =
@@ -1490,6 +1497,7 @@ impl AppConfig {
             feed_build_heartbeat: Duration::from_secs(feed_build_heartbeat_seconds),
             pacing,
             asset_archive,
+            asset_refresh_policy,
             asset_use_absolute_urls,
             admin_enabled,
             admin_username,
@@ -1614,6 +1622,8 @@ struct RawConfig {
     asset_repair_public_max_pending: Option<u32>,
     asset_repair_requeue_seconds: Option<u64>,
     asset_repair_max_attempts: Option<u32>,
+    asset_refresh_max_attempts: Option<u32>,
+    asset_refresh_cooldown_seconds: Option<u64>,
     admin_enabled: Option<String>,
     admin_username: Option<String>,
     admin_password: Option<String>,
@@ -1875,10 +1885,7 @@ fn asset_archive_config(raw: &RawConfig) -> Result<AssetArchiveConfig, ConfigErr
         }
         "oss" => {
             let bucket = required(raw.asset_oss_bucket.clone(), "ASSET_OSS_BUCKET")?;
-            let versioning = required(
-                raw.asset_oss_versioning.clone(),
-                "ASSET_OSS_VERSIONING",
-            )?;
+            let versioning = required(raw.asset_oss_versioning.clone(), "ASSET_OSS_VERSIONING")?;
             if !versioning.trim().eq_ignore_ascii_case("disabled") {
                 return Err(ConfigError::InvalidValue {
                     variable: "ASSET_OSS_VERSIONING",
@@ -1994,17 +2001,11 @@ fn asset_archive_config(raw: &RawConfig) -> Result<AssetArchiveConfig, ConfigErr
             })
         }
         "azure" | "azblob" => {
-            let container = required(
-                raw.asset_azure_container.clone(),
-                "ASSET_AZURE_CONTAINER",
-            )?;
-            let endpoint = required(
-                raw.asset_azure_endpoint.clone(),
-                "ASSET_AZURE_ENDPOINT",
-            )?
-            .trim()
-            .trim_end_matches('/')
-            .to_owned();
+            let container = required(raw.asset_azure_container.clone(), "ASSET_AZURE_CONTAINER")?;
+            let endpoint = required(raw.asset_azure_endpoint.clone(), "ASSET_AZURE_ENDPOINT")?
+                .trim()
+                .trim_end_matches('/')
+                .to_owned();
             if endpoint.is_empty() {
                 return Err(ConfigError::Missing {
                     variable: "ASSET_AZURE_ENDPOINT",
@@ -2038,12 +2039,10 @@ fn asset_archive_config(raw: &RawConfig) -> Result<AssetArchiveConfig, ConfigErr
                 storage: AssetAzureConfig {
                     container,
                     endpoint,
-                    account_name: account_name.map(|value| {
-                        secrecy::SecretString::new(value.into_boxed_str())
-                    }),
-                    account_key: account_key.map(|value| {
-                        secrecy::SecretString::new(value.into_boxed_str())
-                    }),
+                    account_name: account_name
+                        .map(|value| secrecy::SecretString::new(value.into_boxed_str())),
+                    account_key: account_key
+                        .map(|value| secrecy::SecretString::new(value.into_boxed_str())),
                     skip_signature,
                 },
                 policy,
@@ -2063,7 +2062,11 @@ fn asset_archive_config(raw: &RawConfig) -> Result<AssetArchiveConfig, ConfigErr
             let password = optional_secret(raw.asset_ftp_password.clone());
             if user.is_some() != password.is_some() {
                 return Err(ConfigError::InvalidValue {
-                    variable: if user.is_some() { "ASSET_FTP_PASSWORD" } else { "ASSET_FTP_USER" },
+                    variable: if user.is_some() {
+                        "ASSET_FTP_PASSWORD"
+                    } else {
+                        "ASSET_FTP_USER"
+                    },
                     reason: "FTP user and password must be configured together",
                 });
             }
@@ -2124,7 +2127,11 @@ fn asset_archive_config(raw: &RawConfig) -> Result<AssetArchiveConfig, ConfigErr
             let password = optional_secret(raw.asset_webdav_password.clone());
             if user.is_some() != password.is_some() {
                 return Err(ConfigError::InvalidValue {
-                    variable: if user.is_some() { "ASSET_WEBDAV_PASSWORD" } else { "ASSET_WEBDAV_USER" },
+                    variable: if user.is_some() {
+                        "ASSET_WEBDAV_PASSWORD"
+                    } else {
+                        "ASSET_WEBDAV_USER"
+                    },
                     reason: "WebDAV user and password must be configured together",
                 });
             }
@@ -2189,6 +2196,23 @@ fn protocol_endpoint(
         });
     }
     Ok(endpoint.trim_end_matches('/').to_owned())
+}
+
+fn asset_refresh_policy(raw: &RawConfig) -> Result<AssetRefreshPolicy, ConfigError> {
+    AssetRefreshPolicy::new(
+        raw.asset_refresh_max_attempts.unwrap_or(3),
+        Duration::from_secs(raw.asset_refresh_cooldown_seconds.unwrap_or(3_600)),
+    )
+    .map_err(|error| match error {
+        AssetRefreshPolicyError::AttemptLimitOutOfRange => ConfigError::InvalidValue {
+            variable: "ASSET_REFRESH_MAX_ATTEMPTS",
+            reason: "must be between 1 and 10",
+        },
+        AssetRefreshPolicyError::CooldownOutOfRange => ConfigError::InvalidValue {
+            variable: "ASSET_REFRESH_COOLDOWN_SECONDS",
+            reason: "must be between 60 and 86400",
+        },
+    })
 }
 
 fn asset_repair_policy(raw: &RawConfig) -> Result<AssetRepairPolicy, ConfigError> {
@@ -4222,6 +4246,47 @@ mod tests {
         assert_eq!(repair_policy.public_max_pending(), 7);
         assert_eq!(repair_policy.requeue_after(), Duration::from_secs(45));
         assert_eq!(repair_policy.max_attempts(), 4);
+    }
+
+    #[test]
+    fn loads_article_refresh_policy_defaults_and_environment_values() {
+        let defaults = AppConfig::from_env_iter(valid_environment()).unwrap();
+        assert_eq!(defaults.asset_refresh_policy.max_attempts(), 3);
+        assert_eq!(
+            defaults.asset_refresh_policy.cooldown(),
+            Duration::from_secs(3_600)
+        );
+
+        let configured = AppConfig::from_env_iter(replace_environment(
+            replace_environment(valid_environment(), "ASSET_REFRESH_MAX_ATTEMPTS", "8"),
+            "ASSET_REFRESH_COOLDOWN_SECONDS",
+            "7200",
+        ))
+        .unwrap();
+        assert_eq!(configured.asset_refresh_policy.max_attempts(), 8);
+        assert_eq!(
+            configured.asset_refresh_policy.cooldown(),
+            Duration::from_secs(7_200)
+        );
+    }
+
+    #[test]
+    fn rejects_article_refresh_policy_values_outside_specified_ranges() {
+        for (variable, value) in [
+            ("ASSET_REFRESH_MAX_ATTEMPTS", "0"),
+            ("ASSET_REFRESH_MAX_ATTEMPTS", "11"),
+            ("ASSET_REFRESH_COOLDOWN_SECONDS", "59"),
+            ("ASSET_REFRESH_COOLDOWN_SECONDS", "86401"),
+        ] {
+            assert!(matches!(
+                AppConfig::from_env_iter(replace_environment(
+                    valid_environment(),
+                    variable,
+                    value,
+                )),
+                Err(ConfigError::InvalidValue { variable: actual, .. }) if actual == variable
+            ));
+        }
     }
 
     #[test]

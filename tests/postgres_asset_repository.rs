@@ -13,7 +13,7 @@ use uuid::Uuid;
 use werrss::{
     archive::asset_store::{
         AssetBlob, AssetBlobKey, AssetBlobMetadata, AssetBlobStore, AssetBlobStoreError,
-        AssetCachePolicy, AssetInput, AssetRead, AssetRepairPolicy,
+        AssetCachePolicy, AssetInput, AssetRead, AssetRefreshPolicy, AssetRepairPolicy,
     },
     domain::{
         article::{ArticleObservationVersion, NewArticle},
@@ -23,8 +23,8 @@ use werrss::{
         repositories::{
             article_repository::ArticleTransactionRepository,
             asset_repository::{
-                AssetRepairEnqueueResult, AssetRepairRestoreResult, AssetRepositoryError,
-                AssetTransactionRepository, PostgresAssetStore,
+                ArticleRefreshOutcome, AssetRepairEnqueueResult, AssetRepairRestoreResult,
+                AssetRepositoryError, AssetTransactionRepository, PostgresAssetStore,
             },
             job_repository::{JobLease, JobQueue, PostgresJobRepository},
             opendal_blob_store::OpenDalFsBlobStore,
@@ -135,6 +135,34 @@ impl AssetBlobStore for MemoryBlobStore {
         }
         Ok(())
     }
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn asset_unit_of_work_reserves_capacity_before_callers_lock_articles(pool: PgPool) {
+    let input = asset_input("https://cdn.example/capacity-order.png", FIRST_BYTES, 0);
+    let factory = UnitOfWorkFactory::new(pool.clone());
+    let unit_of_work = factory
+        .begin_with_assets(std::slice::from_ref(&input))
+        .await
+        .unwrap();
+
+    assert!(
+        !sqlx::query_scalar::<_, bool>(
+            "SELECT pg_try_advisory_xact_lock(hashtextextended('asset-capacity', 0))",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        "asset preparation must reserve capacity before a caller acquires source/article rows"
+    );
+
+    unit_of_work.commit().await.unwrap();
+    assert!(sqlx::query_scalar::<_, bool>(
+        "SELECT pg_try_advisory_xact_lock(hashtextextended('asset-capacity', 0))",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap());
 }
 
 #[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
@@ -791,6 +819,1766 @@ async fn asset_read_waits_for_eviction_lock_and_keeps_bytes_available(pool: PgPo
             .unwrap(),
         Some(AssetRead::Available { .. })
     ));
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn asset_write_rejects_provider_signed_urls(pool: PgPool) {
+    let source_id = SourceId::from_uuid(Uuid::new_v4());
+    create_source_and_articles(&pool, source_id, &["signed-url-policy"]).await;
+    let policy = test_policy(0, Duration::from_secs(30), 1024);
+    let signed = asset_input(
+        "https://cdn.example/signed.png?X-Amz-Signature=secret",
+        FIRST_BYTES,
+        0,
+    );
+    let factory = UnitOfWorkFactory::new(pool.clone());
+    let mut unit_of_work = factory
+        .begin_with_assets(std::slice::from_ref(&signed))
+        .await
+        .unwrap();
+    assert_eq!(
+        unit_of_work
+            .assets(policy)
+            .store_for_article(source_id, "signed-url-policy", &[signed])
+            .await
+            .unwrap_err(),
+        AssetRepositoryError::InvalidUrl
+    );
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn asset_write_preserves_ordinary_query_url_identity(pool: PgPool) {
+    let source_id = SourceId::from_uuid(Uuid::new_v4());
+    create_source_and_articles(&pool, source_id, &["query-url-policy"]).await;
+    let policy = test_policy(0, Duration::from_secs(30), 1024);
+    let input = asset_input(
+        "https://cdn.example/image.png?width=640&fit=cover",
+        FIRST_BYTES,
+        0,
+    );
+    let factory = UnitOfWorkFactory::new(pool.clone());
+    let mut unit_of_work = factory
+        .begin_with_assets(std::slice::from_ref(&input))
+        .await
+        .unwrap();
+    let stored = unit_of_work
+        .assets(policy)
+        .store_for_article(source_id, "query-url-policy", &[input])
+        .await
+        .unwrap();
+    unit_of_work.commit().await.unwrap();
+
+    let source_url: String =
+        sqlx::query_scalar("SELECT source_url FROM asset_records WHERE id = $1")
+            .bind(stored[0].id())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        source_url,
+        "https://cdn.example/image.png?width=640&fit=cover"
+    );
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn confirmed_expiry_deduplication_leaves_other_generation_unreserved(pool: PgPool) {
+    let (first_asset_id, first_lease) = admit_refresh_job(&pool, "shared-refresh-article").await;
+    let source_id = SourceId::from_uuid(
+        Uuid::parse_str(first_lease.job.payload()["source_id"].as_str().unwrap()).unwrap(),
+    );
+    let policy = test_policy(0, Duration::from_secs(30), 1024);
+    let second = store_asset(
+        &pool,
+        policy,
+        source_id,
+        "shared-refresh-article",
+        asset_input("https://cdn.example/second-expired.png", SECOND_BYTES, 1),
+    )
+    .await;
+    sqlx::query("UPDATE asset_blobs SET data = NULL WHERE id = $1")
+        .bind(second.blob_id())
+        .execute(&pool)
+        .await
+        .unwrap();
+    let store = PostgresAssetStore::new(pool.clone(), policy);
+    assert!(matches!(
+        store.enqueue_repair(second.id()).await.unwrap(),
+        AssetRepairEnqueueResult::Enqueued { .. }
+    ));
+    let repair = claim_repair_job(&pool).await;
+    assert_eq!(store.finish_confirmed_expiry(&repair, second.id()).await.unwrap(),
+        werrss::persistence::repositories::asset_repository::AssetRefreshAdmissionResult::NoEligibleArticle);
+    assert_eq!(
+        sqlx::query_as::<_, (String, i64, Option<Uuid>)>(
+            "SELECT e.state, l.attempts, s.active_chain_id
+         FROM asset_refresh_generation_entries e
+         JOIN asset_record_refresh_state s USING (asset_record_id)
+         JOIN asset_article_refresh_lineage l USING (source_id, review_id)
+         WHERE e.asset_record_id = $1",
+        )
+        .bind(second.id())
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        ("unseen".to_owned(), 1, None)
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, Option<Uuid>>(
+            "SELECT active_chain_id FROM asset_record_refresh_state WHERE asset_record_id = $1",
+        )
+        .bind(first_asset_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        Some(Uuid::parse_str(first_lease.job.payload()["chain_id"].as_str().unwrap()).unwrap())
+    );
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn complete_normal_acquisition_reconciles_other_generation_entries(pool: PgPool) {
+    let (asset_id, lease) = admit_refresh_job(&pool, "reconciled-article").await;
+    let source_id = SourceId::from_uuid(
+        Uuid::parse_str(lease.job.payload()["source_id"].as_str().unwrap()).unwrap(),
+    );
+    let other_asset_id = Uuid::new_v4();
+    sqlx::query("INSERT INTO asset_record_refresh_state (asset_record_id, requested_generation, served_generation) VALUES ($1, 1, 1)")
+        .bind(other_asset_id).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO asset_refresh_generation_entries (asset_record_id, generation, ordinal, source_id, review_id) VALUES ($1, 1, 1, $2, 'reconciled-article')")
+        .bind(other_asset_id).bind(source_id.as_uuid()).execute(&pool).await.unwrap();
+    let factory = UnitOfWorkFactory::new(pool.clone());
+    // Match the production source-sync/backfill path, which reserves the
+    // capacity and recovery-admission locks before touching these rows.
+    let mut uow = factory
+        .begin_article_acquisition_with_assets(&[])
+        .await
+        .unwrap();
+    uow.assets(test_policy(0, Duration::from_secs(30), 1024))
+        .reset_article_refresh_lineage(source_id, "reconciled-article")
+        .await
+        .unwrap();
+    uow.commit().await.unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT state FROM asset_refresh_generation_entries WHERE asset_record_id = $1"
+        )
+        .bind(other_asset_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        "done"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT state FROM asset_refresh_generation_entries WHERE asset_record_id = $1"
+        )
+        .bind(asset_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        "in_flight"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT completed_generation FROM asset_record_refresh_state WHERE asset_record_id = $1"
+        )
+        .bind(other_asset_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        1
+    );
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn periodic_pending_pass_resumes_due_generation_without_cache_miss(pool: PgPool) {
+    let (asset_id, lease) = admit_refresh_job(&pool, "periodic-resume").await;
+    let policy = test_policy(0, Duration::from_secs(30), 1024);
+    let factory = UnitOfWorkFactory::new(pool.clone());
+    let mut uow = factory.begin().await.unwrap();
+    uow.assets(policy)
+        .finish_article_refresh(
+            &lease,
+            ArticleRefreshOutcome::Inconclusive,
+            AssetRefreshPolicy::new(3, Duration::from_secs(60)).unwrap(),
+        )
+        .await
+        .unwrap();
+    uow.commit().await.unwrap();
+    sqlx::query("UPDATE asset_article_refresh_lineage SET next_allowed_at = clock_timestamp() - interval '1 second'")
+        .execute(&pool).await.unwrap();
+    sqlx::query("UPDATE asset_refresh_generation_entries SET not_before = clock_timestamp() - interval '1 second' WHERE state = 'cooling'")
+        .execute(&pool).await.unwrap();
+    let store = PostgresAssetStore::new(pool.clone(), policy);
+    store.resume_pending_refreshes().await.unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM asset_repair_jobs r JOIN jobs j ON j.id = r.job_id
+         WHERE r.expired_asset_record_id = $1 AND j.status = 'queued'",
+        )
+        .bind(asset_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        1
+    );
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn repeated_cache_misses_coalesce_one_active_chain_follow_up(pool: PgPool) {
+    let (asset_id, _lease) = admit_refresh_job(&pool, "coalesced-active-follow-up").await;
+    let store =
+        PostgresAssetStore::new(pool.clone(), test_policy(0, Duration::from_secs(30), 1024))
+            .with_refresh_policy(AssetRefreshPolicy::default());
+
+    assert_eq!(
+        store.enqueue_repair(asset_id).await.unwrap(),
+        AssetRepairEnqueueResult::Retryable
+    );
+    assert_eq!(
+        store.enqueue_repair(asset_id).await.unwrap(),
+        AssetRepairEnqueueResult::Retryable
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT requested_generation FROM asset_record_refresh_state
+             WHERE asset_record_id = $1",
+        )
+        .bind(asset_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        2,
+        "repeated misses during one active generation should request only one follow-up"
+    );
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn pending_generation_marks_entries_done_when_live_relationship_was_removed(pool: PgPool) {
+    let source_id = SourceId::from_uuid(Uuid::new_v4());
+    let review_id = "stale-refresh-snapshot";
+    create_source_and_articles(&pool, source_id, &[review_id]).await;
+    let cache_policy = test_policy(0, Duration::from_secs(30), 1024);
+    let stored = store_asset(
+        &pool,
+        cache_policy,
+        source_id,
+        review_id,
+        asset_input("https://cdn.example/stale-snapshot.png", FIRST_BYTES, 0),
+    )
+    .await;
+    sqlx::query("UPDATE asset_blobs SET data = NULL WHERE id = $1")
+        .bind(stored.blob_id())
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO asset_record_refresh_state
+             (asset_record_id, requested_generation, completed_generation,
+              served_generation, active_chain_id)
+         VALUES ($1, 1, 0, 1, NULL)",
+    )
+    .bind(stored.id())
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO asset_refresh_generation_entries
+             (asset_record_id, generation, ordinal, source_id, review_id, state)
+         VALUES ($1, 1, 1, $2, $3, 'unseen')",
+    )
+    .bind(stored.id())
+    .bind(source_id.as_uuid())
+    .bind(review_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("DELETE FROM article_assets WHERE asset_record_id = $1")
+        .bind(stored.id())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let store = PostgresAssetStore::new(pool.clone(), cache_policy)
+        .with_refresh_policy(AssetRefreshPolicy::default());
+    assert_eq!(
+        store.enqueue_repair(stored.id()).await.unwrap(),
+        AssetRepairEnqueueResult::Retryable
+    );
+    assert_eq!(
+        sqlx::query_as::<_, (String, i64)>(
+            "SELECT e.state, s.completed_generation
+             FROM asset_refresh_generation_entries e
+             JOIN asset_record_refresh_state s USING (asset_record_id)
+             WHERE e.asset_record_id = $1 AND e.generation = 1",
+        )
+        .bind(stored.id())
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        ("done".to_owned(), 1)
+    );
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn pending_refresh_cache_miss_does_not_increment_requested_generation(pool: PgPool) {
+    let source_id = SourceId::from_uuid(Uuid::new_v4());
+    create_source_and_articles(&pool, source_id, &["pending-refresh-cooling"]).await;
+    let policy = test_policy(0, Duration::from_secs(30), 1024);
+    let stored = store_asset(
+        &pool,
+        policy,
+        source_id,
+        "pending-refresh-cooling",
+        asset_input(
+            "https://cdn.example/pending-refresh-cooling.png",
+            FIRST_BYTES,
+            0,
+        ),
+    )
+    .await;
+    sqlx::query("UPDATE asset_blobs SET data = NULL WHERE id = $1")
+        .bind(stored.blob_id())
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO asset_record_refresh_state
+             (asset_record_id, requested_generation, completed_generation,
+              served_generation, active_chain_id)
+         VALUES ($1, 2, 0, 1, NULL)",
+    )
+    .bind(stored.id())
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO asset_refresh_generation_entries
+             (asset_record_id, generation, ordinal, source_id, review_id,
+              state, not_before)
+         VALUES ($1, 1, 1, $2, 'pending-refresh-cooling', 'cooling',
+                 clock_timestamp() + interval '1 hour')",
+    )
+    .bind(stored.id())
+    .bind(source_id.as_uuid())
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let store = PostgresAssetStore::new(pool.clone(), policy)
+        .with_refresh_policy(AssetRefreshPolicy::default());
+    assert_eq!(
+        store.enqueue_repair(stored.id()).await.unwrap(),
+        AssetRepairEnqueueResult::Retryable
+    );
+    let state = sqlx::query_as::<_, (i64, i64)>(
+        "SELECT requested_generation, served_generation
+         FROM asset_record_refresh_state WHERE asset_record_id = $1",
+    )
+    .bind(stored.id())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(state, (2, 1));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM asset_repair_jobs arj
+             JOIN jobs j ON j.id = arj.job_id
+             WHERE arj.asset_record_id = $1
+               AND j.status IN ('queued', 'running', 'retry_wait', 'deferred')",
+        )
+        .bind(stored.id())
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        0,
+        "a cooling pending snapshot must not admit a repair job"
+    );
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn pending_refresh_cache_miss_resumes_existing_snapshot_without_counter_increment(
+    pool: PgPool,
+) {
+    let source_id = SourceId::from_uuid(Uuid::new_v4());
+    create_source_and_articles(&pool, source_id, &["pending-refresh-resume"]).await;
+    let policy = test_policy(0, Duration::from_secs(30), 1024);
+    let stored = store_asset(
+        &pool,
+        policy,
+        source_id,
+        "pending-refresh-resume",
+        asset_input(
+            "https://cdn.example/pending-refresh-resume.png",
+            FIRST_BYTES,
+            0,
+        ),
+    )
+    .await;
+    sqlx::query("UPDATE asset_blobs SET data = NULL WHERE id = $1")
+        .bind(stored.blob_id())
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO asset_record_refresh_state
+             (asset_record_id, requested_generation, completed_generation,
+              served_generation, active_chain_id)
+         VALUES ($1, 2, 0, 1, NULL)",
+    )
+    .bind(stored.id())
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO asset_refresh_generation_entries
+             (asset_record_id, generation, ordinal, source_id, review_id, state)
+         VALUES ($1, 1, 1, $2, 'pending-refresh-resume', 'unseen')",
+    )
+    .bind(stored.id())
+    .bind(source_id.as_uuid())
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let store = PostgresAssetStore::new(pool.clone(), policy)
+        .with_refresh_policy(AssetRefreshPolicy::default());
+    let result = store.enqueue_repair(stored.id()).await.unwrap();
+    let job_id = match result {
+        AssetRepairEnqueueResult::Enqueued { job_id } => job_id,
+        other => panic!("pending snapshot should resume, got {other:?}"),
+    };
+    let state = sqlx::query_as::<_, (i64, i64, i64, Option<Uuid>)>(
+        "SELECT requested_generation, completed_generation, served_generation, active_chain_id
+         FROM asset_record_refresh_state WHERE asset_record_id = $1",
+    )
+    .bind(stored.id())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(state.0, 2);
+    assert_eq!(state.1, 0);
+    assert_eq!(state.2, 1);
+    assert!(state.3.is_some());
+    let queued = sqlx::query_as::<_, (i64, Uuid)>(
+        "SELECT arj.chain_ordinal, arj.chain_id
+         FROM asset_repair_jobs arj JOIN jobs j ON j.id = arj.job_id
+         WHERE j.id = $1 AND j.job_type = 'asset_refresh' AND j.status = 'queued'",
+    )
+    .bind(job_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(queued.0, 1);
+    assert_eq!(Some(queued.1), state.3);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM asset_refresh_generation_entries
+             WHERE asset_record_id = $1 AND generation = 1",
+        )
+        .bind(stored.id())
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        1,
+        "resume must not append snapshot entries"
+    );
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn pending_refresh_cache_miss_resumes_a_due_cooling_entry(pool: PgPool) {
+    let source_id = SourceId::from_uuid(Uuid::new_v4());
+    let review_id = "pending-refresh-cooling-resume";
+    create_source_and_articles(&pool, source_id, &[review_id]).await;
+    let cache_policy = test_policy(0, Duration::from_secs(30), 1024);
+    let stored = store_asset(
+        &pool,
+        cache_policy,
+        source_id,
+        review_id,
+        asset_input(
+            "https://cdn.example/pending-cooling-resume.png",
+            FIRST_BYTES,
+            0,
+        ),
+    )
+    .await;
+    sqlx::query("UPDATE asset_blobs SET data = NULL WHERE id = $1")
+        .bind(stored.blob_id())
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO asset_article_refresh_lineage
+             (source_id, review_id, attempts, next_allowed_at, exhausted, last_outcome)
+         VALUES ($1, $2, 1, clock_timestamp() - interval '1 second', FALSE, 'inconclusive')",
+    )
+    .bind(source_id.as_uuid())
+    .bind(review_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO asset_record_refresh_state
+             (asset_record_id, requested_generation, completed_generation,
+              served_generation, active_chain_id)
+         VALUES ($1, 1, 0, 1, NULL)",
+    )
+    .bind(stored.id())
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO asset_refresh_generation_entries
+             (asset_record_id, generation, ordinal, source_id, review_id, state, not_before)
+         VALUES ($1, 1, 1, $2, $3, 'cooling', clock_timestamp() - interval '1 second')",
+    )
+    .bind(stored.id())
+    .bind(source_id.as_uuid())
+    .bind(review_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let store = PostgresAssetStore::new(pool.clone(), cache_policy)
+        .with_refresh_policy(AssetRefreshPolicy::new(3, Duration::from_secs(60)).unwrap());
+    let job_id = match store.enqueue_repair(stored.id()).await.unwrap() {
+        AssetRepairEnqueueResult::Enqueued { job_id } => job_id,
+        other => panic!("due cooling entry should resume from its snapshot: {other:?}"),
+    };
+
+    let job = sqlx::query_as::<_, (String, i64, i64, i64, i64)>(
+        "SELECT j.job_type, arj.chain_ordinal, ars.served_generation,
+                ars.requested_generation, ars.completed_generation
+         FROM jobs j JOIN asset_repair_jobs arj ON arj.job_id = j.id
+         JOIN asset_record_refresh_state ars ON ars.asset_record_id = $2
+         WHERE j.id = $1",
+    )
+    .bind(job_id)
+    .bind(stored.id())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(job, ("asset_refresh".to_owned(), 1, 1, 1, 0));
+    assert!(sqlx::query_scalar::<_, bool>(
+        "SELECT active_chain_id IS NOT NULL FROM asset_record_refresh_state WHERE asset_record_id = $1",
+    ).bind(stored.id()).fetch_one(&pool).await.unwrap());
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT attempts FROM asset_article_refresh_lineage WHERE source_id = $1 AND review_id = $2",
+        ).bind(source_id.as_uuid()).bind(review_id).fetch_one(&pool).await.unwrap(),
+        2,
+        "resuming a due entry reserves one additional bounded attempt"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM asset_refresh_generation_entries WHERE asset_record_id = $1",
+        )
+        .bind(stored.id())
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        1,
+        "resumption must not create a new generation snapshot"
+    );
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn unresolvable_refresh_metadata_succeeds_only_the_claimed_job(pool: PgPool) {
+    let source_id = SourceId::from_uuid(Uuid::new_v4());
+    create_source_and_articles(&pool, source_id, &["stale-refresh-metadata"]).await;
+    let cache_policy = test_policy(0, Duration::from_secs(30), 1024);
+    let stored = store_asset(
+        &pool,
+        cache_policy,
+        source_id,
+        "stale-refresh-metadata",
+        asset_input(
+            "https://cdn.example/stale-refresh-metadata.png",
+            FIRST_BYTES,
+            0,
+        ),
+    )
+    .await;
+    sqlx::query("UPDATE asset_blobs SET data = NULL WHERE id = $1")
+        .bind(stored.blob_id())
+        .execute(&pool)
+        .await
+        .unwrap();
+    let store = PostgresAssetStore::new(pool.clone(), cache_policy)
+        .with_repair_policy(AssetRepairPolicy::new(2, 2, Duration::from_secs(60), 3).unwrap())
+        .with_refresh_policy(AssetRefreshPolicy::new(3, Duration::from_secs(60)).unwrap());
+    let repair_id = match store.enqueue_repair(stored.id()).await.unwrap() {
+        AssetRepairEnqueueResult::Enqueued { job_id } => job_id,
+        other => panic!("public repair should be admitted, got {other:?}"),
+    };
+    let repair_lease = claim_repair_job(&pool).await;
+    assert_eq!(repair_lease.job.id(), repair_id);
+    let refresh_id = match store
+        .finish_confirmed_expiry(&repair_lease, stored.id())
+        .await
+        .unwrap()
+    {
+        werrss::persistence::repositories::asset_repository::AssetRefreshAdmissionResult::Enqueued {
+            job_id,
+            ..
+        } => job_id,
+        other => panic!("confirmed expiry should create refresh job, got {other:?}"),
+    };
+    let refresh_lease = PostgresJobRepository::new(pool.clone())
+        .claim_next(
+            "asset-refresh-test-worker",
+            Utc::now(),
+            chrono::Duration::minutes(5),
+            &[werrss::domain::job::JobType::AssetRefresh],
+        )
+        .await
+        .unwrap()
+        .expect("refresh job should be claimable");
+    assert_eq!(refresh_lease.job.id(), refresh_id);
+    sqlx::query("DELETE FROM asset_repair_jobs WHERE job_id = $1")
+        .bind(refresh_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let chain_before = sqlx::query_as::<_, (i64, i64, i64, Option<Uuid>)>(
+        "SELECT requested_generation, completed_generation, served_generation, active_chain_id
+         FROM asset_record_refresh_state WHERE asset_record_id = $1",
+    )
+    .bind(stored.id())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    let factory = UnitOfWorkFactory::new(pool.clone());
+    let mut unit_of_work = factory.begin().await.unwrap();
+    unit_of_work
+        .assets(cache_policy)
+        .complete_unresolvable_article_refresh(&refresh_lease)
+        .await
+        .unwrap();
+    unit_of_work.commit().await.unwrap();
+
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT status FROM jobs WHERE id = $1")
+            .bind(refresh_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        "succeeded"
+    );
+    let chain_after = sqlx::query_as::<_, (i64, i64, i64, Option<Uuid>)>(
+        "SELECT requested_generation, completed_generation, served_generation, active_chain_id
+         FROM asset_record_refresh_state WHERE asset_record_id = $1",
+    )
+    .bind(stored.id())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(chain_after, chain_before);
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT status FROM jobs WHERE id = $1")
+            .bind(repair_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        "succeeded",
+        "terminalizing stale refresh metadata must not modify the prior repair job"
+    );
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn malformed_refresh_payload_terminalizes_its_current_snapshot_entry(pool: PgPool) {
+    let (asset_id, old_lease) = admit_refresh_job(&pool, "malformed-refresh-payload").await;
+    sqlx::query(
+        "UPDATE jobs
+         SET status = 'queued', lease_owner = NULL, lease_token = NULL,
+             lease_until = NULL, heartbeat_at = NULL, payload_json = '{}'::jsonb
+         WHERE id = $1",
+    )
+    .bind(old_lease.job.id())
+    .execute(&pool)
+    .await
+    .unwrap();
+    let lease = PostgresJobRepository::new(pool.clone())
+        .claim_next(
+            "malformed-refresh-worker",
+            Utc::now(),
+            chrono::Duration::minutes(5),
+            &[werrss::domain::job::JobType::AssetRefresh],
+        )
+        .await
+        .unwrap()
+        .expect("malformed refresh job should remain claimable");
+
+    let factory = UnitOfWorkFactory::new(pool.clone());
+    let mut unit_of_work = factory.begin().await.unwrap();
+    unit_of_work
+        .assets(test_policy(0, Duration::from_secs(30), 1024))
+        .complete_unresolvable_article_refresh(&lease)
+        .await
+        .unwrap();
+    unit_of_work.commit().await.unwrap();
+
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT state FROM asset_refresh_generation_entries
+             WHERE asset_record_id = $1 AND generation = 1 AND ordinal = 1",
+        )
+        .bind(asset_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        "done"
+    );
+    assert_eq!(
+        sqlx::query_as::<_, (i64, Option<Uuid>)>(
+            "SELECT completed_generation, active_chain_id
+             FROM asset_record_refresh_state WHERE asset_record_id = $1",
+        )
+        .bind(asset_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        (1, None)
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT status FROM jobs WHERE id = $1")
+            .bind(lease.job.id())
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        "succeeded"
+    );
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn superseded_snapshot_entry_cannot_finish_a_refresh(pool: PgPool) {
+    let (asset_id, lease) = admit_refresh_job(&pool, "superseded-entry").await;
+    sqlx::query(
+        "UPDATE asset_refresh_generation_entries
+         SET state = 'done', not_before = NULL
+         WHERE asset_record_id = $1 AND generation = 1 AND ordinal = 1",
+    )
+    .bind(asset_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let factory = UnitOfWorkFactory::new(pool.clone());
+    let mut unit_of_work = factory.begin().await.unwrap();
+    let result = unit_of_work
+        .assets(test_policy(0, Duration::from_secs(30), 1024))
+        .finish_article_refresh(
+            &lease,
+            ArticleRefreshOutcome::Succeeded,
+            AssetRefreshPolicy::new(3, Duration::from_secs(60)).unwrap(),
+        )
+        .await;
+    assert!(
+        matches!(result, Err(AssetRepositoryError::InvalidMetadata)),
+        "a snapshot entry retired by reconciliation must not be finalized by its old owner: {result:?}"
+    );
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn ordinary_completion_reports_entries_retired_by_the_selector(pool: PgPool) {
+    let (asset_id, lease) = admit_refresh_job(&pool, "selector-retired-entry").await;
+    let source_id: Uuid = lease.job.payload()["source_id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO asset_refresh_generation_entries
+             (asset_record_id, generation, ordinal, source_id, review_id, state)
+         VALUES ($1, 1, 2, $2, 'vanished-article', 'unseen')",
+    )
+    .bind(asset_id)
+    .bind(source_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let factory = UnitOfWorkFactory::new(pool.clone());
+    let mut unit_of_work = factory.begin().await.unwrap();
+    let finish = unit_of_work
+        .assets(test_policy(0, Duration::from_secs(30), 1024))
+        .finish_article_refresh(
+            &lease,
+            ArticleRefreshOutcome::Deleted,
+            AssetRefreshPolicy::new(3, Duration::from_secs(60)).unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        finish.generation_completed,
+        "completion must be measured after the selector retires stale entries"
+    );
+    assert!(finish.next_job_id.is_none());
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn cache_miss_returns_retryable_while_article_lineage_is_cooling(pool: PgPool) {
+    let source_id = SourceId::from_uuid(Uuid::new_v4());
+    create_source_and_articles(&pool, source_id, &["cooling-lineage-miss"]).await;
+    let policy = test_policy(0, Duration::from_secs(30), 1024);
+    let stored = store_asset(
+        &pool,
+        policy,
+        source_id,
+        "cooling-lineage-miss",
+        asset_input(
+            "https://cdn.example/cooling-lineage-miss.png",
+            FIRST_BYTES,
+            0,
+        ),
+    )
+    .await;
+    sqlx::query("UPDATE asset_blobs SET data = NULL WHERE id = $1")
+        .bind(stored.blob_id())
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO asset_article_refresh_lineage
+             (source_id, review_id, attempts, next_allowed_at, exhausted, last_outcome)
+         VALUES ($1, 'cooling-lineage-miss', 1,
+                 clock_timestamp() + interval '10 minutes', FALSE, 'inconclusive')",
+    )
+    .bind(source_id.as_uuid())
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let store = PostgresAssetStore::new(pool.clone(), policy);
+    assert_eq!(
+        store.enqueue_repair(stored.id()).await.unwrap(),
+        AssetRepairEnqueueResult::Retryable,
+        "a cooling article lineage keeps the miss retryable instead of admitting a repair"
+    );
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn cache_miss_is_exhausted_once_every_article_lineage_is_exhausted(pool: PgPool) {
+    let source_id = SourceId::from_uuid(Uuid::new_v4());
+    create_source_and_articles(&pool, source_id, &["exhausted-lineage-miss"]).await;
+    let policy = test_policy(0, Duration::from_secs(30), 1024);
+    let stored = store_asset(
+        &pool,
+        policy,
+        source_id,
+        "exhausted-lineage-miss",
+        asset_input(
+            "https://cdn.example/exhausted-lineage-miss.png",
+            FIRST_BYTES,
+            0,
+        ),
+    )
+    .await;
+    sqlx::query("UPDATE asset_blobs SET data = NULL WHERE id = $1")
+        .bind(stored.blob_id())
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO asset_article_refresh_lineage
+             (source_id, review_id, attempts, next_allowed_at, exhausted, last_outcome)
+         VALUES ($1, 'exhausted-lineage-miss', 3, NULL, TRUE, 'exhausted')",
+    )
+    .bind(source_id.as_uuid())
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let store = PostgresAssetStore::new(pool.clone(), policy);
+    assert_eq!(
+        store.enqueue_repair(stored.id()).await.unwrap(),
+        AssetRepairEnqueueResult::Exhausted,
+        "no live article may be refreshed, so the miss is terminal"
+    );
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn normal_acquisition_completes_only_the_generations_it_superseded(pool: PgPool) {
+    let source_id = SourceId::from_uuid(Uuid::new_v4());
+    create_source_and_articles(&pool, source_id, &["reconciled-target", "unrelated-target"]).await;
+    let policy = test_policy(0, Duration::from_secs(30), 1024);
+    let affected = store_asset(
+        &pool,
+        policy,
+        source_id,
+        "reconciled-target",
+        asset_input("https://cdn.example/reconciled-target.png", FIRST_BYTES, 0),
+    )
+    .await;
+    let unrelated = store_asset(
+        &pool,
+        policy,
+        source_id,
+        "unrelated-target",
+        asset_input("https://cdn.example/unrelated-target.png", SECOND_BYTES, 0),
+    )
+    .await;
+    for (asset_id, review_id, state, not_before) in [
+        (
+            affected.id(),
+            "reconciled-target",
+            "unseen",
+            None::<chrono::DateTime<Utc>>,
+        ),
+        (unrelated.id(), "unrelated-target", "done", None),
+    ] {
+        sqlx::query(
+            "INSERT INTO asset_record_refresh_state
+                 (asset_record_id, requested_generation, completed_generation, served_generation)
+             VALUES ($1, 1, 0, 1)",
+        )
+        .bind(asset_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO asset_refresh_generation_entries
+                 (asset_record_id, generation, ordinal, source_id, review_id, state, not_before)
+             VALUES ($1, 1, 1, $2, $3, $4, $5)",
+        )
+        .bind(asset_id)
+        .bind(source_id.as_uuid())
+        .bind(review_id)
+        .bind(state)
+        .bind(not_before)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    let factory = UnitOfWorkFactory::new(pool.clone());
+    let mut unit_of_work = factory.begin().await.unwrap();
+    unit_of_work
+        .assets(policy)
+        .reset_article_refresh_lineage(source_id, "reconciled-target")
+        .await
+        .unwrap();
+    unit_of_work.commit().await.unwrap();
+
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT completed_generation FROM asset_record_refresh_state
+             WHERE asset_record_id = $1",
+        )
+        .bind(affected.id())
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        1,
+        "the superseded generation should complete"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT completed_generation FROM asset_record_refresh_state
+             WHERE asset_record_id = $1",
+        )
+        .bind(unrelated.id())
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        0,
+        "an unrelated generation must not be advanced by another article's reset"
+    );
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn periodic_pass_skips_a_pending_generation_with_an_active_repair(pool: PgPool) {
+    let source_id = SourceId::from_uuid(Uuid::new_v4());
+    let review_id = "repair-owns-the-slot";
+    create_source_and_articles(&pool, source_id, &[review_id]).await;
+    let policy = test_policy(0, Duration::from_secs(30), 1024);
+    let stored = store_asset(
+        &pool,
+        policy,
+        source_id,
+        review_id,
+        asset_input(
+            "https://cdn.example/repair-owns-the-slot.png",
+            FIRST_BYTES,
+            0,
+        ),
+    )
+    .await;
+    sqlx::query("UPDATE asset_blobs SET data = NULL WHERE id = $1")
+        .bind(stored.blob_id())
+        .execute(&pool)
+        .await
+        .unwrap();
+    let store = PostgresAssetStore::new(pool.clone(), policy)
+        .with_refresh_policy(AssetRefreshPolicy::new(3, Duration::from_secs(60)).unwrap());
+    assert!(matches!(
+        store.enqueue_repair(stored.id()).await.unwrap(),
+        AssetRepairEnqueueResult::Enqueued { .. }
+    ));
+    sqlx::query(
+        "INSERT INTO asset_record_refresh_state
+             (asset_record_id, requested_generation, completed_generation, served_generation)
+         VALUES ($1, 1, 0, 1)",
+    )
+    .bind(stored.id())
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO asset_refresh_generation_entries
+             (asset_record_id, generation, ordinal, source_id, review_id, state)
+         VALUES ($1, 1, 1, $2, $3, 'unseen')",
+    )
+    .bind(stored.id())
+    .bind(source_id.as_uuid())
+    .bind(review_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    store.resume_pending_refreshes().await.unwrap();
+
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT state FROM asset_refresh_generation_entries
+             WHERE asset_record_id = $1 AND generation = 1 AND ordinal = 1",
+        )
+        .bind(stored.id())
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        "unseen",
+        "an active repair keeps the recovery slot, so the refresh entry stays pending"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM asset_repair_jobs r JOIN jobs j ON j.id = r.job_id
+             WHERE r.expired_asset_record_id = $1",
+        )
+        .bind(stored.id())
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        0,
+        "no refresh job may be admitted while the repair is active"
+    );
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn stale_refresh_lease_cannot_finish_or_mutate_chain_state(pool: PgPool) {
+    let (asset_id, lease) = admit_refresh_job(&pool, "stale-refresh-lease").await;
+    let replacement_token = Uuid::new_v4();
+    sqlx::query("UPDATE jobs SET lease_token = $2 WHERE id = $1")
+        .bind(lease.job.id())
+        .bind(replacement_token)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let factory = UnitOfWorkFactory::new(pool.clone());
+    let mut unit_of_work = factory.begin().await.unwrap();
+    assert!(matches!(
+        unit_of_work
+            .assets(test_policy(0, Duration::from_secs(30), 1024))
+            .finish_article_refresh(
+                &lease,
+                ArticleRefreshOutcome::Inconclusive,
+                AssetRefreshPolicy::new(3, Duration::from_secs(60)).unwrap(),
+            )
+            .await,
+        Err(AssetRepositoryError::LeaseLost)
+    ));
+    drop(unit_of_work);
+
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT status FROM jobs WHERE id = $1")
+            .bind(lease.job.id())
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        "running"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT state FROM asset_refresh_generation_entries
+             WHERE asset_record_id = $1 AND generation = 1 AND ordinal = 1",
+        )
+        .bind(asset_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        "in_flight"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT attempts FROM asset_article_refresh_lineage
+             WHERE source_id = $1 AND review_id = $2",
+        )
+        .bind(
+            lease.job.payload()["source_id"]
+                .as_str()
+                .unwrap()
+                .parse::<Uuid>()
+                .unwrap()
+        )
+        .bind("stale-refresh-lease")
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, Option<Uuid>>(
+            "SELECT active_chain_id FROM asset_record_refresh_state WHERE asset_record_id = $1",
+        )
+        .bind(asset_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        Some(
+            lease.job.payload()["chain_id"]
+                .as_str()
+                .unwrap()
+                .parse()
+                .unwrap()
+        )
+    );
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn ordinary_refresh_completion_does_not_resnapshot_same_generation(pool: PgPool) {
+    let (asset_id, lease) = admit_refresh_job(&pool, "ordinary-refresh-completion").await;
+
+    let factory = UnitOfWorkFactory::new(pool.clone());
+    let mut unit_of_work = factory.begin().await.unwrap();
+    let finish = unit_of_work
+        .assets(test_policy(0, Duration::from_secs(30), 1024))
+        .finish_article_refresh(
+            &lease,
+            ArticleRefreshOutcome::Deleted,
+            AssetRefreshPolicy::new(3, Duration::from_secs(60)).unwrap(),
+        )
+        .await;
+    assert!(
+        finish.is_ok(),
+        "ordinary completion should not resnapshot: {finish:?}"
+    );
+    let finish = finish.unwrap();
+    assert!(finish.generation_completed);
+    assert_eq!(finish.next_job_id, None);
+    unit_of_work.commit().await.unwrap();
+
+    assert_eq!(
+        sqlx::query_as::<_, (String, i64, i64, i64, Option<Uuid>)>(
+            "SELECT j.status, ars.requested_generation, ars.completed_generation,
+                    ars.served_generation, ars.active_chain_id
+             FROM jobs j CROSS JOIN asset_record_refresh_state ars
+             WHERE j.id = $1 AND ars.asset_record_id = $2",
+        )
+        .bind(lease.job.id())
+        .bind(asset_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        ("succeeded".to_owned(), 1, 1, 1, None)
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM asset_refresh_generation_entries WHERE asset_record_id = $1",
+        )
+        .bind(asset_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        1,
+        "ordinary completion must retain the immutable generation-1 snapshot only"
+    );
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn refresh_completion_starts_one_coalesced_follow_up_generation(pool: PgPool) {
+    let (asset_id, lease) = admit_refresh_job(&pool, "coalesced-refresh-follow-up").await;
+    sqlx::query(
+        "UPDATE asset_record_refresh_state
+         SET requested_generation = requested_generation + 1
+         WHERE asset_record_id = $1",
+    )
+    .bind(asset_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let factory = UnitOfWorkFactory::new(pool.clone());
+    let mut unit_of_work = factory.begin().await.unwrap();
+    let finish = unit_of_work
+        .assets(test_policy(0, Duration::from_secs(30), 1024))
+        .finish_article_refresh(
+            &lease,
+            ArticleRefreshOutcome::Superseded,
+            AssetRefreshPolicy::new(3, Duration::from_secs(60)).unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(finish.generation_completed);
+    let follow_up_job_id = finish
+        .next_job_id
+        .expect("new request should start a follow-up");
+    unit_of_work.commit().await.unwrap();
+
+    let state = sqlx::query_as::<_, (i64, i64, i64, Option<Uuid>)>(
+        "SELECT requested_generation, completed_generation, served_generation, active_chain_id
+         FROM asset_record_refresh_state WHERE asset_record_id = $1",
+    )
+    .bind(asset_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(state.0, 2);
+    assert_eq!(state.1, 1);
+    assert_eq!(state.2, 2);
+    assert!(state.3.is_some());
+    assert_eq!(
+        sqlx::query_as::<_, (String, i64, Uuid)>(
+            "SELECT j.status, arj.chain_ordinal, arj.chain_id
+             FROM jobs j JOIN asset_repair_jobs arj ON arj.job_id = j.id
+             WHERE j.id = $1",
+        )
+        .bind(follow_up_job_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        ("queued".to_owned(), 1, state.3.unwrap())
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM asset_refresh_generation_entries
+             WHERE asset_record_id = $1 AND generation IN (1, 2)",
+        )
+        .bind(asset_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        2,
+        "coalesced follow-up should snapshot live article relationships once"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT status FROM jobs WHERE id = $1")
+            .bind(lease.job.id())
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        "succeeded",
+        "the current job's dedupe slot must be released before the same article is re-admitted"
+    );
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn follow_up_generation_stays_pending_while_its_article_is_cooling(pool: PgPool) {
+    let (asset_id, lease) = admit_refresh_job(&pool, "cooling-follow-up").await;
+    sqlx::query(
+        "UPDATE asset_article_refresh_lineage
+         SET next_allowed_at = clock_timestamp() + interval '1 hour'
+         WHERE source_id = $1 AND review_id = 'cooling-follow-up'",
+    )
+    .bind(
+        lease.job.payload()["source_id"]
+            .as_str()
+            .unwrap()
+            .parse::<Uuid>()
+            .unwrap(),
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE asset_record_refresh_state
+         SET requested_generation = 2 WHERE asset_record_id = $1",
+    )
+    .bind(asset_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let factory = UnitOfWorkFactory::new(pool.clone());
+    let mut unit_of_work = factory.begin().await.unwrap();
+    let finish = unit_of_work
+        .assets(test_policy(0, Duration::from_secs(30), 1024))
+        .finish_article_refresh(
+            &lease,
+            ArticleRefreshOutcome::Superseded,
+            AssetRefreshPolicy::new(3, Duration::from_secs(60)).unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(finish.generation_completed);
+    assert_eq!(finish.next_job_id, None);
+    unit_of_work.commit().await.unwrap();
+
+    assert_eq!(
+        sqlx::query_as::<_, (i64, i64, i64, Option<Uuid>)>(
+            "SELECT requested_generation, completed_generation, served_generation, active_chain_id
+             FROM asset_record_refresh_state WHERE asset_record_id = $1",
+        )
+        .bind(asset_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        (2, 1, 2, None),
+        "a cooling follow-up snapshot must remain pending for cache-miss resumption"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT state FROM asset_refresh_generation_entries
+             WHERE asset_record_id = $1 AND generation = 2",
+        )
+        .bind(asset_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        "unseen"
+    );
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn refresh_chain_advances_articles_in_snapshot_order_and_completes_once(pool: PgPool) {
+    let source_id = SourceId::from_uuid(Uuid::new_v4());
+    create_source_and_articles(&pool, source_id, &["chain-alpha", "chain-beta"]).await;
+    let cache_policy = test_policy(0, Duration::from_secs(30), 1024);
+    let input = asset_input("https://cdn.example/shared-chain.png", FIRST_BYTES, 0);
+    let first = store_asset(&pool, cache_policy, source_id, "chain-alpha", input.clone()).await;
+    let second = store_asset(&pool, cache_policy, source_id, "chain-beta", input).await;
+    assert_eq!(first.id(), second.id());
+    sqlx::query("UPDATE asset_blobs SET data = NULL WHERE id = $1")
+        .bind(first.blob_id())
+        .execute(&pool)
+        .await
+        .unwrap();
+    let refresh_policy = AssetRefreshPolicy::new(3, Duration::from_secs(60)).unwrap();
+    let store = PostgresAssetStore::new(pool.clone(), cache_policy)
+        .with_repair_policy(AssetRepairPolicy::new(3, 3, Duration::from_secs(60), 3).unwrap())
+        .with_refresh_policy(refresh_policy);
+    let repair_id = match store.enqueue_repair(first.id()).await.unwrap() {
+        AssetRepairEnqueueResult::Enqueued { job_id } => job_id,
+        other => panic!("repair should be admitted: {other:?}"),
+    };
+    let repair_lease = claim_repair_job(&pool).await;
+    assert_eq!(repair_lease.job.id(), repair_id);
+    let first_refresh_id = match store.finish_confirmed_expiry(&repair_lease, first.id()).await.unwrap() {
+        werrss::persistence::repositories::asset_repository::AssetRefreshAdmissionResult::Enqueued { job_id, ordinal: 1, .. } => job_id,
+        other => panic!("first snapshot article should be admitted: {other:?}"),
+    };
+    let jobs = PostgresJobRepository::new(pool.clone());
+    let first_refresh = jobs
+        .claim_next(
+            "ordered-refresh-worker",
+            Utc::now(),
+            chrono::Duration::minutes(5),
+            &[werrss::domain::job::JobType::AssetRefresh],
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(first_refresh.job.id(), first_refresh_id);
+    assert_eq!(first_refresh.job.payload()["review_id"], "chain-alpha");
+
+    let factory = UnitOfWorkFactory::new(pool.clone());
+    let mut first_uow = factory.begin().await.unwrap();
+    let first_finish = first_uow
+        .assets(cache_policy)
+        .finish_article_refresh(
+            &first_refresh,
+            ArticleRefreshOutcome::Succeeded,
+            refresh_policy,
+        )
+        .await
+        .unwrap();
+    assert!(!first_finish.generation_completed);
+    let second_refresh_id = first_finish
+        .next_job_id
+        .expect("the next article should inherit the chain slot");
+    first_uow.commit().await.unwrap();
+
+    let second_refresh = jobs
+        .claim_next(
+            "ordered-refresh-worker",
+            Utc::now(),
+            chrono::Duration::minutes(5),
+            &[werrss::domain::job::JobType::AssetRefresh],
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(second_refresh.job.id(), second_refresh_id);
+    assert_eq!(second_refresh.job.payload()["review_id"], "chain-beta");
+    assert_eq!(second_refresh.job.payload()["ordinal"], 2);
+    let mut second_uow = factory.begin().await.unwrap();
+    let second_finish = second_uow
+        .assets(cache_policy)
+        .finish_article_refresh(
+            &second_refresh,
+            ArticleRefreshOutcome::Succeeded,
+            refresh_policy,
+        )
+        .await
+        .unwrap();
+    assert!(second_finish.generation_completed);
+    assert_eq!(second_finish.next_job_id, None);
+    second_uow.commit().await.unwrap();
+
+    assert_eq!(
+        sqlx::query_as::<_, (i64, i64, i64, Option<Uuid>)>(
+            "SELECT requested_generation, completed_generation, served_generation, active_chain_id
+         FROM asset_record_refresh_state WHERE asset_record_id = $1",
+        )
+        .bind(first.id())
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        (1, 1, 1, None)
+    );
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn refresh_chain_slot_handoff_never_exceeds_a_global_limit_of_one(pool: PgPool) {
+    let source_id = SourceId::from_uuid(Uuid::new_v4());
+    create_source_and_articles(&pool, source_id, &["limit-alpha", "limit-beta"]).await;
+    let cache_policy = test_policy(0, Duration::from_secs(30), 1024);
+    let input = asset_input("https://cdn.example/limit-shared.png", FIRST_BYTES, 0);
+    let first = store_asset(&pool, cache_policy, source_id, "limit-alpha", input.clone()).await;
+    let second = store_asset(&pool, cache_policy, source_id, "limit-beta", input).await;
+    assert_eq!(first.id(), second.id());
+    sqlx::query("UPDATE asset_blobs SET data = NULL WHERE id = $1")
+        .bind(first.blob_id())
+        .execute(&pool)
+        .await
+        .unwrap();
+    let refresh_policy = AssetRefreshPolicy::new(3, Duration::from_secs(60)).unwrap();
+    let store = PostgresAssetStore::new(pool.clone(), cache_policy)
+        .with_repair_policy(AssetRepairPolicy::new(1, 1, Duration::from_secs(60), 1).unwrap())
+        .with_refresh_policy(refresh_policy);
+    let active_recovery_jobs = || {
+        let pool = pool.clone();
+        let asset_id = first.id();
+        async move {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM asset_repair_jobs arj
+                 JOIN jobs j ON j.id = arj.job_id
+                 WHERE arj.expired_asset_record_id = $1
+                   AND j.status IN ('queued', 'running', 'retry_wait', 'deferred')",
+            )
+            .bind(asset_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        }
+    };
+    let repair_id = match store.enqueue_repair(first.id()).await.unwrap() {
+        AssetRepairEnqueueResult::Enqueued { job_id } => job_id,
+        other => panic!("repair should be admitted at capacity one: {other:?}"),
+    };
+    let repair_lease = claim_repair_job(&pool).await;
+    assert_eq!(repair_lease.job.id(), repair_id);
+    let first_refresh_id = match store.finish_confirmed_expiry(&repair_lease, first.id()).await.unwrap() {
+        werrss::persistence::repositories::asset_repository::AssetRefreshAdmissionResult::Enqueued {
+            job_id,
+            ordinal: 1,
+            ..
+        } => job_id,
+        other => panic!("the repair slot should transfer to the first snapshot article: {other:?}"),
+    };
+    assert_eq!(
+        active_recovery_jobs().await,
+        1,
+        "the transferred slot must not create a parallel recovery job"
+    );
+    let jobs = PostgresJobRepository::new(pool.clone());
+    let first_refresh = jobs
+        .claim_next(
+            "limit-refresh-worker",
+            Utc::now(),
+            chrono::Duration::minutes(5),
+            &[werrss::domain::job::JobType::AssetRefresh],
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(first_refresh.job.id(), first_refresh_id);
+    let factory = UnitOfWorkFactory::new(pool.clone());
+    let mut first_uow = factory.begin().await.unwrap();
+    let first_finish = first_uow
+        .assets(cache_policy)
+        .finish_article_refresh(
+            &first_refresh,
+            ArticleRefreshOutcome::Succeeded,
+            refresh_policy,
+        )
+        .await
+        .unwrap();
+    let second_refresh_id = first_finish
+        .next_job_id
+        .expect("capacity one still transfers the slot to the next snapshot article");
+    first_uow.commit().await.unwrap();
+    assert_eq!(
+        active_recovery_jobs().await,
+        1,
+        "refresh-to-refresh handoff must keep exactly one active recovery job"
+    );
+    let second_refresh = jobs
+        .claim_next(
+            "limit-refresh-worker",
+            Utc::now(),
+            chrono::Duration::minutes(5),
+            &[werrss::domain::job::JobType::AssetRefresh],
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(second_refresh.job.id(), second_refresh_id);
+    let mut second_uow = factory.begin().await.unwrap();
+    let second_finish = second_uow
+        .assets(cache_policy)
+        .finish_article_refresh(
+            &second_refresh,
+            ArticleRefreshOutcome::Succeeded,
+            refresh_policy,
+        )
+        .await
+        .unwrap();
+    assert!(second_finish.generation_completed);
+    assert_eq!(second_finish.next_job_id, None);
+    second_uow.commit().await.unwrap();
+    assert_eq!(active_recovery_jobs().await, 0);
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn stale_repair_lease_cannot_refund_or_admit_refresh(pool: PgPool) {
+    let source_id = SourceId::from_uuid(Uuid::new_v4());
+    create_source_and_articles(&pool, source_id, &["stale-expiry-lease"]).await;
+    let cache_policy = test_policy(0, Duration::from_secs(30), 1024);
+    let stored = store_asset(
+        &pool,
+        cache_policy,
+        source_id,
+        "stale-expiry-lease",
+        asset_input("https://cdn.example/stale-expiry-lease.png", FIRST_BYTES, 0),
+    )
+    .await;
+    sqlx::query("UPDATE asset_blobs SET data = NULL WHERE id = $1")
+        .bind(stored.blob_id())
+        .execute(&pool)
+        .await
+        .unwrap();
+    let store = PostgresAssetStore::new(pool.clone(), cache_policy);
+    let repair_id = match store.enqueue_repair(stored.id()).await.unwrap() {
+        AssetRepairEnqueueResult::Enqueued { job_id } => job_id,
+        other => panic!("public repair should be admitted: {other:?}"),
+    };
+    let lease = claim_repair_job(&pool).await;
+    assert_eq!(lease.job.id(), repair_id);
+    sqlx::query("UPDATE jobs SET lease_token = $2 WHERE id = $1")
+        .bind(repair_id)
+        .bind(Uuid::new_v4())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        store.finish_confirmed_expiry(&lease, stored.id()).await,
+        Err(AssetRepositoryError::LeaseLost)
+    ));
+    assert!(!sqlx::query_scalar::<_, bool>(
+        "SELECT expiry_refunded FROM asset_repair_jobs WHERE job_id = $1",
+    )
+    .bind(repair_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap());
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM jobs WHERE job_type = 'asset_refresh'",)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT requested_generation FROM asset_record_refresh_state WHERE asset_record_id = $1",
+        )
+        .bind(stored.id())
+        .fetch_optional(&pool)
+        .await
+        .unwrap()
+        .unwrap_or(0),
+        0
+    );
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn confirmed_expiry_completes_a_generation_with_only_exhausted_articles(pool: PgPool) {
+    let source_id = SourceId::from_uuid(Uuid::new_v4());
+    let review_id = "already-exhausted-refresh";
+    create_source_and_articles(&pool, source_id, &[review_id]).await;
+    let cache_policy = test_policy(0, Duration::from_secs(30), 1024);
+    let stored = store_asset(
+        &pool,
+        cache_policy,
+        source_id,
+        review_id,
+        asset_input("https://cdn.example/exhausted-refresh.png", FIRST_BYTES, 0),
+    )
+    .await;
+    sqlx::query("UPDATE asset_blobs SET data = NULL WHERE id = $1")
+        .bind(stored.blob_id())
+        .execute(&pool)
+        .await
+        .unwrap();
+    let refresh_policy = AssetRefreshPolicy::new(3, Duration::from_secs(60)).unwrap();
+    let store =
+        PostgresAssetStore::new(pool.clone(), cache_policy).with_refresh_policy(refresh_policy);
+    let repair_id = match store.enqueue_repair(stored.id()).await.unwrap() {
+        AssetRepairEnqueueResult::Enqueued { job_id } => job_id,
+        other => panic!("repair should be admitted: {other:?}"),
+    };
+    let lease = claim_repair_job(&pool).await;
+    assert_eq!(lease.job.id(), repair_id);
+    // The article exhausts its refresh budget while the repair is in flight, so
+    // the confirmed expiry snapshots it but admits no refresh for it.
+    sqlx::query(
+        "INSERT INTO asset_article_refresh_lineage
+             (source_id, review_id, attempts, exhausted, last_outcome)
+         VALUES ($1, $2, 3, TRUE, 'exhausted')",
+    )
+    .bind(source_id.as_uuid())
+    .bind(review_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        store.finish_confirmed_expiry(&lease, stored.id()).await.unwrap(),
+        werrss::persistence::repositories::asset_repository::AssetRefreshAdmissionResult::NoEligibleArticle
+    );
+    assert_eq!(
+        sqlx::query_as::<_, (i64, i64, i64, Option<Uuid>)>(
+            "SELECT requested_generation, completed_generation, served_generation, active_chain_id
+             FROM asset_record_refresh_state WHERE asset_record_id = $1",
+        )
+        .bind(stored.id())
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        (1, 1, 1, None),
+        "a snapshot with no eligible entries must be terminal rather than pending forever"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT state FROM asset_refresh_generation_entries
+             WHERE asset_record_id = $1 AND generation = 1 AND ordinal = 1",
+        )
+        .bind(stored.id())
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        "done"
+    );
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn confirmed_public_expiry_refunds_repair_and_transfers_its_slot_to_refresh(pool: PgPool) {
+    let source_id = SourceId::from_uuid(Uuid::new_v4());
+    create_source_and_articles(&pool, source_id, &["confirmed-expiry"]).await;
+    let cache_policy = test_policy(0, Duration::from_secs(30), 1024);
+    let stored = store_asset(
+        &pool,
+        cache_policy,
+        source_id,
+        "confirmed-expiry",
+        asset_input("https://cdn.example/confirmed-expiry.png", FIRST_BYTES, 0),
+    )
+    .await;
+    sqlx::query("UPDATE asset_blobs SET data = NULL WHERE id = $1")
+        .bind(stored.blob_id())
+        .execute(&pool)
+        .await
+        .unwrap();
+    let repair_policy = AssetRepairPolicy::new(2, 2, Duration::from_secs(60), 3).unwrap();
+    let refresh_policy = AssetRefreshPolicy::new(3, Duration::from_secs(60)).unwrap();
+    let store = PostgresAssetStore::new(pool.clone(), cache_policy)
+        .with_repair_policy(repair_policy)
+        .with_refresh_policy(refresh_policy);
+    let job_id = match store.enqueue_repair(stored.id()).await.unwrap() {
+        AssetRepairEnqueueResult::Enqueued { job_id } => job_id,
+        other => panic!("public repair should be admitted, got {other:?}"),
+    };
+    let lease = claim_repair_job(&pool).await;
+    assert_eq!(lease.job.id(), job_id);
+
+    let admission = store
+        .finish_confirmed_expiry(&lease, stored.id())
+        .await
+        .unwrap();
+    let refresh_job_id = match admission {
+        werrss::persistence::repositories::asset_repository::AssetRefreshAdmissionResult::Enqueued {
+            job_id,
+            generation: 1,
+            ordinal: 1,
+            ..
+        } => job_id,
+        other => panic!("confirmed expiry should admit an article refresh, got {other:?}"),
+    };
+    let repair = sqlx::query_as::<_, (String, bool, Option<Uuid>)>(
+        "SELECT j.status, arj.expiry_refunded, arj.asset_record_id
+         FROM jobs j JOIN asset_repair_jobs arj ON arj.job_id = j.id
+         WHERE j.id = $1",
+    )
+    .bind(job_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(repair, ("succeeded".to_owned(), true, Some(stored.id())));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT admitted_attempts FROM asset_repair_states WHERE asset_record_id = $1",
+        )
+        .bind(stored.id())
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        0,
+        "confirmed expiry must refund the public repair reservation once"
+    );
+    let refresh = sqlx::query_as::<_, (String, Option<Uuid>, Uuid, i64)>(
+        "SELECT j.status, arj.asset_record_id, arj.chain_id, arj.chain_ordinal
+         FROM jobs j JOIN asset_repair_jobs arj ON arj.job_id = j.id
+         WHERE j.id = $1",
+    )
+    .bind(refresh_job_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(refresh.0, "queued");
+    assert_eq!(refresh.1, None);
+    assert_eq!(refresh.3, 1);
+    let refresh_state = sqlx::query_as::<_, (i64, i64, i64, Option<Uuid>)>(
+        "SELECT requested_generation, completed_generation, served_generation, active_chain_id
+         FROM asset_record_refresh_state WHERE asset_record_id = $1",
+    )
+    .bind(stored.id())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(refresh_state, (1, 0, 1, Some(refresh.2)));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM asset_refresh_generation_entries
+             WHERE asset_record_id = $1 AND generation = 1 AND state = 'in_flight'",
+        )
+        .bind(stored.id())
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        1
+    );
 }
 
 #[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
@@ -2409,6 +4197,60 @@ async fn claim_repair_job(pool: &PgPool) -> JobLease {
         .await
         .unwrap()
         .expect("repair job should be claimable")
+}
+
+async fn admit_refresh_job(pool: &PgPool, review_id: &str) -> (Uuid, JobLease) {
+    let source_id = SourceId::from_uuid(Uuid::new_v4());
+    create_source_and_articles(pool, source_id, &[review_id]).await;
+    let cache_policy = test_policy(0, Duration::from_secs(30), 1024);
+    let stored = store_asset(
+        pool,
+        cache_policy,
+        source_id,
+        review_id,
+        asset_input(
+            &format!("https://cdn.example/{review_id}.png"),
+            FIRST_BYTES,
+            0,
+        ),
+    )
+    .await;
+    sqlx::query("UPDATE asset_blobs SET data = NULL WHERE id = $1")
+        .bind(stored.blob_id())
+        .execute(pool)
+        .await
+        .unwrap();
+    let store = PostgresAssetStore::new(pool.clone(), cache_policy)
+        .with_repair_policy(AssetRepairPolicy::new(2, 2, Duration::from_secs(60), 3).unwrap())
+        .with_refresh_policy(AssetRefreshPolicy::new(3, Duration::from_secs(60)).unwrap());
+    let repair_id = match store.enqueue_repair(stored.id()).await.unwrap() {
+        AssetRepairEnqueueResult::Enqueued { job_id } => job_id,
+        other => panic!("public repair should be admitted, got {other:?}"),
+    };
+    let repair_lease = claim_repair_job(pool).await;
+    assert_eq!(repair_lease.job.id(), repair_id);
+    assert!(matches!(
+        store
+            .finish_confirmed_expiry(&repair_lease, stored.id())
+            .await
+            .unwrap(),
+        werrss::persistence::repositories::asset_repository::AssetRefreshAdmissionResult::Enqueued {
+            generation: 1,
+            ordinal: 1,
+            ..
+        }
+    ));
+    let refresh_lease = PostgresJobRepository::new(pool.clone())
+        .claim_next(
+            "asset-refresh-test-worker",
+            Utc::now(),
+            chrono::Duration::minutes(5),
+            &[werrss::domain::job::JobType::AssetRefresh],
+        )
+        .await
+        .unwrap()
+        .expect("refresh job should be claimable");
+    (stored.id(), refresh_lease)
 }
 
 async fn store_asset(

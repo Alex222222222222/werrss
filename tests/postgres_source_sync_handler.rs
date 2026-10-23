@@ -240,6 +240,20 @@ async fn source_sync_with_asset_archiving_does_not_bump_revision_for_unchanged_a
         JobExecution::Committed
     );
 
+    sqlx::query(
+        "INSERT INTO asset_article_refresh_lineage
+             (source_id, review_id, attempts, next_allowed_at, exhausted, last_outcome)
+         VALUES ($1, $2, 2, clock_timestamp() + interval '1 hour', TRUE, 'inconclusive')
+         ON CONFLICT (source_id, review_id) DO UPDATE
+         SET attempts = EXCLUDED.attempts, next_allowed_at = EXCLUDED.next_allowed_at,
+             exhausted = EXCLUDED.exhausted, last_outcome = EXCLUDED.last_outcome",
+    )
+    .bind(source_id.as_uuid())
+    .bind("asset-idempotent")
+    .execute(&pool)
+    .await
+    .unwrap();
+
     let second_job_id = enqueue_source_sync(&pool, source_id).await;
     let second_lease = claim(&pool, Utc::now()).await;
     let second_handler = handler_with_archiver(
@@ -281,6 +295,19 @@ async fn source_sync_with_asset_archiving_does_not_bump_revision_for_unchanged_a
     .await
     .unwrap();
     assert!(stored_html.contains("/assets/"));
+    assert_eq!(
+        sqlx::query_as::<_, (i64, Option<chrono::DateTime<Utc>>, bool)>(
+            "SELECT attempts, next_allowed_at, exhausted
+             FROM asset_article_refresh_lineage WHERE source_id = $1 AND review_id = $2",
+        )
+        .bind(source_id.as_uuid())
+        .bind("asset-idempotent")
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        (0, None, false),
+        "a complete accepted normal acquisition resets refresh lineage"
+    );
 
     let first_status: String = sqlx::query_scalar("SELECT status FROM jobs WHERE id = $1")
         .bind(first_job_id)
@@ -332,6 +359,28 @@ async fn source_sync_preserves_cached_article_when_asset_fetch_is_incomplete(poo
     .await
     .unwrap();
     assert!(cached_html.contains("/assets/"));
+    sqlx::query(
+        "INSERT INTO asset_article_refresh_lineage
+             (source_id, review_id, attempts, next_allowed_at, exhausted, last_outcome)
+         VALUES ($1, $2, 2, clock_timestamp() + interval '1 hour', TRUE, 'inconclusive')
+         ON CONFLICT (source_id, review_id) DO UPDATE
+         SET attempts = EXCLUDED.attempts, next_allowed_at = EXCLUDED.next_allowed_at,
+             exhausted = EXCLUDED.exhausted, last_outcome = EXCLUDED.last_outcome",
+    )
+    .bind(source_id.as_uuid())
+    .bind("asset-fetch-failure")
+    .execute(&pool)
+    .await
+    .unwrap();
+    let lineage_before = sqlx::query_as::<_, (i64, Option<chrono::DateTime<Utc>>, bool)>(
+        "SELECT attempts, next_allowed_at, exhausted
+         FROM asset_article_refresh_lineage WHERE source_id = $1 AND review_id = $2",
+    )
+    .bind(source_id.as_uuid())
+    .bind("asset-fetch-failure")
+    .fetch_one(&pool)
+    .await
+    .unwrap();
 
     enqueue_source_sync(&pool, source_id).await;
     let second_lease = claim(&pool, Utc::now()).await;
@@ -365,6 +414,19 @@ async fn source_sync_preserves_cached_article_when_asset_fetch_is_incomplete(poo
     .await
     .unwrap();
     assert_eq!(relationship_count, 1);
+    assert_eq!(
+        sqlx::query_as::<_, (i64, Option<chrono::DateTime<Utc>>, bool)>(
+            "SELECT attempts, next_allowed_at, exhausted
+             FROM asset_article_refresh_lineage WHERE source_id = $1 AND review_id = $2",
+        )
+        .bind(source_id.as_uuid())
+        .bind("asset-fetch-failure")
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        lineage_before,
+        "an incomplete source sync must preserve the exhausted refresh lineage"
+    );
 
     asset_server
         .await

@@ -29,10 +29,14 @@ application transaction holding the application pool's only connection. One
 coordination pool is shared by all roles for the supervisor lifetime; it allows
 up to the configured application-pool maximum in additional connections.
 
-Automatic repair of a missing asset is implemented. Signed-URL refresh
-lineages remain future work. The repair implementation covers only the public, anonymous re-fetch
-path and does not infer that an HTTP error means a signed URL should be
-refreshed.
+Automatic repair of a missing asset and bounded, anonymous whole-article
+signed-URL refresh are implemented. Production refresh eligibility remains
+disabled until an exact provider expiry signal has a reviewed, sanitized
+regression fixture. HTTP status alone never identifies an expired signed URL.
+The periodic database maintenance pass also resumes due pending refresh
+generations and removes completed generation snapshots and orphaned refresh
+state under the shared capacity and admission locks; both operations are
+best-effort and never gate job completion.
 
 ## Goals
 
@@ -268,9 +272,12 @@ version listing.
 | `ASSET_REPAIR_PUBLIC_MAX_PENDING` | `50` | PostgreSQL-wide maximum number of active repairs admitted by public asset requests. `0` disables public repair admission. |
 | `ASSET_REPAIR_REQUEUE_SECONDS` | `60` | Backoff after a failed repair before another public admission is allowed. |
 | `ASSET_REPAIR_MAX_ATTEMPTS` | `3` | Maximum number of public repair admissions for one stable asset record before it becomes terminal. |
+| `ASSET_REFRESH_MAX_ATTEMPTS` | `3` | Maximum number of admitted whole-article refresh attempts before article lineage is exhausted (`1..=10`). |
+| `ASSET_REFRESH_COOLDOWN_SECONDS` | `3600` | Minimum delay before an inconclusive article refresh can be admitted again (`60..=86400`). |
 
-`ASSET_REFRESH_*` settings are reserved for the future signed-URL refresh
-feature and are not accepted by the current environment parser.
+Refresh settings configure the bounded article-lineage circuit. Production
+provider eligibility remains empty until an exact provider expiry marker has a
+reviewed, sanitized fixture; status codes alone never admit refresh work.
 
 The live protocol tests are ignored by default and target only operator-provided test endpoints. Run one by name with `cargo test --locked --test asset_blob_store_protocols -- --ignored <test_name> --exact`. FTP uses `WERRSS_TEST_FTP_ENDPOINT` and optional `WERRSS_TEST_FTP_ROOT`, `WERRSS_TEST_FTP_USER`, and `WERRSS_TEST_FTP_PASSWORD`; SFTP uses `WERRSS_TEST_SFTP_ENDPOINT`, optional `WERRSS_TEST_SFTP_ROOT`, required `WERRSS_TEST_SFTP_USER`, and `WERRSS_TEST_SFTP_KEY`; WebDAV uses `WERRSS_TEST_WEBDAV_ENDPOINT` and optional `WERRSS_TEST_WEBDAV_ROOT`, `WERRSS_TEST_WEBDAV_USER`, and `WERRSS_TEST_WEBDAV_PASSWORD`. FTP and WebDAV require `DATABASE_URL` for cross-replica lock coordination. Tests generate unique blob keys and attempt cleanup after every contract run.
 
@@ -293,8 +300,7 @@ future settings service explicitly replaces the environment-only contract.
 The count includes every non-terminal asset recovery row in `queued`, `running`,
 `retry_wait`, or `deferred` state for both `asset_repair` and `asset_refresh`.
 Terminal `succeeded` and `failed` rows do not consume admission capacity. The
-limit is shared by every API, scheduler, and worker replica that uses the same
-database.
+limit is shared by every API and worker replica that uses the same database.
 
 Every enqueue origin uses the same short PostgreSQL transaction and admission
 helper. The helper must:
@@ -319,24 +325,19 @@ global capacity check. `ASSET_REPAIR_PUBLIC_MAX_PENDING` must be no greater than
 `ASSET_REPAIR_MAX_PENDING`; a value of zero disables public repair admission and
 leaves all global capacity for internal work.
 
-When the global or public class limit is full, the public route returns its
-normal retryable response with `Retry-After` and creates no row. If an internal
-refresh cannot be admitted, its triggering repair job enters the existing
-non-failure `deferred` state with a bounded `run_after`; it must not use
-`retry_wait`, because that transition consumes the job failure budget. The
-deferred job records a bounded capacity-wait reason and, when it wakes, retries
-admission before performing another upstream fetch. The refresh lineage attempt
-is not consumed until the refresh job is actually admitted. This preserves the
-old stable asset route without creating an unbounded local queue. Database
-errors likewise create no local fallback queue: the request or worker records a
-bounded warning and the triggering work uses the same deferred capacity-wait
-path when it is safe to retry.
+If the global cap is full, a public request creates no recovery row and returns
+the normal retryable response. A confirmed-expiry repair or refresh already
+occupies a counted slot, so a successor refresh inherits that slot atomically
+when the current job completes. If no article is eligible, the current job
+completes and any cooling generation remains pending for a later cache miss.
+Direct admission against a pending generation is subject to the global cap and
+returns retryable when capacity is full. No process-local queue or deferred
+trigger job is created.
 
-The capacity-wait transition and refresh admission must be committed atomically
-with the triggering job's lease-fenced outcome. A worker crash before that
-transaction commits leaves the original job recoverable; a crash after it
-commits leaves either the durable deferred trigger or the admitted refresh, but
-never neither.
+The repair refund, current job completion, and successor admission share one
+lease-fenced transaction. A crash before commit leaves the current job
+recoverable; a crash after commit leaves either the successor durable or the
+chain paused/completed without an active job.
 
 The generic `jobs` table must retain an immutable asset-recovery admission
 class, either as a constrained column or in a one-to-one child table joined by
@@ -412,10 +413,12 @@ article itself is successfully refreshed.
 
 ### `article_assets`
 
-This join table connects an article to an asset record and optionally stores
-the role and occurrence order, such as `cover` or `body` image. It must have
-foreign keys that make article deletion remove the relationship, while not
-deleting a shared blob still referenced by another article.
+This join table connects an article to an asset record and stores request
+context, role, and occurrence order such as a cover or body image. It has
+foreign keys that make article deletion remove the relationship without
+deleting a shared blob still referenced by another article. Refresh lineage is
+stored separately by article identity, so replacing occurrence rows does not
+reset its attempt or cooldown state.
 
 Every asset record that is exposed through a rewritten article must have at
 least one article relationship. Once its relationship count reaches zero, its
@@ -564,65 +567,47 @@ Both the initial article worker and the `asset_repair` worker perform the same
 bounded anonymous HTTP fetch using the article URL as `Referer`, its origin as
 `Origin`, and the configured User-Agent.
 
-When the stored URL is classified as expired because its signed URL is stale,
-the repair worker does not retry that URL indefinitely. Refresh eligibility is
-provider-specific and must not be inferred from an HTTP status alone:
+When a repair fetch returns an unsuccessful HTTP response, refresh is considered
+only if an exact provider-specific marker confirms signed-URL expiry. Production
+eligibility is currently empty because no provider marker has a reviewed,
+sanitized regression fixture. A `401`, `403`, `404`, or `410` alone never
+qualifies; invalid media, transport, redirect, and ordinary `5xx` failures use
+the bounded repair failure path.
 
-- a `401` or `403` is eligible only when the approved provider policy identifies
-  the response as an expired signed URL rather than an access-control or policy
-  failure;
-- a `404` or `410` is permanent by default and is not refreshed; a provider
-  adapter may opt into refresh only with explicit evidence that the response
-  means an expired signed URL; and
-- invalid media, DNS/connection errors, and ordinary `5xx` responses remain
-  normal repair failures and use the job failure budget rather than starting an
-  article refresh.
+Once a provider is explicitly enabled by fixture-backed policy, confirmed
+expiry starts a durable serial chain over a snapshot of distinct live articles
+that reference the expired asset record. Each refresh reacquires the complete
+public article and every required asset through a clean anonymous browser
+session. It does not use WeRead cookies, account leases, or authenticated
+acquisition. Refresh jobs reuse the triggering job's global capacity slot and
+continue the chain one article at a time.
 
-For an eligible result, it enqueues one deduplicated `asset_refresh` job for the
-live article relationship. Admission reserves one refresh attempt in the
-relationship's durable refresh lineage in the same transaction as the job
-insert. The refresh worker reopens the public article page in a clean,
-unauthenticated browser session, extracts the current sanitized asset URL, and
-runs the normal add-time validation and deduplication path. It never uses
-WeRead account cookies for this public page or asset request.
+Refresh attempts and cooldown are tracked per article, keyed by
+`(source_id, review_id)`, so replacement of `article_assets` rows or discovery
+of a new signed URL cannot reset an exhausted lineage. Admission consumes one
+attempt; retries of the same durable job do not. An incomplete refresh preserves
+article HTML and asset relationships, records a bounded failure and cooldown,
+and continues to other eligible articles. A complete accepted refresh replaces
+the full asset relationship set and rewrites the sanitized article. It bumps
+the feed revision and queues a feed rebuild only when the visible article
+changes. A complete normal source-sync or backfill observation also resets that
+article's lineage in the same transaction; partial, stale, or failed
+observations do not.
 
-Each article/asset occurrence has a durable refresh-lineage state, stored on the
-relationship or in a table keyed by the article, occurrence, and lineage ID.
-The state includes the attempt count, `next_allowed_at`, the configured maximum,
-the last bounded failure classification, and an exhausted/resolved marker. The
-lineage ID survives replacement of an `asset_record`; the refresh transaction
-updates the existing occurrence state or carries it forward when it attaches the
-replacement record. A refresh therefore cannot evade the limit merely by
-discovering a new signed URL. Retries of one admitted job do
-not consume additional lineage attempts; a newly admitted refresh does. A
-successful refresh that stores usable bytes marks the lineage resolved and
-resets its attempt count for a later, genuinely new expiry. A failed or
-inconclusive admitted refresh consumes one attempt and observes
-`ASSET_REFRESH_COOLDOWN_SECONDS`.
-
-If refresh finds a new URL or new bytes, it creates a new asset-record version,
-attaches it to the article, rewrites the article representation, and queues a
-feed rebuild. If it finds the same bytes, it may restore the existing blob and
-update the source metadata without creating duplicate binary data. If the
-article or asset remains unavailable, the old metadata and stable asset URL
-remain intact. While a repair or refresh is eligible, the public route returns
-its retryable response; after a permanent classification or an exhausted
-refresh lineage, it returns a terminal missing-asset response without starting
-more upstream work. The original URL is never exposed as an unrestricted
-redirect target.
+The original upstream URL is never exposed as an unrestricted redirect target.
 
 A successful repair that restores the same stable asset record does not require
 a feed rebuild. A new URL/version or the first successful rewrite does
 invalidate the source feed revision and queues a feed rebuild.
 
-`asset_repair` and the future `asset_refresh` are separate job kinds. Repair
-jobs are deduplicated by stable asset identity, use the normal durable lease
-and crash-recovery rules, and share the cluster-wide pending limit and
-per-process concurrency limit. Repair jobs use `ASSET_REPAIR_REQUEUE_SECONDS`;
-future refresh admission uses
-the refresh-lineage cooldown and attempt limit. A repair may enqueue at most one
-refresh for the current lineage at a time; a refresh must not recursively
-enqueue another refresh without first completing a new article acquisition.
+`asset_repair` and `asset_refresh` are separate job kinds. Repair jobs are
+deduplicated by stable asset identity; refresh jobs are durably chained over
+article snapshots and use the article-level lineage. Both use durable lease and
+crash-recovery rules, share the cluster-wide pending limit and per-process
+concurrency limit, and refresh successors inherit the finishing job's capacity
+slot. Repair uses `ASSET_REPAIR_REQUEUE_SECONDS`; refresh uses the article
+lineage cooldown and attempt limit. A refresh cannot recursively trigger
+another refresh without a new asset repair observation.
 
 The cache-miss enqueue path rejects unknown or unreferenced IDs without
 creating work. Repeated requests for the same missing ID do not create more
@@ -808,10 +793,10 @@ PostgreSQL integration tests should cover:
   including duplicate-at-cap and public-reservation cases;
 - admission classes being assigned by the enqueue origin rather than accepted
   from job payload JSON;
-- capacity-full refresh triggers entering `deferred` without consuming the job
-  failure budget, then being admitted after capacity is released;
-- repair concurrency, public pending, per-asset requeue, and per-asset attempt
-  limits;
+- a confirmed-expiry repair transferring its capacity slot to one admitted
+  article refresh while refunding any public repair reservation exactly once;
+- a full recovery-job cap rejecting new public admission without creating work;
+- bounded attempt and cooldown behavior for repair and article refresh lineage;
 - a repair worker performing an anonymous fetch with the expected headers;
 - the `AssetBlobStore` contract for write, read, missing object, stat, delete,
   repeated immutable writes, and backend failures;
@@ -841,6 +826,8 @@ PostgreSQL integration tests should cover:
   URLs and does not refresh an ordinary `404`;
 - a refresh worker discovering a changed signed URL without using account
   cookies and rebuilding the affected feed;
+- complete accepted source-sync and backfill observations resetting article
+  refresh lineage, while incomplete observations preserve exhausted state;
 - refresh-lineage cooldown and attempt exhaustion persisting across replacement
   URL versions without creating another refresh job;
 - a crashed/expired asset lease being recovered; and

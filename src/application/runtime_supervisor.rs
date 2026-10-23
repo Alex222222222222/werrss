@@ -75,6 +75,7 @@ use super::{
         ArticleBackfillJobHandlerConfigError, ArticleBackfillJobHandlerDependencies,
     },
     asset_archive_service::{AssetArchiveService, AssetArchiveServiceError},
+    asset_refresh_handler::{AssetRefreshJobHandler, AssetRefreshJobHandlerDependencies},
     asset_repair_handler::AssetRepairJobHandler,
     browser_health::{BrowserHealth, BrowserHealthMonitor},
     feed_rebuild_handler::{
@@ -135,6 +136,12 @@ type ArticleBackfillHandler = ArticleBackfillJobHandler<
     PostgresSourceRepository,
     PostgresArticleRepository,
     RuntimeSourceSyncAcquirer,
+>;
+
+type AssetRefreshHandler = AssetRefreshJobHandler<
+    PostgresSourceRepository,
+    PostgresArticleRepository,
+    WebDriverArticlePageFetcher,
 >;
 
 type RuntimeAuthService = AuthService<
@@ -199,6 +206,7 @@ pub struct RuntimeJobHandler<F, S> {
     source_sync: Option<S>,
     article_backfill: Option<Box<dyn JobHandler>>,
     asset_repair: Option<Box<dyn JobHandler>>,
+    asset_refresh: Option<Box<dyn JobHandler>>,
     credential_refresh: Option<Box<dyn OptionalJobHandler>>,
 }
 
@@ -210,6 +218,7 @@ impl<F, S> RuntimeJobHandler<F, S> {
             source_sync,
             article_backfill: None,
             asset_repair: None,
+            asset_refresh: None,
             credential_refresh: None,
         }
     }
@@ -238,6 +247,15 @@ impl<F, S> RuntimeJobHandler<F, S> {
         H: JobHandler + 'static,
     {
         self.asset_repair = Some(Box::new(handler));
+        self
+    }
+
+    /// Adds the anonymous whole-article refresh handler.
+    pub fn with_asset_refresh<H>(mut self, handler: H) -> Self
+    where
+        H: JobHandler + 'static,
+    {
+        self.asset_refresh = Some(Box::new(handler));
         self
     }
 }
@@ -271,6 +289,12 @@ where
                 Some(handler) => handler.execute(lease, now).await,
                 None => crate::application::worker::JobExecution::Failed {
                     error: "asset-repair handler is not configured".to_owned(),
+                },
+            },
+            JobType::AssetRefresh => match &self.asset_refresh {
+                Some(handler) => handler.execute(lease, now).await,
+                None => crate::application::worker::JobExecution::Failed {
+                    error: "asset-refresh handler is not configured".to_owned(),
                 },
             },
             JobType::CredentialRefresh => match &self.credential_refresh {
@@ -388,15 +412,22 @@ impl RuntimeSupervisor {
             .expect("enabled asset archive has repair policy");
         Ok(
             PostgresAssetStore::with_blob_store(self.pool.clone(), policy, self.blob_store()?)
-                .with_repair_policy(repair_policy),
+                .with_repair_policy(repair_policy)
+                .with_refresh_policy(self.config.asset_refresh_policy),
         )
     }
 
     fn unit_of_work_factory(&self) -> Result<UnitOfWorkFactory, RuntimeSupervisorError> {
-        Ok(UnitOfWorkFactory::with_blob_store(
-            self.pool.clone(),
-            self.blob_store()?,
-        ))
+        Ok(
+            UnitOfWorkFactory::with_blob_store(self.pool.clone(), self.blob_store()?)
+                .with_repair_policy(
+                    self.config
+                        .asset_archive
+                        .database_repair_policy()
+                        .unwrap_or_default(),
+                )
+                .with_refresh_policy(self.config.asset_refresh_policy),
+        )
     }
 
     /// Opens the configured PostgreSQL pool, applies pending migrations, and
@@ -540,9 +571,10 @@ impl RuntimeSupervisor {
         if let Some(policy) = self.config.asset_archive.database_policy() {
             let store = self.build_asset_store(policy)?;
             let role_shutdown = role_shutdown_rx.clone();
+            let maintenance_pool = self.pool.clone();
             tracing::info!("database asset-cache maintenance started");
             tasks.spawn(async move {
-                run_asset_maintenance(store, role_shutdown).await;
+                run_asset_maintenance(store, maintenance_pool, role_shutdown).await;
                 Ok(())
             });
         }
@@ -687,7 +719,8 @@ impl RuntimeSupervisor {
         let queue_config = FeedRebuildJobConfig::new(0, self.config.job_max_attempts)
             .map_err(RuntimeSupervisorError::FeedRebuildJobConfig)?;
         let queue = PostgresFeedRebuildQueue::new(
-            PostgresJobRepository::new(self.pool.clone()),
+            PostgresJobRepository::new(self.pool.clone())
+                .with_refresh_policy(self.config.asset_refresh_policy),
             queue_config,
         );
         let rebuild_service =
@@ -782,7 +815,8 @@ impl RuntimeSupervisor {
             || plan
                 .worker_config()
                 .allowed_job_types()
-                .contains(&JobType::AssetRepair)
+                .iter()
+                .any(|job_type| matches!(job_type, JobType::AssetRepair | JobType::AssetRefresh))
         {
             self.build_asset_archiver()?
         } else {
@@ -809,6 +843,15 @@ impl RuntimeSupervisor {
         } else {
             None
         };
+        let asset_refresh = if plan
+            .worker_config()
+            .allowed_job_types()
+            .contains(&JobType::AssetRefresh)
+        {
+            Some(self.build_asset_refresh_handler(retry_after)?)
+        } else {
+            None
+        };
         let source_sync = plan
             .source_sync_enabled()
             .then(|| self.build_source_sync_handler(worker_index, asset_archiver.clone()))
@@ -826,6 +869,10 @@ impl RuntimeSupervisor {
             Some(asset_repair) => handler.with_asset_repair(asset_repair),
             None => handler,
         };
+        let handler = match asset_refresh {
+            Some(asset_refresh) => handler.with_asset_refresh(asset_refresh),
+            None => handler,
+        };
         let handler = match self.credential_refresher.clone() {
             Some(refresher) => handler.with_credential_refresh(
                 self.build_credential_refresh_handler(refresher, worker_index)?,
@@ -834,7 +881,8 @@ impl RuntimeSupervisor {
         };
         Worker::new(
             JobService::new(
-                PostgresJobRepository::new(self.pool.clone()),
+                PostgresJobRepository::new(self.pool.clone())
+                    .with_refresh_policy(self.config.asset_refresh_policy),
                 plan.job_service_config().clone(),
             ),
             self.unit_of_work_factory()?,
@@ -983,6 +1031,34 @@ impl RuntimeSupervisor {
             worker_index,
         );
         Ok(acquirer)
+    }
+
+    fn build_asset_refresh_handler(
+        &self,
+        retry_after: Duration,
+    ) -> Result<AssetRefreshHandler, RuntimeSupervisorError> {
+        let browser_pool = self
+            .browser_pool
+            .clone()
+            .ok_or(RuntimeSupervisorError::SourceSyncNotConfigured)?;
+        let archiver = self
+            .build_asset_archiver()?
+            .ok_or(RuntimeSupervisorError::AssetArchiveNotConfigured)?;
+        let sync_service = SyncService::new();
+        Ok(AssetRefreshJobHandler::new(
+            AssetRefreshJobHandlerDependencies {
+                sources: PostgresSourceRepository::new(self.pool.clone()),
+                articles: PostgresArticleRepository::new(self.pool.clone()),
+                browser_pool,
+                page_fetcher: WebDriverArticlePageFetcher::new(self.config.timezone)
+                    .with_pacing(PacingController::from_entropy(self.config.pacing)),
+                asset_archiver: archiver,
+                unit_of_work: self.unit_of_work_factory()?,
+                sync_service,
+                refresh_policy: self.config.asset_refresh_policy,
+                retry_after,
+            },
+        ))
     }
 
     fn build_auth_service(&self) -> Result<RuntimeAuthService, RuntimeSupervisorError> {
@@ -1152,7 +1228,11 @@ async fn drain_tasks(
 /// Periodically enforces database asset age/size limits and removes orphaned
 /// metadata. Maintenance is deliberately best effort: a transient database
 /// failure must not terminate otherwise healthy API or worker roles.
-async fn run_asset_maintenance(store: PostgresAssetStore, mut shutdown: watch::Receiver<bool>) {
+async fn run_asset_maintenance(
+    store: PostgresAssetStore,
+    pool: PgPool,
+    mut shutdown: watch::Receiver<bool>,
+) {
     const INTERVAL: StdDuration = StdDuration::from_secs(60 * 60);
 
     if *shutdown.borrow() {
@@ -1168,6 +1248,12 @@ async fn run_asset_maintenance(store: PostgresAssetStore, mut shutdown: watch::R
                 }
             }
             _ = ticker.tick() => {
+                if store.resume_pending_refreshes().await.is_err() {
+                    tracing::warn!("pending asset refresh maintenance failed");
+                }
+                if prune_asset_refresh_state(&pool).await.is_err() {
+                    tracing::warn!("asset refresh snapshot cleanup failed");
+                }
                 match store.maintenance().await {
                     Ok(result) if result.changed() => {
                         tracing::info!(
@@ -1184,6 +1270,17 @@ async fn run_asset_maintenance(store: PostgresAssetStore, mut shutdown: watch::R
             }
         }
     }
+}
+
+async fn prune_asset_refresh_state(pool: &PgPool) -> Result<(), sqlx::Error> {
+    let mut transaction = pool.begin().await?;
+    sqlx::query("SELECT prune_asset_refresh_generations()")
+        .execute(&mut *transaction)
+        .await?;
+    sqlx::query("SELECT prune_orphan_asset_refresh_state()")
+        .execute(&mut *transaction)
+        .await?;
+    transaction.commit().await
 }
 
 fn chrono_duration(
@@ -1371,6 +1468,66 @@ mod tests {
         PgPoolOptions::new()
             .connect_lazy("postgres://unused")
             .expect("lazy test pool URL should be valid")
+    }
+
+    #[sqlx::test(migrator = "crate::persistence::postgres::MIGRATOR")]
+    async fn maintenance_reconciles_and_prunes_idle_refresh_work(pool: PgPool) {
+        let asset_id = uuid::Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO asset_record_refresh_state
+             (asset_record_id, requested_generation, served_generation)
+             VALUES ($1, 1, 1)",
+        )
+        .bind(asset_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO asset_refresh_generation_entries
+             (asset_record_id, generation, ordinal, source_id, review_id)
+             VALUES ($1, 1, 1, $2, 'deleted-maintenance-article')",
+        )
+        .bind(asset_id)
+        .bind(uuid::Uuid::new_v4())
+        .execute(&pool)
+        .await
+        .unwrap();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let task = tokio::spawn(run_asset_maintenance(
+            PostgresAssetStore::new(pool.clone(), AssetCachePolicy::default()),
+            pool.clone(),
+            shutdown_rx,
+        ));
+        let completed = tokio::time::timeout(StdDuration::from_secs(5), async {
+            let mut poll = tokio::time::interval(StdDuration::from_millis(10));
+            loop {
+                poll.tick().await;
+                let remaining: i64 = sqlx::query_scalar(
+                    "SELECT count(*) FROM asset_record_refresh_state WHERE asset_record_id = $1",
+                )
+                .bind(asset_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+                if remaining == 0 {
+                    break;
+                }
+            }
+        })
+        .await;
+        shutdown_tx.send(true).unwrap();
+        task.await.unwrap();
+        completed.expect("periodic maintenance must resume and prune idle work");
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM asset_refresh_generation_entries WHERE asset_record_id = $1",
+            )
+            .bind(asset_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            0
+        );
     }
 
     #[tokio::test]

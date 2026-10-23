@@ -70,7 +70,10 @@ use uuid::Uuid;
 
 use sqlx::{postgres::PgRow, PgPool, Postgres, Row, Transaction};
 
-use crate::domain::job::{Job, JobError, JobStatus, JobType, LeaseToken, NewJob, PersistedJob};
+use crate::{
+    archive::asset_store::AssetRefreshPolicy,
+    domain::job::{Job, JobError, JobStatus, JobType, LeaseToken, NewJob, PersistedJob},
+};
 
 /// Result of attempting to enqueue a job.
 #[derive(Debug, Clone, PartialEq)]
@@ -549,6 +552,7 @@ const ACTIVE_STATUSES: &str = "'queued', 'running', 'retry_wait', 'deferred'";
 #[derive(Clone)]
 pub struct PostgresJobRepository {
     pool: PgPool,
+    refresh_policy: AssetRefreshPolicy,
 }
 
 impl std::fmt::Debug for PostgresJobRepository {
@@ -563,7 +567,16 @@ impl std::fmt::Debug for PostgresJobRepository {
 impl PostgresJobRepository {
     /// Creates a job repository using an existing configured SQLx pool.
     pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            refresh_policy: AssetRefreshPolicy::default(),
+        }
+    }
+
+    /// Uses the same lineage limits as refresh admission for terminal cleanup.
+    pub const fn with_refresh_policy(mut self, policy: AssetRefreshPolicy) -> Self {
+        self.refresh_policy = policy;
+        self
     }
 
     /// Returns the underlying pool for health checks and integration setup.
@@ -597,6 +610,7 @@ pub struct PostgresJobTransaction<'a> {
     // TODO(design): move ownership of this SQLx transaction to UnitOfWork and
     // expose this implementation only as its transaction-scoped job view.
     transaction: Option<Transaction<'a, Postgres>>,
+    refresh_policy: AssetRefreshPolicy,
 }
 
 impl<'a> PostgresJobTransaction<'a> {
@@ -604,7 +618,18 @@ impl<'a> PostgresJobTransaction<'a> {
         let transaction = pool.begin().await?;
         Ok(Self {
             transaction: Some(transaction),
+            refresh_policy: AssetRefreshPolicy::default(),
         })
+    }
+
+    pub(crate) fn set_refresh_policy(&mut self, policy: AssetRefreshPolicy) {
+        self.refresh_policy = policy;
+    }
+
+    /// Exposes the configured lineage limits to transactions that reconcile
+    /// refresh generations in the same unit of work.
+    pub(crate) const fn refresh_policy(&self) -> AssetRefreshPolicy {
+        self.refresh_policy
     }
 
     pub(crate) async fn commit_inner(mut self) -> Result<(), sqlx::Error> {
@@ -701,6 +726,133 @@ impl<'a> PostgresJobTransaction<'a> {
         Ok(EnqueueResult::AlreadyActive {
             job_id: row.try_get("id").map_err(storage_error)?,
         })
+    }
+
+    async fn lock_refresh_recovery(
+        &mut self,
+        job_id: Option<Uuid>,
+    ) -> Result<(), JobRepositoryError> {
+        let transaction = self.transaction_mut()?;
+        let has_refresh = match job_id {
+            Some(job_id) => sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS (SELECT 1 FROM jobs WHERE id = $1 AND job_type = 'asset_refresh')",
+            )
+            .bind(job_id)
+            .fetch_one(&mut **transaction)
+            .await
+            .map_err(storage_error)?,
+            None => true,
+        };
+        if has_refresh {
+            // Keep the same ordering as refresh admission and finalization.
+            sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('asset-capacity', 0))")
+                .execute(&mut **transaction)
+                .await
+                .map_err(storage_error)?;
+            sqlx::query(
+                "SELECT pg_advisory_xact_lock(hashtextextended('asset-repair-admission', 0))",
+            )
+            .execute(&mut **transaction)
+            .await
+            .map_err(storage_error)?;
+        }
+        Ok(())
+    }
+
+    async fn cleanup_terminal_refresh(&mut self, job: &Job) -> Result<(), JobRepositoryError> {
+        if job.job_type() != JobType::AssetRefresh || job.status() != JobStatus::Failed {
+            return Ok(());
+        }
+        let policy = self.refresh_policy;
+        let transaction = self.transaction_mut()?;
+        let target = sqlx::query_as::<_, (Uuid, String, Uuid, Uuid, i64, i64)>(
+            "SELECT arj.refresh_source_id, arj.refresh_review_id,
+                    arj.expired_asset_record_id, arj.chain_id, arj.chain_ordinal,
+                    ars.served_generation
+             FROM asset_repair_jobs arj
+             JOIN asset_record_refresh_state ars
+               ON ars.asset_record_id = arj.expired_asset_record_id
+             JOIN asset_refresh_generation_entries e
+               ON e.asset_record_id = ars.asset_record_id
+              AND e.generation = ars.served_generation AND e.ordinal = arj.chain_ordinal
+              AND e.source_id = arj.refresh_source_id AND e.review_id = arj.refresh_review_id
+             WHERE arj.job_id = $1 AND arj.admission_class = 'internal_refresh'
+               AND ars.active_chain_id = arj.chain_id AND e.state = 'in_flight'",
+        )
+        .bind(job.id())
+        .fetch_optional(&mut **transaction)
+        .await
+        .map_err(storage_error)?;
+        let Some((source_id, review_id, asset_id, chain_id, ordinal, generation)) = target else {
+            return Ok(());
+        };
+        sqlx::query("SELECT id FROM sources WHERE id = $1 FOR UPDATE")
+            .bind(source_id)
+            .fetch_optional(&mut **transaction)
+            .await
+            .map_err(storage_error)?;
+        sqlx::query(
+            "SELECT review_id FROM articles WHERE source_id = $1 AND review_id = $2 FOR UPDATE",
+        )
+        .bind(source_id)
+        .bind(&review_id)
+        .fetch_optional(&mut **transaction)
+        .await
+        .map_err(storage_error)?;
+        let lineage = sqlx::query_as::<_, (bool, DateTime<Utc>)>(
+            "WITH db_clock AS MATERIALIZED (SELECT clock_timestamp() AS now)
+             UPDATE asset_article_refresh_lineage
+             SET next_allowed_at = db_clock.now + make_interval(secs => $3::double precision),
+                 exhausted = exhausted OR attempts >= $4,
+                 last_outcome = CASE WHEN exhausted OR attempts >= $4 THEN 'exhausted' ELSE 'inconclusive' END,
+                 updated_at = db_clock.now
+             FROM db_clock
+             WHERE source_id = $1 AND review_id = $2
+             RETURNING exhausted, next_allowed_at",
+        )
+        .bind(source_id)
+        .bind(&review_id)
+        .bind(policy.cooldown().as_secs() as f64)
+        .bind(i64::from(policy.max_attempts()))
+        .fetch_optional(&mut **transaction)
+        .await
+        .map_err(storage_error)?;
+        // A deleted article has no lineage left and its immutable snapshot is done.
+        let exhausted = lineage.as_ref().is_none_or(|(exhausted, _)| *exhausted);
+        let not_before =
+            lineage.and_then(|(_, next_allowed_at)| (!exhausted).then_some(next_allowed_at));
+        sqlx::query(
+            "UPDATE asset_refresh_generation_entries
+             SET state = CASE WHEN $4 THEN 'done' ELSE 'cooling' END, not_before = $5
+             WHERE asset_record_id = $1 AND generation = $2 AND ordinal = $3
+               AND state = 'in_flight'",
+        )
+        .bind(asset_id)
+        .bind(generation)
+        .bind(ordinal)
+        .bind(exhausted)
+        .bind(not_before)
+        .execute(&mut **transaction)
+        .await
+        .map_err(storage_error)?;
+        sqlx::query(
+            "UPDATE asset_record_refresh_state s
+             SET active_chain_id = NULL,
+                 completed_generation = CASE WHEN NOT EXISTS (
+                     SELECT 1 FROM asset_refresh_generation_entries e
+                     WHERE e.asset_record_id = s.asset_record_id AND e.generation = $2
+                       AND e.state <> 'done'
+                 ) THEN GREATEST(completed_generation, $2) ELSE completed_generation END,
+                 updated_at = clock_timestamp()
+             WHERE asset_record_id = $1 AND active_chain_id = $3 AND served_generation = $2",
+        )
+        .bind(asset_id)
+        .bind(generation)
+        .bind(chain_id)
+        .execute(&mut **transaction)
+        .await
+        .map_err(storage_error)?;
+        Ok(())
     }
 
     async fn find_in_transaction(
@@ -1024,6 +1176,7 @@ impl JobRepositoryTransaction for PostgresJobTransaction<'_> {
     ) -> Result<Job, JobRepositoryError> {
         validate_owner(owner)?;
         validate_error(error)?;
+        self.lock_refresh_recovery(Some(job_id)).await?;
         let query = format!(
             r#"
             WITH db_clock AS MATERIALIZED (
@@ -1065,7 +1218,11 @@ impl JobRepositoryTransaction for PostgresJobTransaction<'_> {
             .await
             .map_err(storage_error)?;
         match row {
-            Some(row) => decode_job(row),
+            Some(row) => {
+                let job = decode_job(row)?;
+                self.cleanup_terminal_refresh(&job).await?;
+                Ok(job)
+            }
             None => Err(self
                 .fenced_update_error(
                     job_id,
@@ -1088,6 +1245,7 @@ impl JobRepositoryTransaction for PostgresJobTransaction<'_> {
     ) -> Result<Job, JobRepositoryError> {
         validate_owner(owner)?;
         validate_error(error)?;
+        self.lock_refresh_recovery(Some(job_id)).await?;
         let query = format!(
             r#"
             WITH db_clock AS MATERIALIZED (
@@ -1120,7 +1278,11 @@ impl JobRepositoryTransaction for PostgresJobTransaction<'_> {
             .await
             .map_err(storage_error)?;
         match row {
-            Some(row) => decode_job(row),
+            Some(row) => {
+                let job = decode_job(row)?;
+                self.cleanup_terminal_refresh(&job).await?;
+                Ok(job)
+            }
             None => Err(self
                 .fenced_update_error(job_id, owner, token, now, FencedOperation::Fail { error })
                 .await?),
@@ -1134,6 +1296,7 @@ impl JobRepositoryTransaction for PostgresJobTransaction<'_> {
         reason: &str,
     ) -> Result<Job, JobRepositoryError> {
         validate_error(reason)?;
+        self.lock_refresh_recovery(Some(job_id)).await?;
         let query = format!(
             r#"
             WITH db_clock AS MATERIALIZED (
@@ -1161,7 +1324,11 @@ impl JobRepositoryTransaction for PostgresJobTransaction<'_> {
             .await
             .map_err(storage_error)?;
         match row {
-            Some(row) => decode_job(row),
+            Some(row) => {
+                let job = decode_job(row)?;
+                self.cleanup_terminal_refresh(&job).await?;
+                Ok(job)
+            }
             None => Err(self.cancel_update_error(job_id, now, reason).await?),
         }
     }
@@ -1171,6 +1338,10 @@ impl JobRepositoryTransaction for PostgresJobTransaction<'_> {
         _now: DateTime<Utc>,
         limit: usize,
     ) -> Result<Vec<Job>, JobRepositoryError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        self.lock_refresh_recovery(None).await?;
         let limit = i64::try_from(limit).map_err(|_| {
             JobRepositoryError::Storage("recovery batch limit exceeds PostgreSQL range".to_owned())
         })?;
@@ -1215,7 +1386,11 @@ impl JobRepositoryTransaction for PostgresJobTransaction<'_> {
             .fetch_all(&mut **transaction)
             .await
             .map_err(storage_error)?;
-        rows.into_iter().map(decode_job).collect()
+        let jobs: Vec<Job> = rows.into_iter().map(decode_job).collect::<Result<_, _>>()?;
+        for job in &jobs {
+            self.cleanup_terminal_refresh(job).await?;
+        }
+        Ok(jobs)
     }
 
     async fn commit(self) -> Result<(), JobRepositoryError> {
@@ -1228,9 +1403,11 @@ impl JobRepository for PostgresJobRepository {
     type Transaction<'a> = PostgresJobTransaction<'a>;
 
     async fn begin(&self) -> Result<Self::Transaction<'_>, JobRepositoryError> {
-        PostgresJobTransaction::begin(&self.pool)
+        let mut transaction = PostgresJobTransaction::begin(&self.pool)
             .await
-            .map_err(storage_error)
+            .map_err(storage_error)?;
+        transaction.set_refresh_policy(self.refresh_policy);
+        Ok(transaction)
     }
 }
 
@@ -1345,6 +1522,7 @@ fn parse_job_type(value: String) -> Result<JobType, JobRepositoryError> {
         "article_backfill" => Ok(JobType::ArticleBackfill),
         "credential_refresh" => Ok(JobType::CredentialRefresh),
         "asset_repair" => Ok(JobType::AssetRepair),
+        "asset_refresh" => Ok(JobType::AssetRefresh),
         _ => Err(JobRepositoryError::Storage(format!(
             "unknown persisted job_type: {value}"
         ))),
@@ -1372,6 +1550,7 @@ fn job_type_name(job_type: JobType) -> &'static str {
         JobType::ArticleBackfill => "article_backfill",
         JobType::CredentialRefresh => "credential_refresh",
         JobType::AssetRepair => "asset_repair",
+        JobType::AssetRefresh => "asset_refresh",
     }
 }
 
@@ -1842,6 +2021,19 @@ mod tests {
 
     fn spec(key: &str, priority: i32, run_after: i64) -> NewJob {
         spec_with_type(JobType::SourceSync, key, priority, run_after)
+    }
+
+    #[test]
+    fn asset_refresh_uses_a_stable_persisted_job_type_name() {
+        assert_eq!(
+            parse_job_type("asset_refresh".to_owned()).unwrap(),
+            JobType::AssetRefresh
+        );
+        assert_eq!(job_type_name(JobType::AssetRefresh), "asset_refresh");
+        assert_eq!(
+            job_type_names(&[JobType::AssetRefresh]),
+            vec!["asset_refresh".to_owned()]
+        );
     }
 
     async fn inserted_id(repository: &MemoryJobRepository, job: NewJob) -> Uuid {

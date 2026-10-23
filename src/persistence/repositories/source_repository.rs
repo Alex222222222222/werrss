@@ -340,6 +340,14 @@ impl SourceTransactionRepository for PostgresSourceTransaction<'_, '_> {
     async fn delete(&mut self, source_id: SourceId) -> Result<(), SourceRepositoryError> {
         validate_source_id(source_id)?;
         let transaction = self.transaction()?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('asset-capacity', 0))")
+            .execute(&mut **transaction)
+            .await
+            .map_err(storage_error)?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('asset-repair-admission', 0))")
+            .execute(&mut **transaction)
+            .await
+            .map_err(storage_error)?;
         let exists =
             sqlx::query_scalar::<_, Uuid>("SELECT id FROM sources WHERE id = $1 FOR UPDATE")
                 .bind(source_id.as_uuid())

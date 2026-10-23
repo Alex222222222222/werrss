@@ -74,6 +74,8 @@ pub enum JobType {
     CredentialRefresh,
     /// Re-fetch one missing binary asset while retaining its stable record.
     AssetRepair,
+    /// Re-acquire one complete public article after confirmed asset expiry.
+    AssetRefresh,
 }
 
 impl JobType {
@@ -84,6 +86,7 @@ impl JobType {
         Self::ArticleBackfill,
         Self::CredentialRefresh,
         Self::AssetRepair,
+        Self::AssetRefresh,
     ];
 
     /// Returns whether the job needs the browser sidecar at execution time.
@@ -92,7 +95,10 @@ impl JobType {
     /// refresh transport is an injected application service and does not use a
     /// WebDriver session. Interactive browser login remains a future job kind.
     pub const fn requires_browser(self) -> bool {
-        matches!(self, Self::SourceSync | Self::ArticleBackfill)
+        matches!(
+            self,
+            Self::SourceSync | Self::ArticleBackfill | Self::AssetRefresh
+        )
     }
 }
 
@@ -892,6 +898,16 @@ mod tests {
             now: at(0),
         });
         assert_eq!(empty_key, Err(JobError::EmptyDedupeKey));
+    }
+
+    #[test]
+    fn includes_asset_refresh_as_a_public_browser_job_type() {
+        assert!(JobType::ALL.contains(&JobType::AssetRefresh));
+        assert!(JobType::AssetRefresh.requires_browser());
+        assert_eq!(
+            serde_json::to_value(JobType::AssetRefresh).unwrap(),
+            Value::String("asset_refresh".to_owned())
+        );
     }
 
     #[test]

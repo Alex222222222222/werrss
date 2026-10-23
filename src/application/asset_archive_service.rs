@@ -11,14 +11,14 @@ use std::{
     time::Duration,
 };
 
-use reqwest::{header, redirect::Policy, Client, Response};
+use reqwest::{header, redirect::Policy, Client, Response, StatusCode};
 use thiserror::Error;
 use tokio::time::{timeout, Instant};
 use url::{Host, Url};
 
 use crate::{
     archive::asset_store::{AssetCachePolicy, AssetInput},
-    domain::source::VerifiedWechatArticleUrl,
+    domain::{source::VerifiedWechatArticleUrl, url_policy::has_provider_signature},
 };
 
 /// Errors raised while constructing the asset HTTP client.
@@ -29,12 +29,199 @@ pub enum AssetArchiveServiceError {
     Client(String),
 }
 
+/// Safe failure categories for one repair-specific asset fetch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RepairAssetFetchFailureKind {
+    /// Exact provider evidence matched the repair-only policy.
+    ConfirmedSignedUrlExpiry,
+    /// The provider returned an unsuccessful HTTP response without exact expiry evidence.
+    Http,
+    /// The request could not be completed.
+    Transport,
+    /// The redirect chain could not be followed.
+    Redirect,
+    /// A source or final destination failed outbound URL validation.
+    UnsafeDestination,
+    /// The response media type or signature was invalid.
+    MediaValidation,
+    /// The response body could not be read safely.
+    BodyRead,
+    /// The response exceeded a configured fetch budget.
+    Budget,
+}
+
+/// Failure details that are safe to retain or log.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("asset fetch failed ({kind:?}, status={status:?})")]
+pub struct RepairAssetFetchFailure {
+    /// Bounded, secret-free failure classification.
+    pub kind: RepairAssetFetchFailureKind,
+    /// HTTP status when a response was received.
+    pub status: Option<u16>,
+}
+
+impl RepairAssetFetchFailure {
+    fn new(kind: RepairAssetFetchFailureKind, status: Option<StatusCode>) -> Self {
+        Self {
+            kind,
+            status: status.map(|status| status.as_u16()),
+        }
+    }
+}
+
+/// Result of fetching one asset for a repair job.
+pub enum RepairAssetFetchOutcome {
+    /// A complete validated input ready for persistence.
+    Fetched(Box<AssetInput>),
+    /// A bounded failure without request URLs, bodies, or raw errors.
+    Failed(RepairAssetFetchFailure),
+}
+
+/// Exact response marker required to classify a provider-confirmed expiry.
+#[derive(Clone, Copy)]
+struct ProviderExpiryRule {
+    host: &'static str,
+    status: StatusCode,
+    code: &'static str,
+}
+
+const PRODUCTION_EXPIRY_RULES: &[ProviderExpiryRule] = &[];
+const MAX_EXPIRY_EVIDENCE_BYTES: usize = 4096;
+
+fn classify_expiry_evidence(
+    final_url: &Url,
+    status: StatusCode,
+    evidence: &[u8],
+    rules: &[ProviderExpiryRule],
+) -> bool {
+    if evidence.len() > MAX_EXPIRY_EVIDENCE_BYTES {
+        return false;
+    }
+    let Some(host) = final_url.host_str() else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(evidence) else {
+        return false;
+    };
+    let Some(code) = value.get("code").and_then(serde_json::Value::as_str) else {
+        return false;
+    };
+    rules
+        .iter()
+        .any(|rule| host == rule.host && status == rule.status && code == rule.code)
+}
+
+fn redirect_failure_kind(response: &Response) -> RepairAssetFetchFailureKind {
+    let Some(location) = response
+        .headers()
+        .get(header::LOCATION)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return RepairAssetFetchFailureKind::Redirect;
+    };
+    let Some(destination) = response.url().join(location).ok() else {
+        return RepairAssetFetchFailureKind::UnsafeDestination;
+    };
+    if validate_asset_url(&destination).is_none() {
+        RepairAssetFetchFailureKind::UnsafeDestination
+    } else {
+        RepairAssetFetchFailureKind::Redirect
+    }
+}
+
+async fn response_has_expiry_evidence(
+    mut response: Response,
+    started: Instant,
+    max_fetch_time: Duration,
+    request_timeout: Duration,
+    rules: &[ProviderExpiryRule],
+) -> Result<bool, RepairAssetFetchFailureKind> {
+    use RepairAssetFetchFailureKind as Failure;
+
+    let status = response.status();
+    let Some(final_url) = validate_asset_url(response.url()) else {
+        return Err(Failure::UnsafeDestination);
+    };
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_EXPIRY_EVIDENCE_BYTES as u64)
+    {
+        return Ok(false);
+    }
+
+    let mut evidence = Vec::new();
+    loop {
+        let remaining_time = request_timeout
+            .min(max_fetch_time)
+            .checked_sub(started.elapsed())
+            .ok_or(Failure::Budget)?;
+        let chunk = match timeout(remaining_time, response.chunk()).await {
+            Ok(Ok(Some(chunk))) => chunk,
+            Ok(Ok(None)) => break,
+            Ok(Err(error)) if error.is_timeout() => return Err(Failure::Budget),
+            Ok(Err(_)) => return Err(Failure::BodyRead),
+            Err(_) => return Err(Failure::Budget),
+        };
+        let remaining = MAX_EXPIRY_EVIDENCE_BYTES
+            .saturating_add(1)
+            .saturating_sub(evidence.len());
+        evidence.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+        if evidence.len() > MAX_EXPIRY_EVIDENCE_BYTES {
+            return Ok(false);
+        }
+    }
+
+    Ok(classify_expiry_evidence(
+        &final_url, status, &evidence, rules,
+    ))
+}
+
+async fn read_repair_body(
+    mut response: Response,
+    limit: u64,
+    started: Instant,
+    max_fetch_time: Duration,
+    request_timeout: Duration,
+) -> Result<Vec<u8>, RepairAssetFetchFailureKind> {
+    use RepairAssetFetchFailureKind as Failure;
+
+    let mut bytes = Vec::new();
+    loop {
+        let remaining_time = request_timeout
+            .min(max_fetch_time)
+            .checked_sub(started.elapsed())
+            .ok_or(Failure::Budget)?;
+        let chunk = match timeout(remaining_time, response.chunk()).await {
+            Ok(Ok(chunk)) => chunk,
+            Ok(Err(error)) => {
+                if error.is_timeout() {
+                    return Err(Failure::Budget);
+                }
+                return Err(Failure::BodyRead);
+            }
+            Err(_) => return Err(Failure::Budget),
+        };
+        let Some(chunk) = chunk else { break };
+        let chunk_size = u64::try_from(chunk.len()).map_err(|_| Failure::Budget)?;
+        if chunk_size > limit.saturating_sub(bytes.len() as u64) {
+            return Err(Failure::Budget);
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    if bytes.is_empty() {
+        return Err(Failure::BodyRead);
+    }
+    Ok(bytes)
+}
+
 /// Bounded, anonymous asset fetcher used before article persistence.
 #[derive(Clone)]
 pub struct AssetArchiveService {
     client: Client,
     policy: AssetCachePolicy,
     user_agent: Option<String>,
+    #[cfg(test)]
+    test_expiry_rules: Vec<ProviderExpiryRule>,
 }
 
 impl std::fmt::Debug for AssetArchiveService {
@@ -71,6 +258,8 @@ impl AssetArchiveService {
             client,
             policy,
             user_agent: user_agent.filter(|value| !value.is_empty()),
+            #[cfg(test)]
+            test_expiry_rules: Vec::new(),
         })
     }
 
@@ -94,7 +283,21 @@ impl AssetArchiveService {
             client,
             policy,
             user_agent,
+            #[cfg(test)]
+            test_expiry_rules: Vec::new(),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_expiry_rule_for_test(
+        mut self,
+        host: &'static str,
+        status: StatusCode,
+        code: &'static str,
+    ) -> Self {
+        self.test_expiry_rules
+            .push(ProviderExpiryRule { host, status, code });
+        self
     }
 
     /// Fetches distinct approved image URLs on a best-effort basis.
@@ -160,6 +363,10 @@ impl AssetArchiveService {
                 );
                 continue;
             };
+            if has_provider_signature(&source_url) {
+                tracing::warn!(occurrence, "signed asset URL omitted from acquisition");
+                continue;
+            }
             tracing::debug!(occurrence, host = ?source_url.host_str(), "fetching article asset");
 
             let mut request = self
@@ -178,13 +385,8 @@ impl AssetArchiveService {
             }
             let response = match timeout(remaining_time, request.send()).await {
                 Ok(Ok(response)) => response,
-                Ok(Err(error)) => {
-                    tracing::warn!(
-                        occurrence,
-                        host = ?source_url.host_str(),
-                        error = %error,
-                        "asset request failed"
-                    );
+                Ok(Err(_)) => {
+                    tracing::warn!(occurrence, "asset request failed");
                     continue;
                 }
                 Err(_) => {
@@ -230,6 +432,10 @@ impl AssetArchiveService {
                 tracing::warn!(occurrence, "asset redirect ended at an unsafe URL");
                 continue;
             };
+            if has_provider_signature(&final_url) {
+                tracing::warn!(occurrence, "signed asset redirect omitted from acquisition");
+                continue;
+            }
             let Some(bytes) = self
                 .read_body(response, per_asset_limit, &mut fetched_bytes, started)
                 .await
@@ -265,6 +471,192 @@ impl AssetArchiveService {
         fetched
     }
 
+    /// Fetches one asset with a typed, secret-free outcome for repair workers.
+    pub async fn fetch_asset_for_repair(
+        &self,
+        referer: &VerifiedWechatArticleUrl,
+        source_url: &Url,
+        captured_origin: Option<&str>,
+        captured_user_agent: Option<&str>,
+    ) -> RepairAssetFetchOutcome {
+        use RepairAssetFetchFailureKind as Failure;
+
+        let Some(source_url) = validate_asset_url(source_url) else {
+            return RepairAssetFetchOutcome::Failed(RepairAssetFetchFailure::new(
+                Failure::UnsafeDestination,
+                None,
+            ));
+        };
+        if self.policy.max_count_per_article() == 0 {
+            return RepairAssetFetchOutcome::Failed(RepairAssetFetchFailure::new(
+                Failure::Budget,
+                None,
+            ));
+        }
+        let started = Instant::now();
+        let Some(remaining_time) = self.remaining_fetch_time(started) else {
+            return RepairAssetFetchOutcome::Failed(RepairAssetFetchFailure::new(
+                Failure::Budget,
+                None,
+            ));
+        };
+        let origin = captured_origin
+            .map(str::to_owned)
+            .or_else(|| origin_for(referer.as_str()));
+        let user_agent = captured_user_agent.or(self.user_agent.as_deref());
+        let mut request = self
+            .client
+            .get(source_url.clone())
+            .header(header::REFERER, referer.as_str())
+            .header(
+                header::ACCEPT,
+                "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+            );
+        if let Some(origin) = origin.as_deref() {
+            request = request.header(header::ORIGIN, origin);
+        }
+        if let Some(user_agent) = user_agent {
+            request = request.header(header::USER_AGENT, user_agent);
+        }
+
+        let response = match timeout(remaining_time, request.send()).await {
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) => {
+                let kind = if error.is_timeout() {
+                    Failure::Budget
+                } else if error.is_redirect() {
+                    if error.url().is_some_and(|url| !is_safe_asset_url(url)) {
+                        Failure::UnsafeDestination
+                    } else {
+                        Failure::Redirect
+                    }
+                } else {
+                    Failure::Transport
+                };
+                return RepairAssetFetchOutcome::Failed(RepairAssetFetchFailure::new(kind, None));
+            }
+            Err(_) => {
+                return RepairAssetFetchOutcome::Failed(RepairAssetFetchFailure::new(
+                    Failure::Budget,
+                    None,
+                ));
+            }
+        };
+        let status = response.status();
+        if !status.is_success() {
+            if status.is_redirection() {
+                return RepairAssetFetchOutcome::Failed(RepairAssetFetchFailure::new(
+                    redirect_failure_kind(&response),
+                    Some(status),
+                ));
+            }
+            if validate_asset_url(response.url()).is_none() {
+                return RepairAssetFetchOutcome::Failed(RepairAssetFetchFailure::new(
+                    Failure::UnsafeDestination,
+                    Some(status),
+                ));
+            }
+            #[cfg(test)]
+            let expiry_rules = PRODUCTION_EXPIRY_RULES
+                .iter()
+                .chain(self.test_expiry_rules.iter())
+                .copied()
+                .collect::<Vec<_>>();
+            #[cfg(test)]
+            let expiry_rules = expiry_rules.as_slice();
+            #[cfg(not(test))]
+            let expiry_rules = PRODUCTION_EXPIRY_RULES;
+            let kind = if expiry_rules.is_empty() {
+                Failure::Http
+            } else {
+                match response_has_expiry_evidence(
+                    response,
+                    started,
+                    self.policy.max_fetch_time_per_article(),
+                    self.policy.fetch_timeout(),
+                    expiry_rules,
+                )
+                .await
+                {
+                    Ok(true) => Failure::ConfirmedSignedUrlExpiry,
+                    Ok(false) => Failure::Http,
+                    Err(kind) => kind,
+                }
+            };
+            return RepairAssetFetchOutcome::Failed(RepairAssetFetchFailure::new(
+                kind,
+                Some(status),
+            ));
+        }
+        let Some(final_url) = validate_asset_url(response.url()) else {
+            return RepairAssetFetchOutcome::Failed(RepairAssetFetchFailure::new(
+                Failure::UnsafeDestination,
+                Some(status),
+            ));
+        };
+        if has_provider_signature(&source_url) || has_provider_signature(&final_url) {
+            return RepairAssetFetchOutcome::Failed(RepairAssetFetchFailure::new(
+                Failure::UnsafeDestination,
+                Some(status),
+            ));
+        }
+
+        let Some(media_type) = response_media_type(&response) else {
+            return RepairAssetFetchOutcome::Failed(RepairAssetFetchFailure::new(
+                Failure::MediaValidation,
+                Some(status),
+            ));
+        };
+        let limit = self
+            .policy
+            .max_asset_size_bytes()
+            .min(self.policy.max_fetch_bytes_per_article());
+        if limit == 0
+            || response
+                .content_length()
+                .is_some_and(|length| length > limit)
+        {
+            return RepairAssetFetchOutcome::Failed(RepairAssetFetchFailure::new(
+                Failure::Budget,
+                Some(status),
+            ));
+        }
+        let bytes = match read_repair_body(
+            response,
+            limit,
+            started,
+            self.policy.max_fetch_time_per_article(),
+            self.policy.fetch_timeout(),
+        )
+        .await
+        {
+            Ok(bytes) => bytes,
+            Err(kind) => {
+                return RepairAssetFetchOutcome::Failed(RepairAssetFetchFailure::new(
+                    kind,
+                    Some(status),
+                ));
+            }
+        };
+        if !signature_matches(&media_type, &bytes) {
+            return RepairAssetFetchOutcome::Failed(RepairAssetFetchFailure::new(
+                Failure::MediaValidation,
+                Some(status),
+            ));
+        }
+
+        RepairAssetFetchOutcome::Fetched(Box::new(AssetInput::new(
+            source_url,
+            final_url,
+            media_type,
+            bytes,
+            0,
+            Url::parse(referer.as_str()).expect("verified article URL must remain parseable"),
+            origin,
+            user_agent.map(str::to_owned),
+        )))
+    }
+
     fn remaining_fetch_time(&self, started: Instant) -> Option<Duration> {
         self.policy
             .max_fetch_time_per_article()
@@ -286,15 +678,12 @@ impl AssetArchiveService {
             };
             let chunk = match timeout(remaining_time, response.chunk()).await {
                 Ok(Ok(chunk)) => chunk,
-                Err(error) => {
-                    tracing::warn!(
-                        error = %error,
-                        "asset response body exceeded the article fetch time budget"
-                    );
+                Err(_) => {
+                    tracing::warn!("asset response body exceeded the article fetch time budget");
                     return None;
                 }
-                Ok(Err(error)) => {
-                    tracing::warn!(error = %error, "asset response body could not be read");
+                Ok(Err(_)) => {
+                    tracing::warn!("asset response body could not be read");
                     return None;
                 }
             };
@@ -982,5 +1371,670 @@ mod tests {
 
         assert_eq!(assets.len(), 1);
         assert_eq!(assets[0].occurrence, 0);
+    }
+
+    #[tokio::test]
+    async fn signed_source_urls_are_not_requested_by_best_effort_fetch() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("signed source fixture should bind");
+        let address = listener
+            .local_addr()
+            .expect("signed source fixture should have an address");
+        let server = tokio::spawn(async move {
+            let mut requests = 0;
+            while requests < 2 {
+                let Ok(Ok((mut stream, _))) =
+                    timeout(Duration::from_millis(200), listener.accept()).await
+                else {
+                    break;
+                };
+                requests += 1;
+                let mut request = [0_u8; 1024];
+                let _ = stream
+                    .read(&mut request)
+                    .await
+                    .expect("signed source request should be readable");
+                let body = b"\x89PNG\r\n\x1a\nvalid-signed-response";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("signed source response headers should be writable");
+                stream
+                    .write_all(body)
+                    .await
+                    .expect("signed source response should be writable");
+            }
+            requests
+        });
+        let client = Client::builder()
+            .no_proxy()
+            .resolve("assets.example.test", address)
+            .build()
+            .expect("signed source client should be constructible");
+        let service =
+            AssetArchiveService::with_client_for_test(AssetCachePolicy::default(), None, client);
+        let referer = VerifiedWechatArticleUrl::parse("https://mp.weixin.qq.com/s/article")
+            .expect("test referer should be valid");
+        let source_url =
+            Url::parse("http://assets.example.test/image.png?X-Amz-Signature=signed-source-secret")
+                .expect("signed source URL should be valid");
+
+        let assets = service
+            .fetch_assets(&referer, std::slice::from_ref(&source_url))
+            .await;
+        let requests = server.await.expect("signed source fixture should finish");
+
+        assert!(assets.is_empty());
+        assert_eq!(requests, 0);
+    }
+
+    #[tokio::test]
+    async fn repair_fetch_rejects_successful_signed_source_without_exposing_it() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("signed repair fixture should bind");
+        let address = listener
+            .local_addr()
+            .expect("signed repair fixture should have an address");
+        let server = tokio::spawn(async move {
+            for request_number in 0..2 {
+                let (mut stream, _) = listener
+                    .accept()
+                    .await
+                    .expect("signed repair request should connect");
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 1024];
+                loop {
+                    let read = stream
+                        .read(&mut buffer)
+                        .await
+                        .expect("signed repair request should be readable");
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                if request_number == 0 {
+                    stream
+                        .write_all(b"HTTP/1.1 302 Found\r\nLocation: http://assets.example.test/final.png\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                        .await
+                        .expect("signed repair redirect should be writable");
+                } else {
+                    let body = b"\x89PNG\r\n\x1a\nvalid-signed-response";
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    stream
+                        .write_all(response.as_bytes())
+                        .await
+                        .expect("signed repair response headers should be writable");
+                    stream
+                        .write_all(body)
+                        .await
+                        .expect("signed repair response body should be writable");
+                }
+            }
+        });
+        let client = Client::builder()
+            .no_proxy()
+            .resolve("assets.example.test", address)
+            .build()
+            .expect("signed repair client should be constructible");
+        let service =
+            AssetArchiveService::with_client_for_test(AssetCachePolicy::default(), None, client);
+        let referer = VerifiedWechatArticleUrl::parse("https://mp.weixin.qq.com/s/article")
+            .expect("test referer should be valid");
+        let source_url =
+            Url::parse("http://assets.example.test/image.png?X-Amz-Signature=signed-source-secret")
+                .expect("signed source URL should be valid");
+
+        let outcome = service
+            .fetch_asset_for_repair(&referer, &source_url, None, None)
+            .await;
+        server.await.expect("signed repair fixture should finish");
+
+        let RepairAssetFetchOutcome::Failed(failure) = outcome else {
+            panic!("a successful signed source must not produce a persistent input");
+        };
+        assert_eq!(failure.kind, RepairAssetFetchFailureKind::UnsafeDestination);
+        assert_eq!(failure.status, Some(200));
+        let diagnostics = format!("{failure:?} {failure}");
+        assert!(!diagnostics.contains("signed-source-secret"));
+    }
+
+    #[tokio::test]
+    async fn repair_fetch_preserves_test_only_signed_url_expiry_classification() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("signed expiry fixture should bind");
+        let address = listener
+            .local_addr()
+            .expect("signed expiry fixture should have an address");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener
+                .accept()
+                .await
+                .expect("signed expiry request should connect");
+            let mut request = [0_u8; 1024];
+            let _ = stream
+                .read(&mut request)
+                .await
+                .expect("signed expiry request should be readable");
+            let body = br#"{"code":"ExpiredToken","message":"expiry-secret"}"#;
+            let response = format!(
+                "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("signed expiry response headers should be writable");
+            stream
+                .write_all(body)
+                .await
+                .expect("signed expiry response body should be writable");
+        });
+        let client = Client::builder()
+            .no_proxy()
+            .resolve("assets.example.test", address)
+            .build()
+            .expect("signed expiry client should be constructible");
+        let service =
+            AssetArchiveService::with_client_for_test(AssetCachePolicy::default(), None, client)
+                .with_expiry_rule_for_test(
+                    "assets.example.test",
+                    StatusCode::FORBIDDEN,
+                    "ExpiredToken",
+                );
+        let referer = VerifiedWechatArticleUrl::parse("https://mp.weixin.qq.com/s/article")
+            .expect("test referer should be valid");
+        let source_url =
+            Url::parse("http://assets.example.test/image.png?X-Amz-Signature=signed-source-secret")
+                .expect("signed source URL should be valid");
+
+        let outcome = service
+            .fetch_asset_for_repair(&referer, &source_url, None, None)
+            .await;
+        server.await.expect("signed expiry fixture should finish");
+
+        assert!(matches!(
+            outcome,
+            RepairAssetFetchOutcome::Failed(RepairAssetFetchFailure {
+                kind: RepairAssetFetchFailureKind::ConfirmedSignedUrlExpiry,
+                status: Some(403)
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn successful_redirects_to_signed_urls_are_not_returned_by_either_fetch_path() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("signed redirect fixture should bind");
+        let address = listener
+            .local_addr()
+            .expect("signed redirect fixture should have an address");
+        let redirect_target =
+            "http://assets.example.test/final.png?X-Amz-Signature=redirect-secret";
+        let server = tokio::spawn(async move {
+            let mut signed_responses = 0;
+            for request_number in 0..4 {
+                let accepted = timeout(Duration::from_millis(500), listener.accept()).await;
+                let Ok(Ok((mut stream, _))) = accepted else {
+                    break;
+                };
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 1024];
+                loop {
+                    let read = stream
+                        .read(&mut buffer)
+                        .await
+                        .expect("signed redirect request should be readable");
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                if request_number % 2 == 0 {
+                    let response = format!(
+                        "HTTP/1.1 302 Found\r\nLocation: {redirect_target}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    );
+                    stream
+                        .write_all(response.as_bytes())
+                        .await
+                        .expect("signed redirect response should be writable");
+                } else {
+                    signed_responses += 1;
+                    let body = b"\x89PNG\r\n\x1a\nredirected-image";
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    stream
+                        .write_all(response.as_bytes())
+                        .await
+                        .expect("signed response headers should be writable");
+                    stream
+                        .write_all(body)
+                        .await
+                        .expect("signed response body should be writable");
+                }
+            }
+            signed_responses
+        });
+        let client = Client::builder()
+            .no_proxy()
+            .resolve("assets.example.test", address)
+            .build()
+            .expect("signed redirect client should be constructible");
+        let service =
+            AssetArchiveService::with_client_for_test(AssetCachePolicy::default(), None, client);
+        let referer = VerifiedWechatArticleUrl::parse("https://mp.weixin.qq.com/s/article")
+            .expect("test referer should be valid");
+        let source_url = Url::parse("http://assets.example.test/image.png")
+            .expect("unsigned source URL should be valid");
+
+        let assets = service
+            .fetch_assets(&referer, std::slice::from_ref(&source_url))
+            .await;
+        let repair = service
+            .fetch_asset_for_repair(&referer, &source_url, None, None)
+            .await;
+        let signed_responses = server.await.expect("signed redirect fixture should finish");
+
+        assert!(assets.is_empty());
+        let RepairAssetFetchOutcome::Failed(failure) = repair else {
+            panic!("a signed final URL must not produce a persistent input");
+        };
+        assert_eq!(failure.kind, RepairAssetFetchFailureKind::UnsafeDestination);
+        assert_eq!(failure.status, Some(200));
+        let diagnostics = format!("{failure:?} {failure}");
+        assert!(!diagnostics.contains("redirect-secret"));
+        assert_eq!(signed_responses, 2);
+    }
+
+    #[tokio::test]
+    async fn repair_fetch_returns_validated_asset_input() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("repair success listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("repair success listener should have an address");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener
+                .accept()
+                .await
+                .expect("repair success request should connect");
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            loop {
+                let read = stream
+                    .read(&mut buffer)
+                    .await
+                    .expect("repair success request should be readable");
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let body = b"\x89PNG\r\n\x1a\nvalidated-image";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("repair success headers should be writable");
+            stream
+                .write_all(body)
+                .await
+                .expect("repair success body should be writable");
+        });
+        let client = Client::builder()
+            .no_proxy()
+            .resolve("assets.example.test", address)
+            .build()
+            .expect("repair success client should be constructible");
+        let service = AssetArchiveService::with_client_for_test(
+            AssetCachePolicy::default(),
+            Some("repair-test-agent".to_owned()),
+            client,
+        );
+        let referer = VerifiedWechatArticleUrl::parse("https://mp.weixin.qq.com/s/article")
+            .expect("test referer should be valid");
+        let source_url = Url::parse("http://assets.example.test/image.png")
+            .expect("repair source URL should be valid");
+
+        let outcome = service
+            .fetch_asset_for_repair(&referer, &source_url, None, None)
+            .await;
+        server.await.expect("repair success server should finish");
+
+        let RepairAssetFetchOutcome::Fetched(input) = outcome else {
+            panic!("a valid image response should produce an asset input");
+        };
+        assert_eq!(input.source_url, source_url);
+        assert_eq!(input.final_url, source_url);
+        assert_eq!(input.media_type, "image/png");
+        assert_eq!(input.bytes, b"\x89PNG\r\n\x1a\nvalidated-image");
+        assert_eq!(input.occurrence, 0);
+        assert_eq!(input.user_agent.as_deref(), Some("repair-test-agent"));
+    }
+
+    #[tokio::test]
+    async fn repair_fetch_rejects_unsafe_redirect_destination() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("unsafe redirect listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("unsafe redirect listener should have an address");
+        let redirect_target = format!(
+            "http://127.0.0.1:{}/image?signature=redirect-secret",
+            address.port()
+        );
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener
+                .accept()
+                .await
+                .expect("unsafe redirect request should connect");
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            loop {
+                let read = stream
+                    .read(&mut buffer)
+                    .await
+                    .expect("unsafe redirect request should be readable");
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let response = format!(
+                "HTTP/1.1 302 Found\r\nLocation: {redirect_target}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("unsafe redirect response should be writable");
+        });
+        let client = Client::builder()
+            .no_proxy()
+            .resolve("assets.example.test", address)
+            .redirect(Policy::custom(|attempt| {
+                if can_follow_redirect(attempt.previous().len(), 5, attempt.url()) {
+                    attempt.follow()
+                } else {
+                    attempt.stop()
+                }
+            }))
+            .build()
+            .expect("unsafe redirect client should be constructible");
+        let service =
+            AssetArchiveService::with_client_for_test(AssetCachePolicy::default(), None, client);
+        let referer = VerifiedWechatArticleUrl::parse("https://mp.weixin.qq.com/s/article")
+            .expect("test referer should be valid");
+        let source_url = Url::parse("http://assets.example.test/image.png?signature=source-secret")
+            .expect("repair source URL should be valid");
+
+        let outcome = service
+            .fetch_asset_for_repair(&referer, &source_url, None, None)
+            .await;
+        server.await.expect("unsafe redirect server should finish");
+
+        let RepairAssetFetchOutcome::Failed(failure) = outcome else {
+            panic!("an unsafe redirect target must not be fetched");
+        };
+        assert_eq!(failure.kind, RepairAssetFetchFailureKind::UnsafeDestination);
+        assert_eq!(failure.status, Some(302));
+        let diagnostics = format!("{failure:?} {failure}");
+        assert!(!diagnostics.contains("source-secret"));
+        assert!(!diagnostics.contains("redirect-secret"));
+    }
+
+    #[tokio::test]
+    async fn repair_fetch_returns_safe_status_only_failure() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("repair test listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("repair test listener should have an address");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener
+                .accept()
+                .await
+                .expect("repair request should connect");
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            loop {
+                let read = stream
+                    .read(&mut buffer)
+                    .await
+                    .expect("repair request should be readable");
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let body = br#"{"code":"ExpiredToken","message":"secret-response-body"}"#;
+            let response = format!(
+                "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("repair response headers should be writable");
+            stream
+                .write_all(body)
+                .await
+                .expect("repair response body should be writable");
+        });
+        let client = Client::builder()
+            .no_proxy()
+            .resolve("assets.example.test", address)
+            .build()
+            .expect("repair test client should be constructible");
+        let service =
+            AssetArchiveService::with_client_for_test(AssetCachePolicy::default(), None, client);
+        let referer = VerifiedWechatArticleUrl::parse("https://mp.weixin.qq.com/s/article")
+            .expect("test referer should be valid");
+        let url = Url::parse("http://assets.example.test/image?signature=secret-signed-url")
+            .expect("repair test URL should be valid");
+
+        let outcome = service
+            .fetch_asset_for_repair(&referer, &url, None, None)
+            .await;
+        server.await.expect("repair test server should finish");
+
+        let RepairAssetFetchOutcome::Failed(failure) = outcome else {
+            panic!("403 without exact provider evidence must fail");
+        };
+        assert_eq!(failure.kind, RepairAssetFetchFailureKind::Http);
+        assert_eq!(failure.status, Some(403));
+        let diagnostics = format!("{failure:?} {failure}");
+        assert!(!diagnostics.contains("secret-signed-url"));
+        assert!(!diagnostics.contains("secret-response-body"));
+    }
+
+    #[tokio::test]
+    async fn response_expiry_classifier_matches_only_exact_bounded_provider_evidence() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("expiry fixture listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("expiry fixture listener should have an address");
+        let server = tokio::spawn(async move {
+            for request_number in 0..2 {
+                let (mut stream, _) = listener
+                    .accept()
+                    .await
+                    .expect("expiry fixture request should connect");
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 1024];
+                loop {
+                    let read = stream
+                        .read(&mut buffer)
+                        .await
+                        .expect("expiry fixture request should be readable");
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let body = if request_number == 0 {
+                    br#"{"code":"ExpiredToken"}"#.to_vec()
+                } else {
+                    vec![b' '; MAX_EXPIRY_EVIDENCE_BYTES + 8]
+                };
+                let length = if request_number == 0 {
+                    format!("Content-Length: {}\r\n", body.len())
+                } else {
+                    String::new()
+                };
+                let response = format!(
+                    "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\n{length}Connection: close\r\n\r\n"
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("expiry fixture headers should be writable");
+                stream
+                    .write_all(&body)
+                    .await
+                    .expect("expiry fixture body should be writable");
+            }
+        });
+        let client = Client::builder()
+            .no_proxy()
+            .resolve("cdn.example.test", address)
+            .build()
+            .expect("expiry fixture client should be constructible");
+        let response = client
+            .get("http://cdn.example.test/image")
+            .send()
+            .await
+            .expect("expiry fixture response should arrive");
+        let rules = [ProviderExpiryRule {
+            host: "cdn.example.test",
+            status: reqwest::StatusCode::FORBIDDEN,
+            code: "ExpiredToken",
+        }];
+
+        let expired = response_has_expiry_evidence(
+            response,
+            Instant::now(),
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+            &rules,
+        )
+        .await
+        .expect("response body should be read within the configured budget");
+        let oversized = response_has_expiry_evidence(
+            client
+                .get("http://cdn.example.test/image")
+                .send()
+                .await
+                .expect("second expiry fixture response should arrive"),
+            Instant::now(),
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+            &rules,
+        )
+        .await
+        .expect("oversized evidence should be rejected without a body-read error");
+        server.await.expect("expiry fixture server should finish");
+
+        assert!(expired);
+        assert!(!oversized);
+    }
+
+    #[test]
+    fn signed_url_expiry_requires_injected_provider_status_and_machine_code() {
+        let url = Url::parse("https://cdn.example.test/image").unwrap();
+        let rules = [ProviderExpiryRule {
+            host: "cdn.example.test",
+            status: reqwest::StatusCode::FORBIDDEN,
+            code: "ExpiredToken",
+        }];
+        let evidence = br#"{"code":"ExpiredToken"}"#;
+
+        assert!(classify_expiry_evidence(
+            &url,
+            reqwest::StatusCode::FORBIDDEN,
+            evidence,
+            &rules
+        ));
+        assert!(!classify_expiry_evidence(
+            &url,
+            reqwest::StatusCode::FORBIDDEN,
+            b"",
+            &rules
+        ));
+        assert!(!classify_expiry_evidence(
+            &Url::parse("https://other.example.test/image").unwrap(),
+            reqwest::StatusCode::FORBIDDEN,
+            evidence,
+            &rules
+        ));
+        assert!(!classify_expiry_evidence(
+            &url,
+            reqwest::StatusCode::NOT_FOUND,
+            evidence,
+            &rules
+        ));
+        assert!(!classify_expiry_evidence(
+            &url,
+            reqwest::StatusCode::FORBIDDEN,
+            b"AccessDenied",
+            &rules
+        ));
+        assert!(!classify_expiry_evidence(
+            &url,
+            reqwest::StatusCode::FORBIDDEN,
+            br#"{"error":{"code":"ExpiredToken"}}"#,
+            &rules
+        ));
+        assert!(!classify_expiry_evidence(
+            &url,
+            reqwest::StatusCode::FORBIDDEN,
+            &vec![b' '; MAX_EXPIRY_EVIDENCE_BYTES + 1],
+            &rules
+        ));
+        assert!(PRODUCTION_EXPIRY_RULES.is_empty());
+        assert!(!classify_expiry_evidence(
+            &url,
+            reqwest::StatusCode::FORBIDDEN,
+            evidence,
+            PRODUCTION_EXPIRY_RULES
+        ));
     }
 }
