@@ -7,6 +7,7 @@
 pub mod account_lease_repository;
 pub mod article_repository;
 pub mod asset_repository;
+pub mod config_transfer_repository;
 pub mod credential_repository;
 pub mod feed_cache_repository;
 pub mod feed_token_repository;

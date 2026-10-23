@@ -38,3 +38,7 @@
 pub mod postgres;
 pub mod repositories;
 pub mod unit_of_work;
+
+pub use repositories::config_transfer_repository::{
+    ConfigTransferRepository, ConfigTransferRepositoryError, PostgresConfigTransferRepository,
+};
