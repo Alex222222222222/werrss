@@ -361,6 +361,9 @@ pub enum AuthServiceError {
     /// Disabled accounts cannot be used or refreshed.
     #[error("account {account_id} is disabled")]
     AccountDisabled { account_id: WeReadAccountId },
+    /// Imported account settings cannot authenticate until credentials are enrolled.
+    #[error("account {account_id} requires credential setup")]
+    SetupRequired { account_id: WeReadAccountId },
     /// Another replica currently owns the refresh lease.
     #[error("account {account_id} is busy")]
     AccountBusy { account_id: WeReadAccountId },
@@ -444,7 +447,7 @@ where
             .await?;
         tracing::info!(
             account_id = %record.account().account_id(),
-            access_expires_at = %record.account().access_expires_at(),
+            access_expires_at = ?record.account().access_expires_at(),
             "WeRead account credentials provisioned"
         );
         Ok(record.account().clone())
@@ -537,6 +540,9 @@ where
     ) -> Result<WeReadCredentials, AuthServiceError> {
         tracing::trace!(account_id = %account_id, "loading WeRead credentials for acquisition");
         let record = self.load(account_id).await?;
+        if record.account().setup_required() {
+            return Err(AuthServiceError::SetupRequired { account_id });
+        }
         if record.account().disabled() {
             return Err(AuthServiceError::AccountDisabled { account_id });
         }
@@ -578,6 +584,22 @@ where
                 .cipher
                 .encrypt(provision.account_id, &provision.credentials)?;
             lease.ensure_usable().map_err(AuthServiceError::Lease)?;
+            if current.account().setup_required() {
+                return Ok(self
+                    .dependencies
+                    .accounts
+                    .enroll_placeholder(
+                        provision.account_id,
+                        &provision.display_name,
+                        &ciphertext,
+                        provision.credentials.access_expires_at(),
+                        lease.owner(),
+                        lease.token(),
+                    )
+                    .await?
+                    .account()
+                    .clone());
+            }
             let updated = self
                 .dependencies
                 .accounts
@@ -601,7 +623,7 @@ where
         match &result {
             Ok(account) => tracing::info!(
                 account_id = %account.account_id(),
-                access_expires_at = %account.access_expires_at(),
+                access_expires_at = ?account.access_expires_at(),
                 "WeRead account credentials replaced"
             ),
             Err(error) => tracing::warn!(
@@ -627,6 +649,9 @@ where
     ) -> Result<AuthRefreshOutcome, AuthServiceError> {
         let now = self.dependencies.accounts.database_now().await?;
         let initial = self.load(account_id).await?;
+        if initial.account().setup_required() {
+            return Err(AuthServiceError::SetupRequired { account_id });
+        }
         if initial.account().disabled() {
             return Err(AuthServiceError::AccountDisabled { account_id });
         }
@@ -661,7 +686,7 @@ where
             }
             Ok(AuthRefreshOutcome::Refreshed(account)) => tracing::info!(
                 account_id = %account.account_id(),
-                access_expires_at = %account.access_expires_at(),
+                access_expires_at = ?account.access_expires_at(),
                 "refreshed WeRead credentials"
             ),
             Err(error) => tracing::warn!(
@@ -680,6 +705,9 @@ where
     ) -> Result<AuthRefreshOutcome, AuthServiceError> {
         let now = self.dependencies.accounts.database_now().await?;
         let current = self.load(account_id).await?;
+        if current.account().setup_required() {
+            return Err(AuthServiceError::SetupRequired { account_id });
+        }
         if current.account().disabled() {
             return Err(AuthServiceError::AccountDisabled { account_id });
         }
@@ -731,12 +759,19 @@ where
     }
 
     fn decrypt(&self, record: &CredentialRecord) -> Result<WeReadCredentials, AuthServiceError> {
+        let account_id = record.account().account_id();
+        if record.account().setup_required() {
+            return Err(AuthServiceError::SetupRequired { account_id });
+        }
+        let ciphertext = record
+            .ciphertext()
+            .ok_or(AuthServiceError::SetupRequired { account_id })?;
         let credentials = self
             .dependencies
             .cipher
-            .decrypt(record.account().account_id(), record.ciphertext())
+            .decrypt(account_id, ciphertext)
             .map_err(AuthServiceError::Cipher)?;
-        if credentials.access_expires_at() != record.account().access_expires_at() {
+        if Some(credentials.access_expires_at()) != record.account().access_expires_at() {
             return Err(AuthServiceError::Cipher(
                 CredentialCipherError::InvalidPayload,
             ));
@@ -829,6 +864,7 @@ where
             | Err(AuthServiceError::Refresh(CredentialRefreshError::InvalidResponse))
             | Err(AuthServiceError::AccountNotFound { .. })
             | Err(AuthServiceError::AccountDisabled { .. })
+            | Err(AuthServiceError::SetupRequired { .. })
             | Err(AuthServiceError::Repository(_))
             | Err(AuthServiceError::Cipher(_))
             | Err(AuthServiceError::Credentials(_)) => {
@@ -880,7 +916,10 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
-    use crate::domain::job::{JobType, NewJob};
+    use crate::domain::{
+        credentials::AccountLeaseToken,
+        job::{JobType, NewJob},
+    };
     use crate::persistence::repositories::{
         account_lease_repository::MemoryAccountLeaseRepository,
         credential_repository::{CredentialRepository, MemoryCredentialRepository},
@@ -977,6 +1016,18 @@ mod tests {
             })
         }
 
+        async fn enroll_placeholder(
+            &self,
+            _account_id: WeReadAccountId,
+            _display_name: &str,
+            _ciphertext: &[u8],
+            _access_expires_at: DateTime<Utc>,
+            _lease_owner: &str,
+            _lease_token: AccountLeaseToken,
+        ) -> Result<CredentialRecord, CredentialRepositoryError> {
+            unreachable!("test only exercises replacement conflicts")
+        }
+
         async fn set_disabled(
             &self,
             account_id: WeReadAccountId,
@@ -1069,6 +1120,7 @@ mod tests {
         let stored = accounts.find(account_id()).await.unwrap().unwrap();
         assert!(!stored
             .ciphertext()
+            .expect("enrolled account should have ciphertext")
             .windows("access-old".len())
             .any(|window| window == b"access-old"));
     }
@@ -1100,7 +1152,7 @@ mod tests {
             panic!("expired credentials should be refreshed");
         };
         assert_eq!(account.credential_version(), 2);
-        assert_eq!(account.access_expires_at(), at(3_600));
+        assert_eq!(account.access_expires_at(), Some(at(3_600)));
         assert_eq!(calls.load(Ordering::Relaxed), 1);
         assert_eq!(*received.lock().await, Some("refresh-old".to_owned()));
         assert!(leases
@@ -1396,7 +1448,7 @@ mod tests {
         let account = service.account(account_id()).await.unwrap();
         assert_eq!(account.display_name(), "primary");
         assert_eq!(account.credential_version(), 1);
-        assert_eq!(account.access_expires_at(), at(3_600));
+        assert_eq!(account.access_expires_at(), Some(at(3_600)));
         assert!(matches!(
             service
                 .account(WeReadAccountId::from_uuid(Uuid::from_u128(99)))

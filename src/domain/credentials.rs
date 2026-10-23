@@ -167,8 +167,9 @@ pub struct WeReadAccount {
     account_id: WeReadAccountId,
     display_name: String,
     credential_version: i64,
-    access_expires_at: DateTime<Utc>,
+    access_expires_at: Option<DateTime<Utc>>,
     disabled: bool,
+    setup_required: bool,
 }
 
 impl WeReadAccount {
@@ -177,8 +178,9 @@ impl WeReadAccount {
         account_id: WeReadAccountId,
         display_name: String,
         credential_version: i64,
-        access_expires_at: DateTime<Utc>,
+        access_expires_at: Option<DateTime<Utc>>,
         disabled: bool,
+        setup_required: bool,
     ) -> Self {
         Self {
             account_id,
@@ -186,6 +188,7 @@ impl WeReadAccount {
             credential_version,
             access_expires_at,
             disabled,
+            setup_required,
         }
     }
 
@@ -201,9 +204,13 @@ impl WeReadAccount {
     pub const fn credential_version(&self) -> i64 {
         self.credential_version
     }
-    /// Returns the access-token expiry.
-    pub const fn access_expires_at(&self) -> DateTime<Utc> {
+    /// Returns the access-token expiry, if credentials are enrolled.
+    pub const fn access_expires_at(&self) -> Option<DateTime<Utc>> {
         self.access_expires_at
+    }
+    /// Reports whether account credentials still require setup.
+    pub const fn setup_required(&self) -> bool {
+        self.setup_required
     }
     /// Reports whether this account is disabled.
     pub const fn disabled(&self) -> bool {

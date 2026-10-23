@@ -538,12 +538,23 @@ pub fn weread_account_page(
     let csrf_json = serde_json::to_string(&csrf).expect("escaped CSRF token should serialize");
     let account_id = account.account_id().to_string();
     let display_name = escape_html(account.display_name());
-    let expires_at = escape_html(&account.access_expires_at().to_rfc3339());
-    let status = if account.disabled() {
+    let expires_at = account
+        .access_expires_at()
+        .map(|value| escape_html(&value.to_rfc3339()))
+        .unwrap_or_default();
+    let status = if account.setup_required() {
+        "setup_required"
+    } else if account.disabled() {
         "disabled"
     } else {
         "active"
     };
+    let status_class = if account.setup_required() {
+        "warning"
+    } else {
+        status
+    };
+    let setup_required = account.setup_required();
     let (toggle_key, toggle_text) = if account.disabled() {
         ("account.enable_account", "Enable")
     } else {
@@ -554,7 +565,7 @@ pub fn weread_account_page(
 <body><header class="site-header"><div class="header-inner"><a class="brand" href="/admin/"><span class="brand-mark" aria-hidden="true">W</span><span class="brand-copy">Werrss<small data-i18n="app.admin_console">Admin console</small></span></a><div class="header-actions"><span class="identity"><span data-i18n="nav.signed_in_as">Signed in as</span> <strong>__USERNAME__</strong></span><a class="button button-quiet" href="/admin/weread/accounts" data-i18n="nav.accounts">Accounts</a>__LOCALE_PICKER__</div></div></header><main class="page-shell"><nav class="breadcrumb" data-i18n-aria-label="common.breadcrumb" aria-label="Breadcrumb"><a href="/admin/" data-i18n="nav.dashboard">Dashboard</a><span>/</span><a href="/admin/weread/accounts" data-i18n="account.list_heading">WeRead accounts</a><span>/</span><span data-i18n="nav.manage_account">Manage account</span></nav><section class="page-header"><div><p class="kicker" data-i18n="account.credential_settings_kicker">Credential settings</p><h1 data-i18n="account.manage_heading">Manage WeRead account</h1><p data-i18n="account.manage_description">Rotate the browser session or update its display name.</p></div><span class="status-chip __STATUS_CLASS__" data-i18n="status.__STATUS__">__STATUS__</span></section><div class="split-panel"><section class="card"><div class="card-header"><div><h2 data-i18n="account.details">Account details</h2><p><span data-i18n="account.id">Account ID</span> <code>__ACCOUNT_ID__</code></p></div><span class="card-icon green" aria-hidden="true">W</span></div><div class="notice info"><span class="notice-icon" aria-hidden="true">i</span><span data-i18n="account.rotation_notice">For security, the stored cookie is never displayed. Paste a complete fresh Cookie request-header value when rotating credentials.</span></div><form id="account"><label><span class="label-row"><span data-i18n="account.display_name">Display name</span><span class="label-hint" data-i18n="account.display_name_hint">Optional when wr_name is present</span></span><input name="display_name" value="__DISPLAY_NAME__"><span class="small" data-i18n="account.display_name_help">You may leave this blank if the cookie contains a usable <code>wr_name</code>.</span></label><label><span data-i18n="account.new_cookie_header">New WeRead Cookie header</span><textarea name="cookie_header" rows="7" required autocomplete="off" data-i18n-placeholder="account.cookie_placeholder" placeholder="wr_vid=…; wr_skey=…; wr_rt=…"></textarea></label><label><span data-i18n="account.access_expiry">Access token expiry</span><input id="expiry" name="access_expires_at" type="datetime-local" data-value="__EXPIRES_AT__" required></label><div class="form-actions"><a class="button button-quiet" href="/admin/weread/accounts" data-i18n="action.cancel">Cancel</a><button class="button-primary" type="submit" data-i18n="action.save_changes">Save changes</button></div></form><p id="result" class="feedback" role="status" hidden></p></section><aside class="side-stack"><section class="card"><div class="card-header"><div><h2 data-i18n="account.account_status">Account status</h2><p data-i18n="account.disabled_help">Disabled accounts are skipped by random selection.</p></div><span class="card-icon orange" aria-hidden="true">●</span></div><button id="toggle" class="button-secondary" type="button" data-i18n="account.__TOGGLE__">__TOGGLE__ account</button></section><section class="card danger-zone"><div class="card-header"><div><h2 data-i18n="source.danger_zone">Danger zone</h2><p data-i18n="account.delete_description">Deleting removes the stored credentials permanently.</p></div><span class="card-icon red" aria-hidden="true">!</span></div><button id="delete" class="button-danger" type="button" data-i18n="action.delete_account">Delete account</button></section></aside></div></main>
 <script>
 __I18N__
-const accountId='__ACCOUNT_ID__';const csrf=__CSRF__;const headers={'content-type':'application/json','x-csrf-token':csrf};const result=document.querySelector('#result');document.querySelector('#expiry').value=new Date(document.querySelector('#expiry').dataset.value).toISOString().slice(0,16);
+const accountId='__ACCOUNT_ID__';const csrf=__CSRF__;const headers={'content-type':'application/json','x-csrf-token':csrf};const result=document.querySelector('#result');const expiry=document.querySelector('#expiry');if(expiry.dataset.value){expiry.value=new Date(expiry.dataset.value).toISOString().slice(0,16)};
 const request=(path,options={})=>fetch(path,{...options,headers:{...headers,...(options.headers||{})}});
 async function apiErrorMessage(response,fallback){try{const value=await response.json();if(typeof value.error==='string'&&value.error.trim()){return value.error}}catch{}return t(fallback)}
 async function runControlAction(control,action,fallback){control.disabled=true;try{const response=await action();if(response.ok){return true}result.textContent=await apiErrorMessage(response,fallback)}catch{result.textContent=t('common.unreachable')}finally{control.disabled=false}result.className='feedback error';result.hidden=false;return false}
@@ -569,9 +580,25 @@ document.querySelector('#delete').addEventListener('click',async()=>{if(!confirm
             .replace("__USERNAME__", &username)
             .replace("__ACCOUNT_ID__", &account_id)
             .replace("__STATUS__", status)
-            .replace("__STATUS_CLASS__", status)
+            .replace("__STATUS_CLASS__", status_class)
             .replace("__DISPLAY_NAME__", &display_name)
             .replace("__EXPIRES_AT__", &expires_at)
+            .replace(
+                "<span class=\"notice-icon\" aria-hidden=\"true\">i</span><span data-i18n=\"account.rotation_notice\">For security, the stored cookie is never displayed. Paste a complete fresh Cookie request-header value when rotating credentials.</span>",
+                if setup_required {
+                    "<span class=\"notice-icon\" aria-hidden=\"true\">i</span><span data-i18n=\"account.setup_required_notice\">This account needs WeRead credentials before it can be used. Enroll a fresh cookie header below.</span>"
+                } else {
+                    "<span class=\"notice-icon\" aria-hidden=\"true\">i</span><span data-i18n=\"account.rotation_notice\">For security, the stored cookie is never displayed. Paste a complete fresh Cookie request-header value when rotating credentials.</span>"
+                },
+            )
+            .replace(
+                "data-i18n=\"account.manage_description\">Rotate the browser session or update its display name.",
+                if setup_required {
+                    "data-i18n=\"account.setup_required_manage_description\">Enroll credentials to activate this account."
+                } else {
+                    "data-i18n=\"account.manage_description\">Rotate the browser session or update its display name."
+                },
+            )
             .replace(
                 r#"<span class="small" data-i18n="account.display_name_help">You may leave this blank if the cookie contains a usable <code>wr_name</code>.</span>"#,
                 r#"<span class="small"><span data-i18n="account.display_name_help_before">You may leave this blank if the cookie contains a usable </span><code>wr_name</code><span data-i18n="account.display_name_help_after">.</span></span>"#,
@@ -780,12 +807,34 @@ mod tests {
     }
 
     #[test]
+    fn setup_required_account_page_shows_enrollment_form_without_expiry_value() {
+        let account = WeReadAccount::from_parts(
+            crate::domain::credentials::WeReadAccountId::from_uuid(uuid::Uuid::from_u128(2)),
+            "Imported".to_owned(),
+            1,
+            None,
+            false,
+            true,
+        );
+        let body = weread_account_page(&session(), &account, Locale::English).0;
+
+        assert!(body.contains("data-i18n=\"status.setup_required\">setup_required</span>"));
+        assert!(body.contains("data-i18n=\"account.setup_required_notice\">"));
+        assert!(body.contains("id=\"expiry\" name=\"access_expires_at\" type=\"datetime-local\" data-value=\"\" required"));
+        assert!(
+            body.contains("if(expiry.dataset.value){expiry.value=new Date(expiry.dataset.value)")
+        );
+        assert!(!body.contains("access_expires_at\">"));
+    }
+
+    #[test]
     fn account_page_restores_lifecycle_controls_after_request_failures() {
         let account = WeReadAccount::from_parts(
             crate::domain::credentials::WeReadAccountId::from_uuid(uuid::Uuid::from_u128(1)),
             "Primary".to_owned(),
             2,
-            "2026-10-01T00:00:00Z".parse().unwrap(),
+            Some("2026-10-01T00:00:00Z".parse().unwrap()),
+            false,
             false,
         );
         let body = weread_account_page(&session(), &account, Locale::English).0;
@@ -802,7 +851,8 @@ mod tests {
             crate::domain::credentials::WeReadAccountId::from_uuid(uuid::Uuid::from_u128(1)),
             "Primary".to_owned(),
             2,
-            "2026-10-01T00:00:00Z".parse().unwrap(),
+            Some("2026-10-01T00:00:00Z".parse().unwrap()),
+            false,
             false,
         );
         let body = weread_account_page(&session(), &account, Locale::English).0;
@@ -821,8 +871,9 @@ mod tests {
             crate::domain::credentials::WeReadAccountId::from_uuid(uuid::Uuid::from_u128(1)),
             "Primary".to_owned(),
             2,
-            "2026-10-01T00:00:00Z".parse().unwrap(),
+            Some("2026-10-01T00:00:00Z".parse().unwrap()),
             true,
+            false,
         );
         let body = weread_account_page(&session(), &account, Locale::Chinese).0;
 
@@ -836,7 +887,8 @@ mod tests {
             crate::domain::credentials::WeReadAccountId::from_uuid(uuid::Uuid::from_u128(1)),
             "Primary".to_owned(),
             2,
-            "2026-10-01T00:00:00Z".parse().unwrap(),
+            Some("2026-10-01T00:00:00Z".parse().unwrap()),
+            false,
             false,
         );
         let body = weread_account_page(&session(), &account, Locale::French).0;

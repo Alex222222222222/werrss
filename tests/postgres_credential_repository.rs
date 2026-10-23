@@ -1,3 +1,8 @@
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
+
 use chrono::{TimeZone, Utc};
 use secrecy::SecretString;
 use sqlx::PgPool;
@@ -10,7 +15,8 @@ use werrss::persistence::repositories::credential_repository::{
 use werrss::{
     application::auth_service::{
         AuthRefreshOutcome, AuthService, AuthServiceConfig, AuthServiceDependencies,
-        CredentialProvision, CredentialRefresher, RefreshedCredentials, RingCredentialCipher,
+        AuthServiceError, CredentialCipher, CredentialCipherError, CredentialProvision,
+        CredentialRefresher, ManualCredentialRefresher, RefreshedCredentials, RingCredentialCipher,
     },
     application::source_sync_acquirer::{
         CredentialRepositoryAccountSelector, WeReadAccountSelector,
@@ -29,6 +35,69 @@ fn at(seconds: i64) -> chrono::DateTime<Utc> {
 
 fn account_id() -> WeReadAccountId {
     WeReadAccountId::from_uuid(Uuid::new_v4())
+}
+
+#[derive(Clone, Default)]
+struct PanicCipher(Arc<AtomicUsize>);
+
+impl CredentialCipher for PanicCipher {
+    fn encrypt(
+        &self,
+        _account_id: WeReadAccountId,
+        _credentials: &WeReadCredentials,
+    ) -> Result<Vec<u8>, CredentialCipherError> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        panic!("placeholder auth path must not encrypt before loading the placeholder")
+    }
+
+    fn decrypt(
+        &self,
+        _account_id: WeReadAccountId,
+        _ciphertext: &[u8],
+    ) -> Result<WeReadCredentials, CredentialCipherError> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        panic!("setup-required credentials must never reach the cipher")
+    }
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn setup_required_auth_lookup_returns_safe_metadata_without_cipher_calls(pool: PgPool) {
+    let account_id = account_id();
+    seed_placeholder(&pool, account_id).await;
+    let cipher = PanicCipher::default();
+    let calls = cipher.0.clone();
+    let service = AuthService::new(
+        AuthServiceDependencies {
+            accounts: PostgresCredentialRepository::new(pool.clone()),
+            leases: PostgresAccountLeaseRepository::new(pool.clone()),
+            refresher: ManualCredentialRefresher,
+            cipher,
+        },
+        AuthServiceConfig::new(
+            chrono::Duration::seconds(30),
+            chrono::Duration::seconds(30),
+            chrono::Duration::seconds(5),
+        )
+        .unwrap(),
+    );
+    let account = service
+        .account(account_id)
+        .await
+        .expect("placeholder lookup should return metadata");
+    assert!(account.setup_required());
+    assert_eq!(account.access_expires_at(), None);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert!(matches!(
+        service.credentials(account_id).await,
+        Err(AuthServiceError::SetupRequired { account_id: required }) if required == account_id
+    ));
+    assert!(matches!(
+        service
+            .refresh_if_needed(account_id, "placeholder-auth-test")
+            .await,
+        Err(AuthServiceError::SetupRequired { account_id: required }) if required == account_id
+    ));
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
 }
 
 #[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
@@ -90,7 +159,7 @@ async fn encrypted_account_rows_support_versioned_replacement(pool: PgPool) {
         .await
         .expect("account should be inserted");
     assert_eq!(inserted.account().credential_version(), 1);
-    assert_eq!(inserted.ciphertext(), b"ciphertext-v1");
+    assert_eq!(inserted.ciphertext(), Some(b"ciphertext-v1".as_slice()));
 
     let raw: Vec<u8> = sqlx::query_scalar(
         "SELECT credentials_ciphertext FROM weread_accounts WHERE account_id = $1",
@@ -119,7 +188,7 @@ async fn encrypted_account_rows_support_versioned_replacement(pool: PgPool) {
         .await
         .expect("the expected version should replace credentials");
     assert_eq!(replaced.account().credential_version(), 2);
-    assert_eq!(replaced.account().access_expires_at(), at(7_200));
+    assert_eq!(replaced.account().access_expires_at(), Some(at(7_200)));
     assert!(matches!(
         repository
             .replace(CredentialReplacement {
@@ -192,7 +261,10 @@ async fn credential_replacement_rejects_a_stale_account_lease(pool: PgPool) {
         })
         .await
         .expect("current lease should fence the replacement");
-    assert_eq!(updated.ciphertext(), b"current-worker-write");
+    assert_eq!(
+        updated.ciphertext(),
+        Some(b"current-worker-write".as_slice())
+    );
     leases
         .release(account_id, "new-worker", current.token())
         .await
@@ -436,5 +508,351 @@ async fn auth_refresh_round_trips_through_postgres_without_plaintext_storage(poo
         .await
         .expect("reloading account should work")
         .expect("account should exist");
-    assert!(reloaded.account().access_expires_at() > Utc::now() + chrono::Duration::minutes(30));
+    assert!(reloaded
+        .account()
+        .access_expires_at()
+        .is_some_and(|expires| expires > Utc::now() + chrono::Duration::minutes(30)));
+}
+
+async fn seed_placeholder(pool: &PgPool, account_id: WeReadAccountId) {
+    sqlx::query(
+        "INSERT INTO weread_accounts (account_id, display_name, credentials_ciphertext, access_expires_at, setup_required, disabled) VALUES ($1, $2, NULL, NULL, TRUE, FALSE)",
+    )
+    .bind(account_id.as_uuid())
+    .bind("Imported account")
+    .execute(pool)
+    .await
+    .expect("setup-required account should be seeded");
+}
+
+async fn seed_disabled_placeholder(pool: &PgPool, account_id: WeReadAccountId) {
+    sqlx::query("INSERT INTO weread_accounts (account_id, display_name, credentials_ciphertext, access_expires_at, setup_required, disabled) VALUES ($1, $2, NULL, NULL, TRUE, TRUE)")
+        .bind(account_id.as_uuid())
+        .bind("Imported account")
+        .execute(pool)
+        .await
+        .expect("disabled setup-required account should be seeded");
+}
+
+#[derive(Debug, PartialEq, Eq, sqlx::FromRow)]
+struct SourceScheduleState {
+    scheduling_gate: String,
+    next_fetch_at: chrono::DateTime<Utc>,
+    failure_cooldown_until: Option<chrono::DateTime<Utc>>,
+    schedule_reserved_until: Option<chrono::DateTime<Utc>>,
+}
+
+async fn seed_bound_source(pool: &PgPool, account_id: WeReadAccountId, gate: &str) -> Uuid {
+    let source_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO sources (id, book_id, display_name, account_id, scheduling_gate, next_fetch_at, failure_cooldown_until, schedule_reserved_until) VALUES ($1, $2, $3, $4, $5, clock_timestamp() - interval '1 hour', clock_timestamp() + interval '1 hour', clock_timestamp() + interval '1 hour')",
+    )
+    .bind(source_id)
+    .bind(format!("book-{}", source_id))
+    .bind("Bound source")
+    .bind(account_id.as_uuid())
+    .bind(gate)
+    .execute(pool)
+    .await
+    .expect("bound source should be seeded");
+    source_id
+}
+
+async fn enroll_placeholder(
+    pool: &PgPool,
+    account_id: WeReadAccountId,
+) -> Result<
+    werrss::persistence::repositories::credential_repository::CredentialRecord,
+    CredentialRepositoryError,
+> {
+    let leases = PostgresAccountLeaseRepository::new(pool.clone());
+    let lease = leases
+        .acquire(account_id, "placeholder-test", chrono::Duration::minutes(5))
+        .await
+        .expect("lease acquisition should succeed")
+        .expect("test should own the account lease");
+    let repository = PostgresCredentialRepository::new(pool.clone());
+    let result = repository
+        .enroll_placeholder(
+            account_id,
+            "Enrolled account",
+            b"encrypted-payload",
+            at(7_200),
+            "placeholder-test",
+            lease.token(),
+        )
+        .await;
+    leases
+        .release(account_id, "placeholder-test", lease.token())
+        .await
+        .expect("test lease should be released");
+    result
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn setup_required_rows_are_visible_to_admin_but_never_selected_at_runtime(pool: PgPool) {
+    let account_id = account_id();
+    seed_placeholder(&pool, account_id).await;
+    let repository = PostgresCredentialRepository::new(pool.clone());
+
+    let record = repository
+        .find(account_id)
+        .await
+        .expect("placeholder lookup should succeed")
+        .expect("placeholder should be visible");
+    assert!(record.account().setup_required());
+    assert_eq!(record.account().access_expires_at(), None);
+    assert_eq!(record.ciphertext(), None);
+    assert_eq!(repository.list_all().await.unwrap().len(), 1);
+    assert!(repository.list().await.unwrap().is_empty());
+
+    let selector = CredentialRepositoryAccountSelector::new(repository);
+    assert_eq!(
+        selector.select_account(Some(account_id)).await.unwrap(),
+        None
+    );
+    assert_eq!(selector.select_account(None).await.unwrap(), None);
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn enrolling_enabled_placeholder_resumes_only_authentication_gated_sources(pool: PgPool) {
+    let account_id = account_id();
+    seed_placeholder(&pool, account_id).await;
+    let auth_source = seed_bound_source(&pool, account_id, "authentication_required").await;
+    let risk_source = seed_bound_source(&pool, account_id, "risk_controlled").await;
+
+    let enrolled = enroll_placeholder(&pool, account_id)
+        .await
+        .expect("a valid live lease should enroll the placeholder");
+    assert!(!enrolled.account().setup_required());
+    assert_eq!(enrolled.account().access_expires_at(), Some(at(7_200)));
+    assert_eq!(enrolled.ciphertext(), Some(b"encrypted-payload".as_slice()));
+    assert!(!enrolled.account().disabled());
+
+    let auth_schedule: SourceScheduleState = sqlx::query_as("SELECT scheduling_gate, next_fetch_at, failure_cooldown_until, schedule_reserved_until FROM sources WHERE id = $1")
+        .bind(auth_source)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(auth_schedule.scheduling_gate, "ready");
+    assert!(auth_schedule.next_fetch_at <= Utc::now());
+    assert_eq!(auth_schedule.failure_cooldown_until, None);
+    assert_eq!(auth_schedule.schedule_reserved_until, None);
+
+    let risk_schedule: SourceScheduleState = sqlx::query_as("SELECT scheduling_gate, next_fetch_at, failure_cooldown_until, schedule_reserved_until FROM sources WHERE id = $1")
+        .bind(risk_source)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(risk_schedule.scheduling_gate, "risk_controlled");
+    assert!(risk_schedule.failure_cooldown_until.is_some());
+    assert!(risk_schedule.schedule_reserved_until.is_some());
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn enrolling_disabled_placeholder_preserves_preference_and_authentication_gate(pool: PgPool) {
+    let account_id = account_id();
+    seed_disabled_placeholder(&pool, account_id).await;
+    let source_id = seed_bound_source(&pool, account_id, "authentication_required").await;
+
+    let enrolled = enroll_placeholder(&pool, account_id)
+        .await
+        .expect("a valid live lease should enroll the placeholder");
+    assert!(!enrolled.account().setup_required());
+    assert!(enrolled.account().disabled());
+    let (gate, cooldown, reservation): (
+        String,
+        Option<chrono::DateTime<Utc>>,
+        Option<chrono::DateTime<Utc>>,
+    ) = sqlx::query_as("SELECT scheduling_gate, failure_cooldown_until, schedule_reserved_until FROM sources WHERE id = $1")
+        .bind(source_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(gate, "authentication_required");
+    assert!(cooldown.is_some());
+    assert!(reservation.is_some());
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn placeholder_enrollment_rolls_back_if_bound_source_recovery_fails(pool: PgPool) {
+    let account_id = account_id();
+    seed_placeholder(&pool, account_id).await;
+    let source_id = seed_bound_source(&pool, account_id, "authentication_required").await;
+    sqlx::query(
+        "CREATE FUNCTION reject_auth_source_recovery() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF OLD.scheduling_gate = 'authentication_required' AND NEW.scheduling_gate = 'ready' THEN RAISE EXCEPTION 'test source recovery failure'; END IF; RETURN NEW; END; $$",
+    )
+    .execute(&pool)
+    .await
+    .expect("failure trigger should be installed");
+    sqlx::query("CREATE TRIGGER reject_auth_source_recovery BEFORE UPDATE ON sources FOR EACH ROW EXECUTE FUNCTION reject_auth_source_recovery()")
+        .execute(&pool)
+        .await
+        .expect("failure trigger should be installed");
+
+    assert!(enroll_placeholder(&pool, account_id).await.is_err());
+    let repository = PostgresCredentialRepository::new(pool.clone());
+    let account = repository
+        .find(account_id)
+        .await
+        .unwrap()
+        .expect("placeholder should remain present after rollback");
+    assert!(account.account().setup_required());
+    assert_eq!(account.ciphertext(), None);
+    let gate: String = sqlx::query_scalar("SELECT scheduling_gate FROM sources WHERE id = $1")
+        .bind(source_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(gate, "authentication_required");
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn placeholder_enrollment_cannot_overwrite_an_enrolled_account(pool: PgPool) {
+    let account_id = account_id();
+    let repository = PostgresCredentialRepository::new(pool.clone());
+    let original = repository
+        .insert(account_id, "Original", b"original-ciphertext", at(3_600))
+        .await
+        .expect("enrolled account should be inserted");
+    let leases = PostgresAccountLeaseRepository::new(pool.clone());
+    let lease = leases
+        .acquire(account_id, "placeholder-test", chrono::Duration::minutes(5))
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert!(matches!(
+        repository
+            .enroll_placeholder(
+                account_id,
+                "Overwritten",
+                b"replacement-ciphertext",
+                at(7_200),
+                "placeholder-test",
+                lease.token(),
+            )
+            .await,
+        Err(CredentialRepositoryError::Conflict { account_id: conflict }) if conflict == account_id
+    ));
+    let reloaded = repository.find(account_id).await.unwrap().unwrap();
+    assert_eq!(reloaded, original);
+    assert_eq!(
+        reloaded.ciphertext(),
+        Some(b"original-ciphertext".as_slice())
+    );
+    leases
+        .release(account_id, "placeholder-test", lease.token())
+        .await
+        .unwrap();
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn placeholder_enrollment_rejects_a_stale_account_lease(pool: PgPool) {
+    let account_id = account_id();
+    seed_placeholder(&pool, account_id).await;
+    let leases = PostgresAccountLeaseRepository::new(pool.clone());
+    let stale = leases
+        .acquire(account_id, "old-enrollment", chrono::Duration::minutes(5))
+        .await
+        .unwrap()
+        .unwrap();
+    sqlx::query("UPDATE account_leases SET lease_until = clock_timestamp() - interval '1 second' WHERE account_id = $1")
+        .bind(account_id.as_uuid())
+        .execute(&pool)
+        .await
+        .unwrap();
+    let current = leases
+        .acquire(account_id, "new-enrollment", chrono::Duration::minutes(5))
+        .await
+        .unwrap()
+        .unwrap();
+    let repository = PostgresCredentialRepository::new(pool.clone());
+
+    assert!(matches!(
+        repository
+            .enroll_placeholder(
+                account_id,
+                "Stale enrollment",
+                b"stale-ciphertext",
+                at(7_200),
+                "old-enrollment",
+                stale.token(),
+            )
+            .await,
+        Err(CredentialRepositoryError::Conflict { account_id: conflict }) if conflict == account_id
+    ));
+    let record = repository.find(account_id).await.unwrap().unwrap();
+    assert!(record.account().setup_required());
+    assert_eq!(record.ciphertext(), None);
+    leases
+        .release(account_id, "new-enrollment", current.token())
+        .await
+        .unwrap();
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn disabling_account_does_not_change_bound_source_scheduling(pool: PgPool) {
+    let repository = PostgresCredentialRepository::new(pool.clone());
+    let account_id = account_id();
+    repository
+        .insert(account_id, "Enabled", b"ciphertext", at(3_600))
+        .await
+        .unwrap();
+    let source_id = seed_bound_source(&pool, account_id, "authentication_required").await;
+    let before: SourceScheduleState = sqlx::query_as(
+        "SELECT scheduling_gate, next_fetch_at, failure_cooldown_until, schedule_reserved_until FROM sources WHERE id = $1",
+    )
+    .bind(source_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    repository.set_disabled(account_id, true).await.unwrap();
+
+    let after: SourceScheduleState = sqlx::query_as(
+        "SELECT scheduling_gate, next_fetch_at, failure_cooldown_until, schedule_reserved_until FROM sources WHERE id = $1",
+    )
+    .bind(source_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(after, before);
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn reenabling_account_resumes_only_authentication_gated_bound_sources(pool: PgPool) {
+    let repository = PostgresCredentialRepository::new(pool.clone());
+    let account_id = account_id();
+    repository
+        .insert(account_id, "Disabled", b"ciphertext", at(3_600))
+        .await
+        .unwrap();
+    repository.set_disabled(account_id, true).await.unwrap();
+    repository.set_disabled(account_id, true).await.unwrap();
+    let auth_source = seed_bound_source(&pool, account_id, "authentication_required").await;
+    let risk_source = seed_bound_source(&pool, account_id, "risk_controlled").await;
+
+    let enabled = repository
+        .set_disabled(account_id, false)
+        .await
+        .expect("account should be enabled");
+    assert!(!enabled.account().disabled());
+    let auth_schedule: SourceScheduleState = sqlx::query_as("SELECT scheduling_gate, next_fetch_at, failure_cooldown_until, schedule_reserved_until FROM sources WHERE id = $1")
+        .bind(auth_source)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(auth_schedule.scheduling_gate, "ready");
+    assert!(auth_schedule.next_fetch_at <= Utc::now());
+    assert_eq!(auth_schedule.failure_cooldown_until, None);
+    assert_eq!(auth_schedule.schedule_reserved_until, None);
+    let risk_schedule: SourceScheduleState = sqlx::query_as("SELECT scheduling_gate, next_fetch_at, failure_cooldown_until, schedule_reserved_until FROM sources WHERE id = $1")
+        .bind(risk_source)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(risk_schedule.scheduling_gate, "risk_controlled");
+    assert!(risk_schedule.failure_cooldown_until.is_some());
+    assert!(risk_schedule.schedule_reserved_until.is_some());
 }

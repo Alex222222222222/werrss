@@ -64,6 +64,94 @@ use werrss::{
 };
 
 #[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn admin_placeholder_account_is_visible_and_can_be_enrolled_manually(pool: PgPool) {
+    let app = admin_app(&pool);
+    let (cookie, csrf) = admin_session(&app).await;
+    let account_id = Uuid::new_v4();
+    sqlx::query("INSERT INTO weread_accounts (account_id, display_name, credentials_ciphertext, access_expires_at, setup_required) VALUES ($1, $2, NULL, NULL, TRUE)")
+        .bind(account_id)
+        .bind("Imported config")
+        .execute(&pool)
+        .await
+        .expect("setup-required account should be seeded");
+
+    let accounts = app
+        .clone()
+        .oneshot(admin_request(
+            "/api/admin/weread/accounts",
+            &cookie,
+            None,
+            None,
+        ))
+        .await
+        .expect("account list request should complete");
+    let body = to_bytes(accounts.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+        serde_json::json!([{
+            "account_id": account_id,
+            "display_name": "Imported config",
+            "status": "setup_required"
+        }])
+    );
+
+    let status = app
+        .clone()
+        .oneshot(admin_request(
+            &format!("/api/admin/weread/accounts/{account_id}"),
+            &cookie,
+            None,
+            None,
+        ))
+        .await
+        .expect("placeholder status request should complete");
+    let status_body = to_bytes(status.into_body(), usize::MAX).await.unwrap();
+    let status: serde_json::Value = serde_json::from_slice(&status_body).unwrap();
+    assert_eq!(status["setup_required"], true);
+    assert!(status.get("access_expires_at").is_none());
+
+    let page = app
+        .clone()
+        .oneshot(admin_request(
+            &format!("/admin/weread/accounts/{account_id}"),
+            &cookie,
+            None,
+            None,
+        ))
+        .await
+        .expect("placeholder setup page should complete");
+    assert_eq!(page.status(), StatusCode::OK);
+    let page = String::from_utf8_lossy(&to_bytes(page.into_body(), usize::MAX).await.unwrap())
+        .into_owned();
+    assert!(page.contains("status.setup_required"));
+    assert!(page.contains("account.setup_required_notice"));
+    assert!(page
+        .contains("name=\"access_expires_at\" type=\"datetime-local\" data-value=\"\" required"));
+
+    let enrollment = app
+        .oneshot(admin_request_with_method(
+            &format!("/api/admin/weread/accounts/{account_id}"),
+            &cookie,
+            Some(&csrf),
+            Some(serde_json::json!({
+                "account_id": account_id,
+                "display_name": "Imported config",
+                "cookie_header": "wr_vid=placeholder-vid; wr_skey=enrolled-access; wr_rt=enrolled-refresh",
+                "access_expires_at": "2099-05-01T00:00:00Z"
+            })),
+            "PUT",
+        ))
+        .await
+        .expect("placeholder enrollment should complete");
+    assert_eq!(enrollment.status(), StatusCode::OK);
+    let body = to_bytes(enrollment.into_body(), usize::MAX).await.unwrap();
+    let response: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(response["setup_required"], false);
+    assert_eq!(response["access_expires_at"], "2099-05-01T00:00:00+00:00");
+    assert!(!String::from_utf8_lossy(&body).contains("enrolled-access"));
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
 async fn admin_login_requires_authentication_and_csrf_for_mutations(pool: PgPool) {
     let app = admin_app(&pool);
     let root = app
@@ -1532,6 +1620,65 @@ async fn admin_qr_login_provisions_a_new_account_without_returning_secrets(pool:
     .expect("QR login should persist an account");
     assert_eq!(stored_name, "QR User");
     assert!(!String::from_utf8_lossy(&ciphertext).contains("qr-access-secret"));
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn admin_qr_login_enrolls_a_matching_setup_required_account(pool: PgPool) {
+    let manager = Arc::new(QrLoginManager::new(TestQrTransport::new(Ok(
+        QrLoginTransportPoll::Authenticated(test_qr_session()),
+    ))));
+    let app = admin_app_with_qr_login(&pool, None, Some(manager));
+    let (cookie, csrf) = admin_session(&app).await;
+    let account_id = Uuid::new_v4();
+    sqlx::query("INSERT INTO weread_accounts (account_id, display_name, credentials_ciphertext, access_expires_at, setup_required, disabled) VALUES ($1, $2, NULL, NULL, TRUE, TRUE)")
+        .bind(account_id)
+        .bind("Imported config")
+        .execute(&pool)
+        .await
+        .expect("setup-required account should be seeded");
+
+    let start = app
+        .clone()
+        .oneshot(admin_request(
+            "/api/admin/weread/qr",
+            &cookie,
+            Some(&csrf),
+            Some(serde_json::json!({"account_id": account_id, "display_name": null})),
+        ))
+        .await
+        .expect("QR start should complete");
+    assert_eq!(start.status(), StatusCode::OK);
+    let start: serde_json::Value =
+        serde_json::from_slice(&to_bytes(start.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let attempt_id = start["attempt_id"].as_str().unwrap();
+
+    let completion = app
+        .oneshot(admin_request(
+            &format!("/api/admin/weread/qr/{attempt_id}"),
+            &cookie,
+            Some(&csrf),
+            None,
+        ))
+        .await
+        .expect("QR placeholder enrollment should complete");
+    assert_eq!(completion.status(), StatusCode::OK);
+    let completion_body = to_bytes(completion.into_body(), usize::MAX).await.unwrap();
+    let completion: serde_json::Value = serde_json::from_slice(&completion_body).unwrap();
+    assert_eq!(completion["account"]["account_id"], account_id.to_string());
+    assert_eq!(completion["account"]["disabled"], true);
+    assert_eq!(completion["account"]["setup_required"], false);
+    assert!(!String::from_utf8_lossy(&completion_body).contains("qr-access-secret"));
+
+    let (setup_required, disabled, ciphertext): (bool, bool, Option<Vec<u8>>) = sqlx::query_as(
+        "SELECT setup_required, disabled, credentials_ciphertext FROM weread_accounts WHERE account_id = $1",
+    )
+    .bind(account_id)
+    .fetch_one(&pool)
+    .await
+    .expect("enrolled account should be stored");
+    assert!(!setup_required);
+    assert!(disabled);
+    assert!(ciphertext.is_some());
 }
 
 #[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]

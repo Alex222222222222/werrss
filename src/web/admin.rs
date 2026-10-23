@@ -290,8 +290,10 @@ struct WeReadAccountResponse {
     account_id: Uuid,
     display_name: String,
     credential_version: i64,
-    access_expires_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    access_expires_at: Option<String>,
     disabled: bool,
+    setup_required: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -498,8 +500,11 @@ impl From<crate::domain::credentials::WeReadAccount> for WeReadAccountResponse {
             account_id: account.account_id().as_uuid(),
             display_name: account.display_name().to_owned(),
             credential_version: account.credential_version(),
-            access_expires_at: account.access_expires_at().to_rfc3339(),
+            access_expires_at: account
+                .access_expires_at()
+                .map(|expires_at| expires_at.to_rfc3339()),
             disabled: account.disabled(),
+            setup_required: account.setup_required(),
         }
     }
 }
@@ -693,9 +698,14 @@ fn weread_account_status(
     account: &crate::domain::credentials::WeReadAccount,
     now: DateTime<Utc>,
 ) -> &'static str {
-    if account.disabled() {
+    if account.setup_required() {
+        "setup_required"
+    } else if account.disabled() {
         "disabled"
-    } else if account.access_expires_at() <= now {
+    } else if account
+        .access_expires_at()
+        .is_some_and(|expires_at| expires_at <= now)
+    {
         "expired"
     } else {
         "active"
@@ -1573,6 +1583,7 @@ fn auth_service_error_response(error: AuthServiceError) -> Response {
             StatusCode::SERVICE_UNAVAILABLE
         }
         AuthServiceError::AccountDisabled { .. }
+        | AuthServiceError::SetupRequired { .. }
         | AuthServiceError::AccountBusy { .. }
         | AuthServiceError::Lease(_)
         | AuthServiceError::Refresh(_) => StatusCode::SERVICE_UNAVAILABLE,
@@ -1802,22 +1813,25 @@ mod tests {
             WeReadAccountId::from_uuid(Uuid::from_u128(1)),
             "active".to_owned(),
             1,
-            now + Duration::hours(1),
+            Some(now + Duration::hours(1)),
+            false,
             false,
         );
         let expired = crate::domain::credentials::WeReadAccount::from_parts(
             WeReadAccountId::from_uuid(Uuid::from_u128(2)),
             "expired".to_owned(),
             1,
-            now,
+            Some(now),
+            false,
             false,
         );
         let disabled = crate::domain::credentials::WeReadAccount::from_parts(
             WeReadAccountId::from_uuid(Uuid::from_u128(3)),
             "disabled".to_owned(),
             1,
-            now + Duration::hours(1),
+            Some(now + Duration::hours(1)),
             true,
+            false,
         );
 
         assert_eq!(weread_account_status(&active, now), "active");

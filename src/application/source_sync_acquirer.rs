@@ -106,7 +106,12 @@ where
 
         let selected = record
             .filter(|record| {
-                !record.account().disabled() && record.account().access_expires_at() > now
+                !record.account().disabled()
+                    && !record.account().setup_required()
+                    && record
+                        .account()
+                        .access_expires_at()
+                        .is_some_and(|expires_at| expires_at > now)
             })
             .map(|record| record.account().account_id());
         tracing::debug!(selected_account_id = ?selected, "resolved requested WeRead account");
@@ -121,7 +126,14 @@ fn choose_random_usable_account<R: rand::Rng + ?Sized>(
 ) -> Option<WeReadAccountId> {
     records
         .into_iter()
-        .filter(|record| !record.account().disabled() && record.account().access_expires_at() > now)
+        .filter(|record| {
+            !record.account().disabled()
+                && !record.account().setup_required()
+                && record
+                    .account()
+                    .access_expires_at()
+                    .is_some_and(|expires_at| expires_at > now)
+        })
         .map(|record| record.account().account_id())
         .choose(rng)
 }
