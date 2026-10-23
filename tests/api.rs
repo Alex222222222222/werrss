@@ -40,6 +40,7 @@ use werrss::{
             account_lease_repository::PostgresAccountLeaseRepository,
             article_repository::PostgresArticleRepository,
             asset_repository::PostgresAssetStore,
+            config_transfer_repository::PostgresConfigTransferRepository,
             credential_repository::PostgresCredentialRepository,
             feed_cache_repository::{
                 FeedBuildLeaseRepository, FeedCachePublishResult, FeedCacheRepository,
@@ -62,6 +63,306 @@ use werrss::{
         auth::AdminAuthenticator,
     },
 };
+
+#[tokio::test]
+async fn config_transfer_requires_authentication_and_csrf() {
+    let pool = PgPoolOptions::new()
+        .connect_lazy("postgres://test:test@127.0.0.1/unused")
+        .expect("lazy PostgreSQL pool should be valid");
+    let app = admin_app(&pool);
+
+    for (method, path) in [
+        (
+            "GET",
+            "/api/admin/config/export?sources=true&weread_accounts=false",
+        ),
+        ("POST", "/api/admin/config/import/preview"),
+        ("POST", "/api/admin/config/import"),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(raw_admin_request(path, None, None, method, b"{}"))
+            .await
+            .expect("unauthenticated request should complete");
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "{method} {path}"
+        );
+    }
+
+    let (cookie, _) = admin_session(&app).await;
+    for csrf in [None, Some("invalid-token")] {
+        for path in [
+            "/api/admin/config/import/preview",
+            "/api/admin/config/import",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(raw_admin_request(path, Some(&cookie), csrf, "POST", b"{}"))
+                .await
+                .expect("CSRF-protected request should complete");
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{path}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn config_export_rejects_empty_section_selection() {
+    let pool = PgPoolOptions::new()
+        .connect_lazy("postgres://test:test@127.0.0.1/unused")
+        .expect("lazy PostgreSQL pool should be valid");
+    let app = admin_app(&pool);
+    let (cookie, _) = admin_session(&app).await;
+    let response = app
+        .oneshot(raw_admin_request(
+            "/api/admin/config/export?sources=false&weread_accounts=false",
+            Some(&cookie),
+            None,
+            "GET",
+            b"",
+        ))
+        .await
+        .expect("invalid export selection should complete");
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[tokio::test]
+async fn config_transfer_rejects_oversized_body_before_json_parsing() {
+    let pool = PgPoolOptions::new()
+        .connect_lazy("postgres://test:test@127.0.0.1/unused")
+        .expect("lazy PostgreSQL pool should be valid");
+    let app = admin_app(&pool);
+    let (cookie, csrf) = admin_session(&app).await;
+    let oversized_invalid_json = vec![b'{'; 2 * 1024 * 1024 + 1];
+
+    for path in [
+        "/api/admin/config/import/preview",
+        "/api/admin/config/import",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(raw_admin_request(
+                path,
+                Some(&cookie),
+                Some(&csrf),
+                "POST",
+                &oversized_invalid_json,
+            ))
+            .await
+            .expect("oversized request should complete");
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE, "{path}");
+    }
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn admin_config_export_honors_section_selection_and_cache_headers(pool: PgPool) {
+    let source_id = insert_source(&pool).await;
+    let account_id = Uuid::new_v4();
+    sqlx::query("INSERT INTO weread_accounts (account_id, display_name, credentials_ciphertext, access_expires_at) VALUES ($1, 'Export account', $2, CURRENT_TIMESTAMP)")
+        .bind(account_id)
+        .bind(b"private-ciphertext".to_vec())
+        .execute(&pool)
+        .await
+        .expect("account should be seeded");
+    let app = admin_app(&pool);
+    let (cookie, _) = admin_session(&app).await;
+
+    let response = app
+        .clone()
+        .oneshot(admin_request(
+            "/api/admin/config/export?sources=true&weread_accounts=false",
+            &cookie,
+            None,
+            None,
+        ))
+        .await
+        .expect("configuration export should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+    assert!(response.headers()[header::CONTENT_DISPOSITION]
+        .to_str()
+        .unwrap()
+        .contains("attachment; filename=\"werrss-config.json\""));
+    assert_eq!(response.headers()[header::CONTENT_TYPE], "application/json");
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let bundle: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(bundle["sources"][0]["id"], source_id.as_uuid().to_string());
+    assert!(bundle.get("weread_accounts").is_none());
+    assert!(!String::from_utf8_lossy(&body).contains("private-ciphertext"));
+
+    let response = app
+        .oneshot(admin_request(
+            "/api/admin/config/export?sources=false&weread_accounts=true",
+            &cookie,
+            None,
+            None,
+        ))
+        .await
+        .expect("account-only configuration export should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let bundle: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(bundle.get("sources").is_none());
+    assert_eq!(
+        bundle["weread_accounts"][0]["account_id"],
+        account_id.to_string()
+    );
+    assert!(bundle["weread_accounts"][0].get("access_token").is_none());
+    assert!(bundle["weread_accounts"][0]
+        .get("credentials_ciphertext")
+        .is_none());
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn admin_config_import_preview_does_not_mutate_database(pool: PgPool) {
+    let app = admin_app(&pool);
+    let (cookie, csrf) = admin_session(&app).await;
+    let source_id = Uuid::new_v4();
+    let before: i64 = sqlx::query_scalar("SELECT count(*) FROM sources")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+    let response = app
+        .oneshot(raw_admin_request(
+            "/api/admin/config/import/preview",
+            Some(&cookie),
+            Some(&csrf),
+            "POST",
+            &valid_config_bundle(source_id, "preview-book")
+                .to_string()
+                .into_bytes(),
+        ))
+        .await
+        .expect("configuration preview should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let preview: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(preview["sources_created"], 1);
+    let after: i64 = sqlx::query_scalar("SELECT count(*) FROM sources")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(after, before);
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn admin_config_import_applies_valid_bundle_without_secrets_in_response(pool: PgPool) {
+    let app = admin_app(&pool);
+    let (cookie, csrf) = admin_session(&app).await;
+    let source_id = Uuid::new_v4();
+    let payload = valid_config_bundle(source_id, "apply-book");
+
+    let response = app
+        .oneshot(raw_admin_request(
+            "/api/admin/config/import",
+            Some(&cookie),
+            Some(&csrf),
+            "POST",
+            &payload.to_string().into_bytes(),
+        ))
+        .await
+        .expect("configuration import should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let result: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(result["sources_created"], 1);
+    assert!(!String::from_utf8_lossy(&body).contains("credential"));
+    let exists: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM sources WHERE id = $1)")
+        .bind(source_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(exists);
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn admin_config_import_returns_safe_conflict_response(pool: PgPool) {
+    let existing_id = insert_source(&pool).await;
+    let existing_book: String = sqlx::query_scalar("SELECT book_id FROM sources WHERE id = $1")
+        .bind(existing_id.as_uuid())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let app = admin_app(&pool);
+    let (cookie, csrf) = admin_session(&app).await;
+    let payload = valid_config_bundle(Uuid::new_v4(), &existing_book);
+
+    let response = app
+        .oneshot(raw_admin_request(
+            "/api/admin/config/import",
+            Some(&cookie),
+            Some(&csrf),
+            "POST",
+            &payload.to_string().into_bytes(),
+        ))
+        .await
+        .expect("conflicting import should complete");
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body = String::from_utf8_lossy(&body);
+    assert!(body.contains("conflict"));
+    assert!(!body.contains("SQL"));
+    assert!(!body.contains("private"));
+}
+
+#[tokio::test]
+async fn admin_config_import_rejects_history_and_secret_fields_safely() {
+    let pool = PgPoolOptions::new()
+        .connect_lazy("postgres://test:test@127.0.0.1/unused")
+        .expect("lazy PostgreSQL pool should be valid");
+    let app = admin_app(&pool);
+    let (cookie, csrf) = admin_session(&app).await;
+    let forbidden = [
+        serde_json::json!({
+            "format": "werrss-config", "version": 1, "exported_at": Utc::now(),
+            "sources": [], "sync_runs": [{"private_history": "history-marker"}]
+        }),
+        serde_json::json!({
+            "format": "werrss-config", "version": 1, "exported_at": Utc::now(),
+            "weread_accounts": [{"account_id": Uuid::new_v4(), "display_name": "Account", "enabled": true, "access_token": "secret-marker"}]
+        }),
+    ];
+    for payload in forbidden {
+        let response = app
+            .clone()
+            .oneshot(raw_admin_request(
+                "/api/admin/config/import/preview",
+                Some(&cookie),
+                Some(&csrf),
+                "POST",
+                &payload.to_string().into_bytes(),
+            ))
+            .await
+            .expect("invalid configuration request should complete");
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert!(!body.contains("secret-marker"));
+        assert!(!body.contains("history-marker"));
+    }
+}
+
+fn valid_config_bundle(source_id: Uuid, book_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "format": "werrss-config",
+        "version": 1,
+        "exported_at": Utc::now(),
+        "sources": [{
+            "id": source_id,
+            "book_id": book_id,
+            "display_name": "Portable source",
+            "article_url": null,
+            "account_id": null,
+            "enabled": true,
+            "sync_interval_seconds": 3600,
+            "rss_item_limit": 20,
+            "priority": 1,
+            "max_attempts": 3
+        }]
+    })
+}
 
 #[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
 async fn admin_placeholder_account_is_visible_and_can_be_enrolled_manually(pool: PgPool) {
@@ -2359,6 +2660,28 @@ fn admin_request_with_method(
     }
 }
 
+fn raw_admin_request(
+    path: &str,
+    cookie: Option<&str>,
+    csrf: Option<&str>,
+    method: &str,
+    body: &[u8],
+) -> Request<Body> {
+    let mut builder = Request::builder()
+        .method(method)
+        .uri(path)
+        .header(header::CONTENT_TYPE, "application/json");
+    if let Some(cookie) = cookie {
+        builder = builder.header(header::COOKIE, cookie);
+    }
+    if let Some(csrf) = csrf {
+        builder = builder.header("x-csrf-token", csrf);
+    }
+    builder
+        .body(Body::from(body.to_vec()))
+        .expect("raw admin request should be valid")
+}
+
 fn admin_app(pool: &PgPool) -> axum::Router {
     admin_app_with_server_root_url(pool, None)
 }
@@ -2384,6 +2707,7 @@ fn admin_app_with_qr_login(
     );
     let feed_tokens = FeedTokenService::new(PostgresFeedTokenRepository::new(pool.clone()));
     let sync_runs = PostgresSyncRunRepository::new(pool.clone());
+    let config_transfer = PostgresConfigTransferRepository::new(pool.clone());
     let weread_auth = AuthService::new(
         AuthServiceDependencies {
             accounts: PostgresCredentialRepository::new(pool.clone()),
@@ -2408,6 +2732,7 @@ fn admin_app_with_qr_login(
             sources,
             feed_tokens,
             sync_runs,
+            config_transfer,
             weread_auth,
             root,
             qr_login,
@@ -2417,6 +2742,7 @@ fn admin_app_with_qr_login(
             sources,
             feed_tokens,
             sync_runs,
+            config_transfer,
             weread_auth,
             root,
         ),

@@ -8,6 +8,7 @@
 use std::{net::SocketAddr, sync::Arc};
 
 use axum::{
+    body::{to_bytes, Body},
     extract::{ConnectInfo, Path, Query, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Redirect, Response},
@@ -28,6 +29,9 @@ use crate::{
             AuthService, AuthServiceError, CredentialProvision, ManualCredentialRefresher,
             RingCredentialCipher,
         },
+        config_transfer::{
+            ConfigExportSelection, ConfigTransferValidationError, ValidatedConfigBundle,
+        },
         feed_token_service::{FeedTokenService, FeedTokenServiceError},
         qr_login::{
             QrAuthenticatedSession, QrLoginError, QrLoginManager, QrLoginPollResult,
@@ -42,6 +46,9 @@ use crate::{
     },
     persistence::repositories::{
         account_lease_repository::PostgresAccountLeaseRepository,
+        config_transfer_repository::{
+            ConfigTransferRepositoryError, PostgresConfigTransferRepository,
+        },
         credential_repository::PostgresCredentialRepository,
         feed_token_repository::{FeedTokenRepositoryError, PostgresFeedTokenRepository},
         source_repository::{PostgresSourceRepository, SourceRepositoryError},
@@ -71,6 +78,7 @@ pub fn admin_router(
     sources: AdminSourceService,
     feed_tokens: AdminTokenService,
     sync_runs: PostgresSyncRunRepository,
+    config_transfer: PostgresConfigTransferRepository,
     weread_auth: AdminAuthService,
 ) -> Router {
     admin_router_with_identity_resolver_and_server_root_url(
@@ -78,6 +86,7 @@ pub fn admin_router(
         sources,
         feed_tokens,
         sync_runs,
+        config_transfer,
         weread_auth,
         Arc::new(UrlArticleIdentityResolver),
         None,
@@ -91,6 +100,7 @@ pub fn admin_router_with_server_root_url(
     sources: AdminSourceService,
     feed_tokens: AdminTokenService,
     sync_runs: PostgresSyncRunRepository,
+    config_transfer: PostgresConfigTransferRepository,
     weread_auth: AdminAuthService,
     server_root_url: Option<url::Url>,
 ) -> Router {
@@ -99,6 +109,7 @@ pub fn admin_router_with_server_root_url(
         sources,
         feed_tokens,
         sync_runs,
+        config_transfer,
         weread_auth,
         Arc::new(UrlArticleIdentityResolver),
         server_root_url,
@@ -112,6 +123,7 @@ pub fn admin_router_with_server_root_url_and_qr_login(
     sources: AdminSourceService,
     feed_tokens: AdminTokenService,
     sync_runs: PostgresSyncRunRepository,
+    config_transfer: PostgresConfigTransferRepository,
     weread_auth: AdminAuthService,
     server_root_url: Option<url::Url>,
     qr_login: Arc<dyn QrLoginService>,
@@ -121,6 +133,7 @@ pub fn admin_router_with_server_root_url_and_qr_login(
         sources,
         feed_tokens,
         sync_runs,
+        config_transfer,
         weread_auth,
         Arc::new(UrlArticleIdentityResolver),
         server_root_url,
@@ -136,6 +149,7 @@ pub fn admin_router_with_identity_resolver(
     sources: AdminSourceService,
     feed_tokens: AdminTokenService,
     sync_runs: PostgresSyncRunRepository,
+    config_transfer: PostgresConfigTransferRepository,
     weread_auth: AdminAuthService,
     identity_resolver: Arc<dyn ArticleIdentityResolver>,
 ) -> Router {
@@ -144,6 +158,7 @@ pub fn admin_router_with_identity_resolver(
         sources,
         feed_tokens,
         sync_runs,
+        config_transfer,
         weread_auth,
         identity_resolver,
         None,
@@ -157,6 +172,7 @@ pub fn admin_router_with_identity_resolver_and_server_root_url(
     sources: AdminSourceService,
     feed_tokens: AdminTokenService,
     sync_runs: PostgresSyncRunRepository,
+    config_transfer: PostgresConfigTransferRepository,
     weread_auth: AdminAuthService,
     identity_resolver: Arc<dyn ArticleIdentityResolver>,
     server_root_url: Option<url::Url>,
@@ -166,6 +182,7 @@ pub fn admin_router_with_identity_resolver_and_server_root_url(
         sources,
         feed_tokens,
         sync_runs,
+        config_transfer,
         weread_auth,
         identity_resolver,
         server_root_url,
@@ -184,6 +201,7 @@ pub fn admin_router_with_identity_resolver_and_server_root_url_and_qr_login(
     sources: AdminSourceService,
     feed_tokens: AdminTokenService,
     sync_runs: PostgresSyncRunRepository,
+    config_transfer: PostgresConfigTransferRepository,
     weread_auth: AdminAuthService,
     identity_resolver: Arc<dyn ArticleIdentityResolver>,
     server_root_url: Option<url::Url>,
@@ -194,6 +212,7 @@ pub fn admin_router_with_identity_resolver_and_server_root_url_and_qr_login(
         sources,
         feed_tokens,
         sync_runs,
+        config_transfer,
         weread_auth,
         identity_resolver,
         server_root_url,
@@ -212,6 +231,12 @@ pub fn admin_router_with_identity_resolver_and_server_root_url_and_qr_login(
         )
         .route("/api/admin/login", post(login))
         .route("/api/admin/logout", post(logout))
+        .route("/api/admin/config/export", get(export_config))
+        .route(
+            "/api/admin/config/import/preview",
+            post(preview_config_import),
+        )
+        .route("/api/admin/config/import", post(apply_config_import))
         .route(
             "/api/admin/weread/accounts",
             get(list_weread_accounts).post(provision_weread_account),
@@ -254,6 +279,7 @@ struct AdminApiState {
     sources: AdminSourceService,
     feed_tokens: AdminTokenService,
     sync_runs: PostgresSyncRunRepository,
+    config_transfer: PostgresConfigTransferRepository,
     weread_auth: AdminAuthService,
     identity_resolver: Arc<dyn ArticleIdentityResolver>,
     server_root_url: Option<url::Url>,
@@ -326,6 +352,134 @@ struct QrLoginStartResponse {
 struct QrLoginCompletionResponse {
     status: QrLoginState,
     account: WeReadAccountResponse,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConfigExportQuery {
+    sources: bool,
+    weread_accounts: bool,
+}
+
+#[tracing::instrument(skip_all, level = "debug")]
+async fn export_config(
+    State(state): State<Arc<AdminApiState>>,
+    query: Result<Query<ConfigExportQuery>, axum::extract::rejection::QueryRejection>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(error) = authenticate(&state.auth, &headers) {
+        return auth_error_response(error);
+    }
+    let Query(query) = match query {
+        Ok(query) => query,
+        Err(_) => return validation_error("invalid configuration export selection"),
+    };
+    let selection = match ConfigExportSelection::new(query.sources, query.weread_accounts) {
+        Ok(selection) => selection,
+        Err(error) => return config_transfer_error_response(error.into()),
+    };
+    match state.config_transfer.export(selection).await {
+        Ok(bundle) => match bundle.serialize_limited() {
+            Ok(bytes) => {
+                tracing::info!(
+                    sources = bundle.sources.as_ref().map_or(0, Vec::len),
+                    weread_accounts = bundle.weread_accounts.as_ref().map_or(0, Vec::len),
+                    "administrator exported configuration"
+                );
+                let mut response = Response::new(Body::from(bytes));
+                *response.status_mut() = StatusCode::OK;
+                response.headers_mut().insert(
+                    header::CONTENT_TYPE,
+                    HeaderValue::from_static("application/json"),
+                );
+                response.headers_mut().insert(
+                    header::CONTENT_DISPOSITION,
+                    HeaderValue::from_static("attachment; filename=\"werrss-config.json\""),
+                );
+                response
+                    .headers_mut()
+                    .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+                response
+            }
+            Err(error) => config_transfer_error_response(error.into()),
+        },
+        Err(error) => config_transfer_error_response(error),
+    }
+}
+
+#[tracing::instrument(skip_all, level = "debug")]
+async fn preview_config_import(
+    State(state): State<Arc<AdminApiState>>,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    if let Err(response) = protected_mutation(&state, &headers) {
+        return *response;
+    }
+    let bytes = match bounded_config_body(body).await {
+        Ok(bytes) => bytes,
+        Err(response) => return response,
+    };
+    let bundle = match ValidatedConfigBundle::parse_limited(&bytes) {
+        Ok(bundle) => bundle,
+        Err(error) => return config_transfer_error_response(error.into()),
+    };
+    match state.config_transfer.preview(&bundle).await {
+        Ok(preview) => {
+            tracing::info!(
+                sources = preview.sources_created + preview.sources_updated,
+                accounts = preview.accounts_created + preview.accounts_updated,
+                conflicts = preview.conflicts.len(),
+                "administrator previewed configuration import"
+            );
+            Json(preview).into_response()
+        }
+        Err(error) => config_transfer_error_response(error),
+    }
+}
+
+#[tracing::instrument(skip_all, level = "debug")]
+async fn apply_config_import(
+    State(state): State<Arc<AdminApiState>>,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    let session = match protected_mutation(&state, &headers) {
+        Ok(session) => session,
+        Err(response) => return *response,
+    };
+    let bytes = match bounded_config_body(body).await {
+        Ok(bytes) => bytes,
+        Err(response) => return response,
+    };
+    let bundle = match ValidatedConfigBundle::parse_limited(&bytes) {
+        Ok(bundle) => bundle,
+        Err(error) => return config_transfer_error_response(error.into()),
+    };
+    let source_count = bundle.sources().map_or(0, <[_]>::len);
+    let account_count = bundle.weread_accounts().map_or(0, <[_]>::len);
+    match state.config_transfer.apply(bundle).await {
+        Ok(result) => {
+            tracing::info!(
+                username = %session.username(),
+                sources = source_count,
+                accounts = account_count,
+                "administrator applied configuration import"
+            );
+            Json(result).into_response()
+        }
+        Err(error) => config_transfer_error_response(error),
+    }
+}
+
+async fn bounded_config_body(body: Body) -> Result<axum::body::Bytes, Response> {
+    match to_bytes(body, crate::application::config_transfer::MAX_BUNDLE_BYTES).await {
+        Ok(bytes) => Ok(bytes),
+        Err(_) => Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(json!({ "error": "configuration bundle exceeds the 2 MiB limit" })),
+        )
+            .into_response()),
+    }
 }
 
 #[tracing::instrument(skip_all, level = "debug")]
@@ -1544,6 +1698,36 @@ fn auth_error_response(error: AuthError) -> Response {
     (status, Json(json!({ "error": error.to_string() }))).into_response()
 }
 
+fn config_transfer_error_response(error: ConfigTransferRepositoryError) -> Response {
+    let (status, message) = match error {
+        ConfigTransferRepositoryError::Conflict(conflict) => {
+            tracing::warn!(kind = %conflict.kind, "configuration transfer conflict");
+            (
+                StatusCode::CONFLICT,
+                "configuration conflicts with existing data",
+            )
+        }
+        ConfigTransferRepositoryError::Validation(error) => {
+            let status = match error {
+                ConfigTransferValidationError::PayloadTooLarge { .. } => {
+                    StatusCode::PAYLOAD_TOO_LARGE
+                }
+                _ => StatusCode::UNPROCESSABLE_ENTITY,
+            };
+            tracing::warn!(status = %status, "configuration transfer validation failed");
+            (status, "invalid configuration bundle")
+        }
+        ConfigTransferRepositoryError::Storage(_) => {
+            tracing::warn!("configuration transfer storage operation failed");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "configuration transfer temporarily unavailable",
+            )
+        }
+    };
+    (status, Json(json!({ "error": message }))).into_response()
+}
+
 fn validation_error(message: impl Into<String>) -> Response {
     (
         StatusCode::UNPROCESSABLE_ENTITY,
@@ -1700,6 +1884,21 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr};
 
     use super::*;
+
+    #[tokio::test]
+    async fn config_transfer_storage_errors_are_not_returned_to_admin_clients() {
+        let response = config_transfer_error_response(ConfigTransferRepositoryError::Storage(
+            "postgres://user:password@internal/db private-data".to_owned(),
+        ));
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("error response should be readable");
+        let body = String::from_utf8_lossy(&body);
+        assert!(!body.contains("password"));
+        assert!(!body.contains("private-data"));
+        assert!(body.contains("temporarily unavailable"));
+    }
 
     #[tokio::test]
     async fn storage_errors_are_not_returned_to_admin_clients() {

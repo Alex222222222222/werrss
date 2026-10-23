@@ -42,6 +42,7 @@ use crate::{
             account_lease_repository::PostgresAccountLeaseRepository,
             article_repository::PostgresArticleRepository,
             asset_repository::{PostgresAssetBlobStore, PostgresAssetStore},
+            config_transfer_repository::PostgresConfigTransferRepository,
             credential_repository::PostgresCredentialRepository,
             feed_cache_repository::{
                 PostgresFeedBuildLeaseRepository, PostgresFeedCacheRepository,
@@ -770,6 +771,7 @@ impl RuntimeSupervisor {
             let feed_tokens =
                 FeedTokenService::new(PostgresFeedTokenRepository::new(self.pool.clone()));
             let sync_runs = PostgresSyncRunRepository::new(self.pool.clone());
+            let config_transfer = PostgresConfigTransferRepository::new(self.pool.clone());
             if let Some(browser_pool) = self.browser_pool.clone() {
                 let webdriver = browser_factory(&self.config);
                 let identity_resolver =
@@ -779,6 +781,7 @@ impl RuntimeSupervisor {
                     sources,
                     feed_tokens,
                     sync_runs,
+                    config_transfer,
                     weread_auth,
                     identity_resolver,
                     self.config.server_root_url.clone(),
@@ -789,6 +792,7 @@ impl RuntimeSupervisor {
                     sources,
                     feed_tokens,
                     sync_runs,
+                    config_transfer,
                     weread_auth,
                     self.config.server_root_url.clone(),
                 ));
@@ -1402,7 +1406,12 @@ pub enum RuntimeSupervisorError {
 
 #[cfg(test)]
 mod tests {
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode},
+    };
     use sqlx::postgres::PgPoolOptions;
+    use tower::ServiceExt;
 
     use super::*;
     use crate::{
@@ -1715,6 +1724,49 @@ mod tests {
         };
 
         assert!(plan.credential_refresh_enabled());
+    }
+
+    #[tokio::test]
+    async fn api_router_injects_admin_config_transfer_routes() {
+        let config = AppConfig::from_env_iter([
+            (
+                "DATABASE_URL".to_owned(),
+                "postgres://user:pass@db/feed".to_owned(),
+            ),
+            (
+                "CREDENTIAL_ENCRYPTION_KEY".to_owned(),
+                "runtime-test-key".to_owned(),
+            ),
+            ("APP_ROLES".to_owned(), "api".to_owned()),
+            (
+                "SERVER_ROOT_URL".to_owned(),
+                "https://feeds.example.test".to_owned(),
+            ),
+            ("ADMIN_ENABLED".to_owned(), "true".to_owned()),
+            ("ADMIN_USERNAME".to_owned(), "admin".to_owned()),
+            ("ADMIN_PASSWORD".to_owned(), "test-password".to_owned()),
+            (
+                "SESSION_SIGNING_KEY".to_owned(),
+                "test-signing-key".to_owned(),
+            ),
+        ])
+        .expect("admin runtime configuration should be valid");
+        let supervisor = RuntimeSupervisor::new(config, lazy_pool()).unwrap();
+        let router = supervisor
+            .api_router()
+            .expect("API router should compose")
+            .expect("API role should expose a router");
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/admin/config/export?sources=true&weread_accounts=false")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("admin export route should respond");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
