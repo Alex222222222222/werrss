@@ -58,6 +58,7 @@ use werrss::{
     web::{
         admin::{
             admin_router_with_server_root_url, admin_router_with_server_root_url_and_qr_login,
+            AdminRouterDependencies,
         },
         api::{feed_router, feed_router_with_browser_health_and_assets},
         auth::AdminAuthenticator,
@@ -2725,27 +2726,20 @@ fn admin_app_with_qr_login(
         )
         .expect("test auth configuration should be valid"),
     );
+    let dependencies = AdminRouterDependencies::new(
+        auth,
+        sources,
+        feed_tokens,
+        sync_runs,
+        config_transfer,
+        weread_auth,
+    );
     let root = root.map(|value| value.parse().expect("test server root URL should parse"));
     let router = match qr_login {
-        Some(qr_login) => admin_router_with_server_root_url_and_qr_login(
-            auth,
-            sources,
-            feed_tokens,
-            sync_runs,
-            config_transfer,
-            weread_auth,
-            root,
-            qr_login,
-        ),
-        None => admin_router_with_server_root_url(
-            auth,
-            sources,
-            feed_tokens,
-            sync_runs,
-            config_transfer,
-            weread_auth,
-            root,
-        ),
+        Some(qr_login) => {
+            admin_router_with_server_root_url_and_qr_login(dependencies, root, qr_login)
+        }
+        None => admin_router_with_server_root_url(dependencies, root),
     };
     router.layer(Extension(ConnectInfo(std::net::SocketAddr::from((
         [127, 0, 0, 1],

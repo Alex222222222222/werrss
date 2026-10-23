@@ -63,7 +63,7 @@ use crate::{
     web::{
         admin::{
             admin_router_with_identity_resolver_and_server_root_url,
-            admin_router_with_server_root_url,
+            admin_router_with_server_root_url, AdminRouterDependencies,
         },
         api::feed_router_with_browser_health_and_assets,
         auth::AdminAuthenticator,
@@ -772,28 +772,26 @@ impl RuntimeSupervisor {
                 FeedTokenService::new(PostgresFeedTokenRepository::new(self.pool.clone()));
             let sync_runs = PostgresSyncRunRepository::new(self.pool.clone());
             let config_transfer = PostgresConfigTransferRepository::new(self.pool.clone());
+            let dependencies = AdminRouterDependencies::new(
+                auth,
+                sources,
+                feed_tokens,
+                sync_runs,
+                config_transfer,
+                weread_auth,
+            );
             if let Some(browser_pool) = self.browser_pool.clone() {
                 let webdriver = browser_factory(&self.config);
                 let identity_resolver =
                     Arc::new(BrowserArticleIdentityResolver::new(webdriver, browser_pool));
                 router = router.merge(admin_router_with_identity_resolver_and_server_root_url(
-                    auth,
-                    sources,
-                    feed_tokens,
-                    sync_runs,
-                    config_transfer,
-                    weread_auth,
+                    dependencies,
                     identity_resolver,
                     self.config.server_root_url.clone(),
                 ));
             } else {
                 router = router.merge(admin_router_with_server_root_url(
-                    auth,
-                    sources,
-                    feed_tokens,
-                    sync_runs,
-                    config_transfer,
-                    weread_auth,
+                    dependencies,
                     self.config.server_root_url.clone(),
                 ));
             }

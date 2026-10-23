@@ -72,22 +72,41 @@ type AdminAuthService = AuthService<
     RingCredentialCipher,
 >;
 
-/// Builds the authenticated administration API and HTML panel routes.
-pub fn admin_router(
+/// Shared application dependencies used to build administration routes.
+pub struct AdminRouterDependencies {
     auth: AdminAuthenticator,
     sources: AdminSourceService,
     feed_tokens: AdminTokenService,
     sync_runs: PostgresSyncRunRepository,
     config_transfer: PostgresConfigTransferRepository,
     weread_auth: AdminAuthService,
-) -> Router {
+}
+
+impl AdminRouterDependencies {
+    /// Creates the shared application dependencies for administration routes.
+    pub fn new(
+        auth: AdminAuthenticator,
+        sources: AdminSourceService,
+        feed_tokens: AdminTokenService,
+        sync_runs: PostgresSyncRunRepository,
+        config_transfer: PostgresConfigTransferRepository,
+        weread_auth: AdminAuthService,
+    ) -> Self {
+        Self {
+            auth,
+            sources,
+            feed_tokens,
+            sync_runs,
+            config_transfer,
+            weread_auth,
+        }
+    }
+}
+
+/// Builds the authenticated administration API and HTML panel routes.
+pub fn admin_router(dependencies: AdminRouterDependencies) -> Router {
     admin_router_with_identity_resolver_and_server_root_url(
-        auth,
-        sources,
-        feed_tokens,
-        sync_runs,
-        config_transfer,
-        weread_auth,
+        dependencies,
         Arc::new(UrlArticleIdentityResolver),
         None,
     )
@@ -96,21 +115,11 @@ pub fn admin_router(
 /// Builds the administration routes with the URL-only identity resolver and
 /// an optional public server root used for generated feed links.
 pub fn admin_router_with_server_root_url(
-    auth: AdminAuthenticator,
-    sources: AdminSourceService,
-    feed_tokens: AdminTokenService,
-    sync_runs: PostgresSyncRunRepository,
-    config_transfer: PostgresConfigTransferRepository,
-    weread_auth: AdminAuthService,
+    dependencies: AdminRouterDependencies,
     server_root_url: Option<url::Url>,
 ) -> Router {
     admin_router_with_identity_resolver_and_server_root_url(
-        auth,
-        sources,
-        feed_tokens,
-        sync_runs,
-        config_transfer,
-        weread_auth,
+        dependencies,
         Arc::new(UrlArticleIdentityResolver),
         server_root_url,
     )
@@ -119,22 +128,12 @@ pub fn admin_router_with_server_root_url(
 /// Builds the administration routes with an injected QR-login service and the
 /// compatibility URL-only identity resolver.
 pub fn admin_router_with_server_root_url_and_qr_login(
-    auth: AdminAuthenticator,
-    sources: AdminSourceService,
-    feed_tokens: AdminTokenService,
-    sync_runs: PostgresSyncRunRepository,
-    config_transfer: PostgresConfigTransferRepository,
-    weread_auth: AdminAuthService,
+    dependencies: AdminRouterDependencies,
     server_root_url: Option<url::Url>,
     qr_login: Arc<dyn QrLoginService>,
 ) -> Router {
     admin_router_with_identity_resolver_and_server_root_url_and_qr_login(
-        auth,
-        sources,
-        feed_tokens,
-        sync_runs,
-        config_transfer,
-        weread_auth,
+        dependencies,
         Arc::new(UrlArticleIdentityResolver),
         server_root_url,
         qr_login,
@@ -145,45 +144,21 @@ pub fn admin_router_with_server_root_url_and_qr_login(
 /// resolver. Runtime deployments should provide the browser-backed resolver;
 /// the compatibility constructor above remains useful for long URLs and tests.
 pub fn admin_router_with_identity_resolver(
-    auth: AdminAuthenticator,
-    sources: AdminSourceService,
-    feed_tokens: AdminTokenService,
-    sync_runs: PostgresSyncRunRepository,
-    config_transfer: PostgresConfigTransferRepository,
-    weread_auth: AdminAuthService,
+    dependencies: AdminRouterDependencies,
     identity_resolver: Arc<dyn ArticleIdentityResolver>,
 ) -> Router {
-    admin_router_with_identity_resolver_and_server_root_url(
-        auth,
-        sources,
-        feed_tokens,
-        sync_runs,
-        config_transfer,
-        weread_auth,
-        identity_resolver,
-        None,
-    )
+    admin_router_with_identity_resolver_and_server_root_url(dependencies, identity_resolver, None)
 }
 
 /// Builds the administration routes with a configured identity resolver and
 /// optional public server root for generated feed links.
 pub fn admin_router_with_identity_resolver_and_server_root_url(
-    auth: AdminAuthenticator,
-    sources: AdminSourceService,
-    feed_tokens: AdminTokenService,
-    sync_runs: PostgresSyncRunRepository,
-    config_transfer: PostgresConfigTransferRepository,
-    weread_auth: AdminAuthService,
+    dependencies: AdminRouterDependencies,
     identity_resolver: Arc<dyn ArticleIdentityResolver>,
     server_root_url: Option<url::Url>,
 ) -> Router {
     admin_router_with_identity_resolver_and_server_root_url_and_qr_login(
-        auth,
-        sources,
-        feed_tokens,
-        sync_runs,
-        config_transfer,
-        weread_auth,
+        dependencies,
         identity_resolver,
         server_root_url,
         Arc::new(QrLoginManager::new(WereadQrHttpTransport::default())),
@@ -195,18 +170,20 @@ pub fn admin_router_with_identity_resolver_and_server_root_url(
 /// The injected boundary keeps HTTP integration tests independent of WeRead
 /// and allows deployments to replace the upstream transport with an approved
 /// adapter without changing the account API.
-#[allow(clippy::too_many_arguments)]
 pub fn admin_router_with_identity_resolver_and_server_root_url_and_qr_login(
-    auth: AdminAuthenticator,
-    sources: AdminSourceService,
-    feed_tokens: AdminTokenService,
-    sync_runs: PostgresSyncRunRepository,
-    config_transfer: PostgresConfigTransferRepository,
-    weread_auth: AdminAuthService,
+    dependencies: AdminRouterDependencies,
     identity_resolver: Arc<dyn ArticleIdentityResolver>,
     server_root_url: Option<url::Url>,
     qr_login: Arc<dyn QrLoginService>,
 ) -> Router {
+    let AdminRouterDependencies {
+        auth,
+        sources,
+        feed_tokens,
+        sync_runs,
+        config_transfer,
+        weread_auth,
+    } = dependencies;
     let state = Arc::new(AdminApiState {
         auth,
         sources,
