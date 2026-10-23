@@ -209,6 +209,64 @@ async fn source_sync_commits_article_run_schedule_and_feed_rebuild(pool: PgPool)
 }
 
 #[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn source_sync_commits_when_a_signed_image_is_reachable(pool: PgPool) {
+    let (archiver, asset_server, signed_image_url) =
+        reachable_signed_asset_archiver_fixture().await;
+    let source_id = SourceId::from_uuid(Uuid::new_v4());
+    let factory = UnitOfWorkFactory::new(pool.clone());
+    create_source(&factory, source_id).await;
+    let mut article_page = page(
+        "https://mp.weixin.qq.com/s/reachable-signed-image",
+        "Reachable signed image",
+    );
+    article_page.content_html = format!("<p>kept content</p><img src=\"{signed_image_url}\">");
+    let job_id = enqueue_source_sync(&pool, source_id).await;
+    let lease = claim(&pool, Utc::now()).await;
+    let handler = handler_with_archiver(
+        pool.clone(),
+        FakeAcquirer::successful(
+            reference(
+                "reachable-signed-image",
+                "https://mp.weixin.qq.com/s/reachable-signed-image",
+            ),
+            article_page,
+        ),
+        SourceSyncJobHandlerConfig::default(),
+        Some(archiver),
+    );
+
+    assert_eq!(
+        handler.execute(&lease, Utc::now()).await,
+        JobExecution::Committed
+    );
+    assert!(
+        !asset_server
+            .await
+            .expect("signed image fixture should finish"),
+        "source sync must not request a reachable signed image"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT status FROM jobs WHERE id = $1")
+            .bind(job_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        "succeeded"
+    );
+    let stored_html: String = sqlx::query_scalar(
+        "SELECT content_html FROM articles WHERE source_id = $1 AND review_id = $2",
+    )
+    .bind(source_id.as_uuid())
+    .bind("reachable-signed-image")
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(stored_html.contains("kept content"));
+    assert!(!stored_html.contains("<img"));
+    assert!(!stored_html.contains("fixture-secret"));
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
 async fn source_sync_with_asset_archiving_does_not_bump_revision_for_unchanged_article(
     pool: PgPool,
 ) {
@@ -1133,6 +1191,59 @@ fn handler_with_archiver(
             asset_archiver,
         },
         config,
+    )
+}
+
+async fn reachable_signed_asset_archiver_fixture(
+) -> (AssetArchiveService, tokio::task::JoinHandle<bool>, String) {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("signed asset fixture listener should bind");
+    let address = listener
+        .local_addr()
+        .expect("signed asset fixture listener should have an address");
+    let server = tokio::spawn(async move {
+        let Ok(Ok((mut stream, _))) =
+            tokio::time::timeout(StdDuration::from_secs(5), listener.accept()).await
+        else {
+            return false;
+        };
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 1024];
+        loop {
+            let Ok(read) = stream.read(&mut buffer).await else {
+                return true;
+            };
+            if read == 0 {
+                return true;
+            }
+            request.extend_from_slice(&buffer[..read]);
+            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+        let body = b"\x89PNG\r\n\x1a\nreachable-signed-image";
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        if stream.write_all(response.as_bytes()).await.is_err()
+            || stream.write_all(body).await.is_err()
+        {
+            return true;
+        }
+        true
+    });
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .resolve("assets.example.test", address)
+        .build()
+        .expect("signed asset fixture client should be constructible");
+    let url = "http://assets.example.test/image.png?X-Amz-Signature=fixture-secret".to_owned();
+    (
+        AssetArchiveService::with_client_for_test(AssetCachePolicy::default(), None, client),
+        server,
+        url,
     )
 }
 
