@@ -19,6 +19,7 @@ pub mod asset_refresh_handler;
 pub mod asset_repair_handler;
 pub mod auth_service;
 pub mod browser_health;
+pub mod config_transfer;
 pub mod feed_rebuild_handler;
 pub mod feed_rebuild_service;
 pub mod feed_service;
