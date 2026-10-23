@@ -90,6 +90,13 @@ async fn config_transfer_requires_authentication_and_csrf() {
             StatusCode::UNAUTHORIZED,
             "{method} {path}"
         );
+        if method == "POST" {
+            assert_eq!(
+                response.headers()[header::CACHE_CONTROL],
+                "no-store",
+                "{path}"
+            );
+        }
     }
 
     let (cookie, _) = admin_session(&app).await;
@@ -104,6 +111,11 @@ async fn config_transfer_requires_authentication_and_csrf() {
                 .await
                 .expect("CSRF-protected request should complete");
             assert_eq!(response.status(), StatusCode::FORBIDDEN, "{path}");
+            assert_eq!(
+                response.headers()[header::CACHE_CONTROL],
+                "no-store",
+                "{path}"
+            );
         }
     }
 }
@@ -153,6 +165,11 @@ async fn config_transfer_rejects_oversized_body_before_json_parsing() {
             .await
             .expect("oversized request should complete");
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE, "{path}");
+        assert_eq!(
+            response.headers()[header::CACHE_CONTROL],
+            "no-store",
+            "{path}"
+        );
     }
 }
 

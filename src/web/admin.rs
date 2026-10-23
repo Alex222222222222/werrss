@@ -390,11 +390,11 @@ async fn preview_config_import(
     body: Body,
 ) -> Response {
     if let Err(response) = protected_mutation(&state, &headers) {
-        return *response;
+        return config_transfer_no_store(*response);
     }
     let bytes = match bounded_config_body(body).await {
         Ok(bytes) => bytes,
-        Err(response) => return response,
+        Err(response) => return config_transfer_no_store(response),
     };
     let bundle = match ValidatedConfigBundle::parse_limited(&bytes) {
         Ok(bundle) => bundle,
@@ -426,11 +426,11 @@ async fn apply_config_import(
 ) -> Response {
     let session = match protected_mutation(&state, &headers) {
         Ok(session) => session,
-        Err(response) => return *response,
+        Err(response) => return config_transfer_no_store(*response),
     };
     let bytes = match bounded_config_body(body).await {
         Ok(bytes) => bytes,
-        Err(response) => return response,
+        Err(response) => return config_transfer_no_store(response),
     };
     let bundle = match ValidatedConfigBundle::parse_limited(&bytes) {
         Ok(bundle) => bundle,
@@ -465,6 +465,13 @@ async fn bounded_config_body(body: Body) -> Result<axum::body::Bytes, Response> 
         )
             .into_response()),
     }
+}
+
+fn config_transfer_no_store(mut response: Response) -> Response {
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
 }
 
 #[tracing::instrument(skip_all, level = "debug")]
