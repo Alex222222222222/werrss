@@ -195,6 +195,37 @@ const TRANSLATIONS: &[(&str, &str, &str, &str)] = &[
     ("dashboard.description", "Keep your feeds healthy, credentials current, and delivery links close at hand.", "Gardez vos flux fonctionnels, vos identifiants à jour et vos liens accessibles。", "保持订阅正常、凭据有效，并随时掌握投递链接。"),
     ("dashboard.add_source", "Add source", "Ajouter une source", "添加来源"),
     ("dashboard.manage_accounts", "Manage accounts", "Gérer les comptes", "管理账号"),
+    ("config.heading", "Configuration backup", "Sauvegarde de la configuration", "配置备份"),
+    ("config.description", "Export or preview configuration before applying it.", "Exportez ou prévisualisez la configuration avant de l'appliquer。", "导出配置，或在应用前预览更改。"),
+    ("config.export_sections", "Export sections", "Sections à exporter", "导出内容"),
+    ("config.sources", "Sources", "Sources", "来源"),
+    ("config.accounts", "WeRead account settings", "Paramètres des comptes WeRead", "微信读书账号设置"),
+    ("config.export", "Download JSON", "Télécharger le JSON", "下载 JSON"),
+    ("config.import_heading", "Import configuration", "Importer la configuration", "导入配置"),
+    ("config.choose_file", "Choose a configuration JSON file", "Choisir un fichier JSON de configuration", "选择配置 JSON 文件"),
+    ("config.no_file", "Choose a configuration file to preview.", "Choisissez un fichier de configuration à prévisualiser。", "请选择要预览的配置文件。"),
+    ("config.preview", "Preview import", "Prévisualiser l'importation", "预览导入"),
+    ("config.apply", "Apply import", "Appliquer l'importation", "应用导入"),
+    ("config.credential_notice", "Account settings are exported without credentials. Imported accounts need credential setup before use.", "Les paramètres des comptes sont exportés sans identifiants. Les comptes importés doivent être configurés avant utilisation。", "导出的账号设置不包含凭据。导入的账号需要先设置凭据才能使用。"),
+    ("config.unsupported", "Articles, synchronization history, and cached assets are not included.", "Les articles, l'historique de synchronisation et les ressources en cache ne sont pas inclus。", "不会包含文章、同步历史记录和缓存资源。"),
+    ("config.preview_ready", "Preview is ready to apply.", "L'aperçu peut être appliqué。", "预览已就绪，可以应用。"),
+    ("config.preview_conflicts", "Resolve the listed conflicts before applying.", "Résolvez les conflits affichés avant l'application。", "请先解决列出的冲突，再应用导入。"),
+    ("config.file_too_large", "The selected file exceeds the 2 MiB limit.", "Le fichier sélectionné dépasse la limite de 2 Mio。", "所选文件超过 2 MiB 限制。"),
+    ("config.export_selection_required", "Select at least one section to export.", "Sélectionnez au moins une section à exporter。", "请至少选择一项导出内容。"),
+    ("config.export_failed", "Configuration could not be exported.", "Impossible d'exporter la configuration。", "无法导出配置。"),
+    ("config.preview_failed", "Configuration could not be previewed.", "Impossible de prévisualiser la configuration。", "无法预览配置。"),
+    ("config.apply_failed", "Configuration could not be applied.", "Impossible d'appliquer la configuration。", "无法应用配置。"),
+    ("config.result_heading", "Import result", "Résultat de l'importation", "导入结果"),
+    ("config.applied", "Configuration applied.", "Configuration appliquée。", "配置已应用。"),
+    ("config.conflicts_heading", "Conflicts", "Conflits", "冲突"),
+    ("config.sources_created", "Sources created", "Sources créées", "新建来源"),
+    ("config.sources_updated", "Sources updated", "Sources mises à jour", "更新来源"),
+    ("config.accounts_created", "Accounts created", "Comptes créés", "新建账号"),
+    ("config.accounts_updated", "Accounts updated", "Comptes mis à jour", "更新账号"),
+    ("config.placeholders_created", "Setup-required accounts created", "Comptes à configurer créés", "新建待设置账号"),
+    ("config.bindings_preserved", "Account bindings preserved", "Associations de comptes conservées", "保留账号绑定"),
+    ("config.bindings_cleared", "Account bindings cleared", "Associations de comptes supprimées", "清除账号绑定"),
+    ("account.setup_required_manage_action", "Set up credentials", "Configurer les identifiants", "设置凭据"),
     ("action.add_account", "Add account", "Ajouter un compte", "添加账号"),
     ("dashboard.summary_aria", "Workspace summary", "Résumé de l'espace de travail", "工作区摘要"),
     ("stats.sources", "Sources", "Sources", "来源"),
@@ -443,5 +474,53 @@ mod tests {
 
         assert_eq!(french["dashboard.heading"], "Ravi de vous revoir。");
         assert_eq!(chinese["dashboard.heading"], "很高兴再次见到你。");
+    }
+
+    #[test]
+    fn configuration_transfer_and_setup_required_copy_exists_in_all_locales() {
+        for locale in [Locale::English, Locale::French, Locale::Chinese] {
+            let translations: serde_json::Value =
+                serde_json::from_str(&translations_json(locale)).unwrap();
+
+            for key in [
+                "config.heading",
+                "config.description",
+                "config.export_sections",
+                "config.sources",
+                "config.accounts",
+                "config.export",
+                "config.import_heading",
+                "config.choose_file",
+                "config.no_file",
+                "config.preview",
+                "config.apply",
+                "config.unsupported",
+                "config.preview_ready",
+                "config.preview_conflicts",
+                "config.file_too_large",
+                "config.export_selection_required",
+                "config.export_failed",
+                "config.preview_failed",
+                "config.apply_failed",
+                "config.credential_notice",
+                "config.result_heading",
+                "config.applied",
+                "config.conflicts_heading",
+                "config.sources_created",
+                "config.sources_updated",
+                "config.accounts_created",
+                "config.accounts_updated",
+                "config.placeholders_created",
+                "config.bindings_preserved",
+                "config.bindings_cleared",
+                "account.setup_required_manage_action",
+            ] {
+                assert!(
+                    !translations[key].as_str().unwrap_or_default().is_empty(),
+                    "missing {key} in {}",
+                    locale.code()
+                );
+            }
+        }
     }
 }

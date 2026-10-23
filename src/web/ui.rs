@@ -183,6 +183,7 @@ input, textarea {
   transition: border-color .16s ease, box-shadow .16s ease;
 }
 input { min-height: 42px; }
+input[type="checkbox"] { width: auto; min-height: auto; }
 textarea { min-height: 106px; resize: vertical; }
 input::placeholder, textarea::placeholder { color: #98a2b3; }
 input:hover, textarea:hover { border-color: #98a2b3; }
@@ -277,6 +278,19 @@ code { border-radius: 5px; padding: 2px 5px; color: #344054; background: #f2f4f7
 
 const LOCALE_PICKER: &str = r##"<label class="locale-picker"><span class="sr-only" data-i18n="language.label">Language</span><select id="locale" data-i18n-aria-label="language.label" aria-label="Language"><option value="en" data-i18n="language.english">English</option><option value="fr" data-i18n="language.french">Français</option><option value="zh" data-i18n="language.chinese">中文</option></select></label>"##;
 
+const CONFIG_TRANSFER_CARD: &str = r##"<section class="card full-width" id="configuration" aria-labelledby="config-heading"><div class="card-header"><div><h2 id="config-heading" data-i18n="config.heading">Configuration backup</h2><p data-i18n="config.description">Export or preview configuration before applying it.</p></div><span class="card-icon" aria-hidden="true">⇅</span></div><fieldset><legend data-i18n="config.export_sections">Export sections</legend><div class="field-grid"><label for="config-export-sources"><span data-i18n="config.sources">Sources</span><input id="config-export-sources" name="sources" type="checkbox" checked></label><label for="config-export-accounts"><span data-i18n="config.accounts">WeRead account settings</span><input id="config-export-accounts" name="weread_accounts" type="checkbox" checked></label></div><div class="form-actions"><button id="config-export" class="button button-secondary" type="button" data-i18n="config.export">Download JSON</button></div></fieldset><div class="notice info"><span class="notice-icon" aria-hidden="true">i</span><span data-i18n="config.credential_notice">Account settings are exported without credentials. Imported accounts need credential setup before use.</span></div><div class="form-section"><h3 data-i18n="config.import_heading">Import configuration</h3><label for="config-file"><span data-i18n="config.choose_file">Choose a configuration JSON file</span><input id="config-file" type="file" accept="application/json,.json"></label><div class="form-actions"><button id="config-preview" class="button button-secondary" type="button" data-i18n="config.preview">Preview import</button><button id="config-apply" class="button button-primary" type="button" disabled data-i18n="config.apply">Apply import</button></div><p id="config-feedback" class="feedback" role="status" aria-live="polite" hidden></p><section id="config-preview-result" aria-live="polite" hidden><h3 id="config-result-heading" data-i18n="config.result_heading">Import result</h3><div id="config-counts" class="resource-grid"></div><div id="config-conflicts" hidden><h4 data-i18n="config.conflicts_heading">Conflicts</h4><ul id="config-conflict-list"></ul></div></section></div><div class="notice warning"><span class="notice-icon" aria-hidden="true">!</span><span data-i18n="config.unsupported">Articles, synchronization history, and cached assets are not included.</span></div></section>"##;
+
+const CONFIG_TRANSFER_SCRIPT: &str = r##"
+const configSources=document.querySelector('#config-export-sources');const configAccounts=document.querySelector('#config-export-accounts');const configExport=document.querySelector('#config-export');const configFile=document.querySelector('#config-file');const configPreview=document.querySelector('#config-preview');const configApply=document.querySelector('#config-apply');const configFeedback=document.querySelector('#config-feedback');const configResult=document.querySelector('#config-preview-result');const configCounts=document.querySelector('#config-counts');const configConflicts=document.querySelector('#config-conflicts');const configConflictList=document.querySelector('#config-conflict-list');let configBundle=null;let configPreviewValid=false;let configPreviewRequestId=0;
+function resetConfigPreview(){configPreviewRequestId++;configBundle=null;configPreviewValid=false;configApply.disabled=true;configResult.hidden=true;configCounts.replaceChildren();configConflictList.replaceChildren();configConflicts.hidden=true;feedback(configFeedback,'')}
+function renderConfigCounts(value){const fields=[['config.sources_created','sources_created'],['config.sources_updated','sources_updated'],['config.accounts_created','accounts_created'],['config.accounts_updated','accounts_updated'],['config.placeholders_created','placeholders_created'],['config.bindings_preserved','account_bindings_preserved'],['config.bindings_cleared','account_bindings_cleared']];configCounts.replaceChildren(...fields.map(([key,name])=>meta(t(key),String(value[name]||0))))}
+configSources.addEventListener('change',()=>{configExport.disabled=!(configSources.checked||configAccounts.checked)});configAccounts.addEventListener('change',()=>{configExport.disabled=!(configSources.checked||configAccounts.checked)});
+configExport.addEventListener('click',async()=>{if(!configSources.checked&&!configAccounts.checked){feedback(configFeedback,t('config.export_selection_required'));return}configExport.disabled=true;feedback(configFeedback,'');const query=new URLSearchParams({sources:String(configSources.checked),weread_accounts:String(configAccounts.checked)});try{const response=await request('/api/admin/config/export?'+query);if(!response.ok){feedback(configFeedback,await apiErrorMessage(response,'config.export_failed'));return}const blob=await response.blob();const url=URL.createObjectURL(blob);const link=document.createElement('a');link.href=url;link.download='werrss-config.json';document.body.append(link);link.click();link.remove();setTimeout(()=>URL.revokeObjectURL(url),1000);feedback(configFeedback,'','success')}catch{feedback(configFeedback,t('common.unreachable'))}finally{configExport.disabled=!(configSources.checked||configAccounts.checked)}});
+configFile.addEventListener('change',()=>{resetConfigPreview();configPreview.disabled=false});
+configPreview.addEventListener('click',async()=>{resetConfigPreview();const file=configFile.files&&configFile.files[0];if(!file){feedback(configFeedback,t('config.no_file'));return}if(file.size>2097152){feedback(configFeedback,t('config.file_too_large'));return}const configPreviewRequest=++configPreviewRequestId;configPreview.disabled=true;try{configBundle=await file.text();if(configPreviewRequest!==configPreviewRequestId){return}const response=await request('/api/admin/config/import/preview',{method:'POST',body:configBundle});if(configPreviewRequest!==configPreviewRequestId){return}if(!response.ok){const message=await apiErrorMessage(response,'config.preview_failed');if(configPreviewRequest!==configPreviewRequestId){return}configBundle=null;feedback(configFeedback,message);return}const value=await response.json();if(configPreviewRequest!==configPreviewRequestId){return}renderConfigCounts(value);const conflicts=Array.isArray(value.conflicts)?value.conflicts:[];configConflictList.replaceChildren(...conflicts.map(conflict=>{const item=document.createElement('li');item.textContent=conflict.message;return item}));configConflicts.hidden=conflicts.length===0;configPreviewValid=conflicts.length===0;configApply.disabled=!configPreviewValid;configResult.hidden=false;feedback(configFeedback,t(configPreviewValid?'config.preview_ready':'config.preview_conflicts'),configPreviewValid?'success':'info')}catch{if(configPreviewRequest===configPreviewRequestId){configBundle=null;feedback(configFeedback,t('common.unreachable'))}}finally{if(configPreviewRequest===configPreviewRequestId){configPreview.disabled=false}}});
+configApply.addEventListener('click',async()=>{if(!configPreviewValid||!configBundle){return}configApply.disabled=true;try{const response=await request('/api/admin/config/import',{method:'POST',body:configBundle});if(!response.ok){feedback(configFeedback,await apiErrorMessage(response,'config.apply_failed'));configApply.disabled=false;return}const value=await response.json();renderConfigCounts(value);configResult.hidden=false;configPreviewValid=false;configBundle=null;feedback(configFeedback,t('config.applied'),'success')}catch{feedback(configFeedback,t('common.unreachable'));configApply.disabled=false}});
+"##;
+
 const QR_LOGIN_CARD: &str = r##"<section class="card" id="weread-qr-card"><div class="card-header"><div><h2 data-i18n="account.qr_heading">Sign in with QR code</h2><p data-i18n="account.qr_description">Scan a fresh WeRead code to enroll an account without copying cookies.</p></div><span class="card-icon" aria-hidden="true">▣</span></div><div class="notice"><span class="notice-icon" aria-hidden="true">i</span><span data-i18n="account.qr_notice">The QR code is short-lived and shown only while this page is open.</span></div><form id="weread-qr"><label><span class="label-row"><span data-i18n="account.id">Account ID</span><span class="label-hint" data-i18n="account.id_hint_qr">Optional; leave empty for a new account</span></span><input name="account_id" type="text" autocomplete="off" data-i18n-placeholder="account.id_placeholder_qr" placeholder="Optional existing account UUID"></label><label><span data-i18n="account.display_name">Display name</span><input name="display_name" type="text" autocomplete="off" data-i18n-placeholder="account.display_name_placeholder_qr" placeholder="Optional override"></label><div class="form-actions"><button class="button-secondary" type="submit" data-i18n="account.start_qr">Start QR login</button></div></form><div id="qr-session" hidden><div id="qr-image" aria-live="polite"></div><p id="qr-status" class="feedback info" role="status"></p><button id="qr-cancel" class="button-quiet" type="button" data-i18n="account.cancel_qr">Cancel QR login</button></div><p id="qr-result" class="feedback" role="status" hidden></p></section>"##;
 
 const QR_LOGIN_SCRIPT: &str = r##"
@@ -355,7 +369,7 @@ function renderSource(source){
   const history=document.createElement('details');history.className='history';const summary=document.createElement('summary');summary.textContent=t('source.history');history.append(summary);const historyList=document.createElement('ul');history.append(historyList);
   history.addEventListener('toggle',async()=>{if(!history.open||history.dataset.loaded){return}history.dataset.loaded='true';const message=document.createElement('li');message.textContent=t('source.history_loading');historyList.replaceChildren(message);try{const response=await fetch(`/api/admin/sources/${source.id}/sync-runs`);if(!response.ok){throw new Error('history request failed')}const runs=await response.json();historyList.replaceChildren();if(!runs.length){const empty=document.createElement('li');empty.textContent=t('source.no_history');historyList.append(empty);return}runs.forEach(run=>{const runMessage=document.createElement('li');runMessage.textContent=statusLabel(run.outcome);historyList.append(runMessage)})}catch{historyList.replaceChildren();const failure=document.createElement('li');failure.textContent=t('source.history_unavailable');historyList.append(failure)}});item.append(history);return item}
 async function load(){list.setAttribute('aria-busy','true');list.replaceChildren(stateMessage(t('state.loading_sources')));try{const response=await fetch('/api/admin/sources');if(!response.ok){throw new Error('source list failed')}const sources=await response.json();sourceCount.textContent=sources.length;activeSourceCount.textContent=sources.filter(source=>source.enabled).length;if(!sources.length){list.replaceChildren(stateMessage(t('state.no_sources'),'empty'));const strong=document.createElement('strong');strong.textContent=t('state.first_feed');list.firstChild.prepend(strong)}else{list.replaceChildren(...sources.map(renderSource))}feedback(error,'')}catch{sourceCount.textContent='—';activeSourceCount.textContent='—';list.replaceChildren(stateMessage(t('state.sources_load_failed'),'error'));feedback(error,t('state.load_sources_error'))}finally{list.setAttribute('aria-busy','false')}}
-function renderAccount(account){const item=document.createElement('article');item.className='resource-card';const header=document.createElement('div');header.className='resource-card-header';const title=document.createElement('h3');title.textContent=account.display_name;header.append(title,chip(t(`status.${account.status}`),account.status==='active'?'active':account.status==='disabled'?'disabled':'warning'));item.append(header);const details=document.createElement('div');details.className='resource-meta';details.append(meta(t('account.id'),account.account_id),meta(t('account.current_status'),t(`status.${account.status}`)));item.append(details);const actions=document.createElement('div');actions.className='resource-actions';const edit=document.createElement('a');edit.className='button button-quiet';edit.href=`/admin/weread/accounts/${encodeURIComponent(account.account_id)}`;edit.textContent=t('account.manage');actions.append(edit);item.append(actions);return item}
+function renderAccount(account){const item=document.createElement('article');item.className='resource-card';const header=document.createElement('div');header.className='resource-card-header';const title=document.createElement('h3');title.textContent=account.display_name;header.append(title,chip(t(`status.${account.status}`),account.status==='active'?'active':account.status==='disabled'?'disabled':'warning'));item.append(header);const details=document.createElement('div');details.className='resource-meta';details.append(meta(t('account.id'),account.account_id),meta(t('account.current_status'),t(`status.${account.status}`)));item.append(details);const actions=document.createElement('div');actions.className='resource-actions';const edit=document.createElement('a');edit.className='button button-quiet';edit.href=`/admin/weread/accounts/${encodeURIComponent(account.account_id)}`;edit.textContent=t(account.status==='setup_required'?'account.setup_required_manage_action':'account.manage_account');actions.append(edit);item.append(actions);return item}
 async function loadAccounts(){accountList.setAttribute('aria-busy','true');accountList.replaceChildren(stateMessage(t('state.loading_accounts')));try{const response=await fetch('/api/admin/weread/accounts');if(!response.ok){throw new Error('account list failed')}const accounts=await response.json();accountCount.textContent=accounts.length;if(!accounts.length){accountList.replaceChildren(stateMessage(t('state.no_accounts'),'empty'));const strong=document.createElement('strong');strong.textContent=t('state.add_account_hint');accountList.firstChild.prepend(strong)}else{accountList.replaceChildren(...accounts.map(renderAccount))}feedback(accountListError,'')}catch{accountCount.textContent='—';accountList.replaceChildren(stateMessage(t('state.accounts_load_failed'),'error'));feedback(accountListError,t('state.load_accounts_error'))}finally{accountList.setAttribute('aria-busy','false')}}
 document.querySelector('#source-create').addEventListener('submit', async event => {
   event.preventDefault();
@@ -398,6 +412,10 @@ document.querySelector('#logout').addEventListener('click',async()=>{const logou
         template
             .replace("__STYLES__", STYLES)
             .replace("__LOCALE_PICKER__", LOCALE_PICKER)
+            .replace(
+                "<div class=\"layout-grid\">",
+                &format!("<div class=\"layout-grid\">{CONFIG_TRANSFER_CARD}"),
+            )
             .replace("__USERNAME__", &username)
             .replace("__CSRF__", &csrf_json)
             .replace("__I18N__", &i18n_bootstrap(locale))
@@ -407,7 +425,7 @@ document.querySelector('#logout').addEventListener('click',async()=>{const logou
             )
             .replace(
                 "</script></body></html>",
-                &format!("{QR_LOGIN_SCRIPT}</script></body></html>"),
+                &format!("{CONFIG_TRANSFER_SCRIPT}{QR_LOGIN_SCRIPT}</script></body></html>"),
             ),
     )
 }
@@ -515,7 +533,7 @@ pub fn weread_accounts_page(session: &AdminSession, locale: Locale) -> Html<Stri
 __I18N__
 const list=document.querySelector('#accounts');const error=document.querySelector('#error');
 function stateMessage(message,kind='loading'){const item=document.createElement('div');item.className=`${kind}-state`;item.textContent=message;return item}
-async function loadAccounts(){list.setAttribute('aria-busy','true');try{const response=await fetch('/api/admin/weread/accounts');if(!response.ok){throw new Error('account list failed')}const accounts=await response.json();if(!accounts.length){list.replaceChildren(stateMessage(t('state.no_accounts_page'),'empty'));const strong=document.createElement('strong');strong.textContent=t('state.add_first_account');list.firstChild.prepend(strong);return}list.replaceChildren(...accounts.map(account=>{const item=document.createElement('article');item.className='resource-card';const header=document.createElement('div');header.className='resource-card-header';const title=document.createElement('h3');title.textContent=account.display_name;const status=document.createElement('span');status.className=`status-chip ${account.status==='active'?'active':account.status==='disabled'?'disabled':'warning'}`;status.textContent=statusLabel(account.status);header.append(title,status);item.append(header);const details=document.createElement('div');details.className='resource-meta';const row=document.createElement('div');row.className='resource-meta-row';const label=document.createElement('span');label.textContent=t('account.id');const value=document.createElement('strong');value.textContent=account.account_id;row.append(label,value);details.append(row);item.append(details);const edit=document.createElement('a');edit.className='button button-quiet';edit.href=`/admin/weread/accounts/${encodeURIComponent(account.account_id)}`;edit.textContent=t('account.manage_account');item.append(edit);return item}))}catch{list.replaceChildren(stateMessage(t('state.accounts_page_load_failed'),'error'));error.textContent=t('state.accounts_page_error');error.className='feedback error';error.hidden=false}finally{list.setAttribute('aria-busy','false')}}
+async function loadAccounts(){list.setAttribute('aria-busy','true');try{const response=await fetch('/api/admin/weread/accounts');if(!response.ok){throw new Error('account list failed')}const accounts=await response.json();if(!accounts.length){list.replaceChildren(stateMessage(t('state.no_accounts_page'),'empty'));const strong=document.createElement('strong');strong.textContent=t('state.add_first_account');list.firstChild.prepend(strong);return}list.replaceChildren(...accounts.map(account=>{const item=document.createElement('article');item.className='resource-card';const header=document.createElement('div');header.className='resource-card-header';const title=document.createElement('h3');title.textContent=account.display_name;const status=document.createElement('span');status.className=`status-chip ${account.status==='active'?'active':account.status==='disabled'?'disabled':'warning'}`;status.textContent=statusLabel(account.status);header.append(title,status);item.append(header);const details=document.createElement('div');details.className='resource-meta';const row=document.createElement('div');row.className='resource-meta-row';const label=document.createElement('span');label.textContent=t('account.id');const value=document.createElement('strong');value.textContent=account.account_id;row.append(label,value);details.append(row);item.append(details);const edit=document.createElement('a');edit.className='button button-quiet';edit.href=`/admin/weread/accounts/${encodeURIComponent(account.account_id)}`;edit.textContent=t(account.status==='setup_required'?'account.setup_required_manage_action':'account.manage_account');item.append(edit);return item}))}catch{list.replaceChildren(stateMessage(t('state.accounts_page_load_failed'),'error'));error.textContent=t('state.accounts_page_error');error.className='feedback error';error.hidden=false}finally{list.setAttribute('aria-busy','false')}}
 loadAccounts();
 </script></body></html>"##;
     Html(
@@ -695,6 +713,57 @@ mod tests {
     }
 
     #[test]
+    fn admin_page_renders_configuration_export_import_controls() {
+        let body = admin_page(&session(), Locale::English).0;
+
+        assert!(body.contains("id=\"configuration\""));
+        assert!(body.contains("data-i18n=\"config.heading\">Configuration backup</h2>"));
+        assert!(body.contains("<label for=\"config-export-sources\">"));
+        assert!(body.contains("<label for=\"config-export-accounts\">"));
+        assert!(body.contains("id=\"config-export-sources\" name=\"sources\" type=\"checkbox\""));
+        assert!(body
+            .contains("id=\"config-export-accounts\" name=\"weread_accounts\" type=\"checkbox\""));
+        assert!(body.contains("id=\"config-file\" type=\"file\" accept=\"application/json,.json\""));
+        assert!(body.contains("id=\"config-preview\""));
+        assert!(body.contains(
+            "id=\"config-apply\" class=\"button button-primary\" type=\"button\" disabled"
+        ));
+        assert!(body.contains("request('/api/admin/config/export?'+query)"));
+        assert!(body.contains("new URLSearchParams({sources:String(configSources.checked),weread_accounts:String(configAccounts.checked)})"));
+        assert!(body.contains("/api/admin/config/import/preview"));
+        assert!(body.contains("/api/admin/config/import'"));
+        assert!(body.contains("conflicts.length===0"));
+        assert!(
+            body.contains("Articles, synchronization history, and cached assets are not included")
+        );
+        for field in [
+            "sources_created",
+            "sources_updated",
+            "accounts_created",
+            "accounts_updated",
+            "placeholders_created",
+            "account_bindings_preserved",
+            "account_bindings_cleared",
+        ] {
+            assert!(body.contains(field), "missing result field: {field}");
+        }
+        assert!(body.contains("'x-csrf-token':csrf"));
+    }
+
+    #[test]
+    fn admin_page_embeds_configuration_copy_in_french_and_chinese() {
+        let french = admin_page(&session(), Locale::French).0;
+        assert!(french.contains("Sauvegarde de la configuration"));
+        assert!(french.contains("Les articles, l'historique de synchronisation et les ressources en cache ne sont pas inclus。"));
+        assert!(french.contains("Configurer les identifiants"));
+
+        let chinese = admin_page(&session(), Locale::Chinese).0;
+        assert!(chinese.contains("配置备份"));
+        assert!(chinese.contains("不会包含文章、同步历史记录和缓存资源。"));
+        assert!(chinese.contains("设置凭据"));
+    }
+
+    #[test]
     fn admin_page_exposes_the_qr_login_form_and_lifecycle_script() {
         let body = admin_page(&session(), Locale::English).0;
         assert!(body.contains("id=\"weread-qr-card\""));
@@ -807,6 +876,15 @@ mod tests {
     }
 
     #[test]
+    fn setup_required_account_list_has_direct_enrollment_action() {
+        let body = weread_accounts_page(&session(), Locale::English).0;
+
+        assert!(body.contains("statusLabel(account.status)"));
+        assert!(body.contains("edit.textContent=t(account.status==='setup_required'?'account.setup_required_manage_action':'account.manage_account')"));
+        assert!(body.contains("/admin/weread/accounts/${encodeURIComponent(account.account_id)}"));
+    }
+
+    #[test]
     fn setup_required_account_page_shows_enrollment_form_without_expiry_value() {
         let account = WeReadAccount::from_parts(
             crate::domain::credentials::WeReadAccountId::from_uuid(uuid::Uuid::from_u128(2)),
@@ -825,6 +903,24 @@ mod tests {
             body.contains("if(expiry.dataset.value){expiry.value=new Date(expiry.dataset.value)")
         );
         assert!(!body.contains("access_expires_at\">"));
+    }
+
+    #[test]
+    fn disabled_setup_required_account_keeps_disabled_state_visible_as_enable_action() {
+        let account = WeReadAccount::from_parts(
+            crate::domain::credentials::WeReadAccountId::from_uuid(uuid::Uuid::from_u128(2)),
+            "Imported".to_owned(),
+            1,
+            None,
+            true,
+            true,
+        );
+        let body = weread_account_page(&session(), &account, Locale::English).0;
+
+        assert!(body.contains("data-i18n=\"status.setup_required\">setup_required</span>"));
+        assert!(body.contains("data-i18n=\"account.enable_account\">Enable account</button>"));
+        assert!(body.contains("Enroll credentials to activate this account."));
+        assert!(body.contains("name=\"cookie_header\""));
     }
 
     #[test]
