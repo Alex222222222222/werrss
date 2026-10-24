@@ -874,6 +874,72 @@ async fn replacing_expired_credentials_resumes_only_authentication_gated_sources
 }
 
 #[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn replacing_credentials_rolls_back_when_source_recovery_fails(pool: PgPool) {
+    let repository = PostgresCredentialRepository::new(pool.clone());
+    let leases = PostgresAccountLeaseRepository::new(pool.clone());
+    let account_id = account_id();
+    let original_expiry = Utc::now() - chrono::Duration::seconds(1);
+    repository
+        .insert(
+            account_id,
+            "Expired",
+            b"original-ciphertext",
+            original_expiry,
+        )
+        .await
+        .unwrap();
+    let source_id = seed_bound_source(&pool, account_id, "authentication_required").await;
+    sqlx::query(
+        "CREATE FUNCTION reject_auth_source_recovery() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF OLD.scheduling_gate = 'authentication_required' AND NEW.scheduling_gate = 'ready' THEN RAISE EXCEPTION 'test source recovery failure'; END IF; RETURN NEW; END; $$",
+    )
+    .execute(&pool)
+    .await
+    .expect("failure function should be installed");
+    sqlx::query("CREATE TRIGGER reject_auth_source_recovery BEFORE UPDATE ON sources FOR EACH ROW EXECUTE FUNCTION reject_auth_source_recovery()")
+        .execute(&pool)
+        .await
+        .expect("failure trigger should be installed");
+    let lease = leases
+        .acquire(
+            account_id,
+            "credential-rollback-test",
+            chrono::Duration::minutes(5),
+        )
+        .await
+        .unwrap()
+        .expect("test should own the account lease");
+
+    assert!(repository
+        .replace(CredentialReplacement {
+            account_id,
+            display_name: "Renewed".to_owned(),
+            expected_version: 1,
+            ciphertext: b"replacement-ciphertext".to_vec(),
+            access_expires_at: Utc::now() + chrono::Duration::hours(1),
+            lease_owner: "credential-rollback-test".to_owned(),
+            lease_token: lease.token(),
+        })
+        .await
+        .is_err());
+
+    let (version, ciphertext, expiry): (i64, Vec<u8>, chrono::DateTime<Utc>) =
+        sqlx::query_as("SELECT credential_version, credentials_ciphertext, access_expires_at FROM weread_accounts WHERE account_id = $1")
+            .bind(account_id.as_uuid())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(version, 1);
+    assert_eq!(ciphertext, b"original-ciphertext");
+    assert_eq!(expiry, original_expiry);
+    let gate: String = sqlx::query_scalar("SELECT scheduling_gate FROM sources WHERE id = $1")
+        .bind(source_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(gate, "authentication_required");
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
 async fn reenabling_expired_account_does_not_resume_authentication_gates(pool: PgPool) {
     let repository = PostgresCredentialRepository::new(pool.clone());
     let account_id = account_id();
