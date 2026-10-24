@@ -1027,12 +1027,55 @@ async fn combined_import_retains_binding_to_newly_created_placeholder(pool: PgPo
         .await
         .unwrap();
     assert_eq!(risk_gate, "risk_controlled");
-    let risk_gate: String = sqlx::query_scalar("SELECT scheduling_gate FROM sources WHERE id = $1")
-        .bind(risk_source_id)
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn enabling_expired_enrolled_account_does_not_resume_authentication_gated_sources(
+    pool: PgPool,
+) {
+    let repo = PostgresConfigTransferRepository::new(pool.clone());
+    let account_id = Uuid::new_v4();
+    let source_id = Uuid::new_v4();
+    seed_enrolled_account(
+        &pool,
+        account_id,
+        "Expired Disabled Account",
+        true,
+        b"expired-ciphertext",
+        at(500),
+    )
+    .await;
+    seed_source_full(
+        &pool,
+        source_id,
+        "book-expired-disabled",
+        "Expired Disabled Source",
+        None,
+        Some(account_id),
+        0,
+        true,
+        "authentication_required",
+        at(500),
+        Some(at(900)),
+        Some(at(900)),
+        3600,
+        20,
+        0,
+        3,
+    )
+    .await;
+
+    let account = sample_portable_account(account_id, "Expired Disabled Account", true);
+    repo.apply(make_validated_bundle(None, Some(vec![account])))
+        .await
+        .expect("account should be enabled");
+
+    let gate: String = sqlx::query_scalar("SELECT scheduling_gate FROM sources WHERE id = $1")
+        .bind(source_id)
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(risk_gate, "risk_controlled");
+    assert_eq!(gate, "authentication_required");
 }
 
 #[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]

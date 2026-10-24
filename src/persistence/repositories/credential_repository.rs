@@ -266,6 +266,7 @@ impl CredentialRepository for PostgresCredentialRepository {
                 account_id: replacement.account_id,
             });
         }
+        let mut transaction = self.pool.begin().await.map_err(storage_error)?;
         let row = sqlx::query(
             r#"
             WITH live_lease AS MATERIALIZED (
@@ -303,14 +304,20 @@ impl CredentialRepository for PostgresCredentialRepository {
         .bind(replacement.access_expires_at)
         .bind(replacement.lease_owner)
         .bind(replacement.lease_token.as_uuid())
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *transaction)
         .await
         .map_err(storage_error)?;
-        row.map(decode_record)
-            .transpose()?
-            .ok_or(CredentialRepositoryError::Conflict {
-                account_id: replacement.account_id,
-            })
+        let record =
+            row.map(decode_record)
+                .transpose()?
+                .ok_or(CredentialRepositoryError::Conflict {
+                    account_id: replacement.account_id,
+                })?;
+        if !record.account().disabled() {
+            resume_authentication_gated_sources(&mut transaction, replacement.account_id).await?;
+        }
+        transaction.commit().await.map_err(storage_error)?;
+        Ok(record)
     }
 
     async fn enroll_placeholder(
@@ -423,7 +430,7 @@ async fn resume_authentication_gated_sources(
     account_id: WeReadAccountId,
 ) -> Result<(), CredentialRepositoryError> {
     sqlx::query(
-        "UPDATE sources SET scheduling_gate = 'ready', failure_cooldown_until = NULL, schedule_reserved_until = NULL, next_fetch_at = clock_timestamp(), updated_at = clock_timestamp() WHERE account_id = $1 AND scheduling_gate = 'authentication_required'",
+        "UPDATE sources SET scheduling_gate = 'ready', failure_cooldown_until = NULL, schedule_reserved_until = NULL, next_fetch_at = clock_timestamp(), updated_at = clock_timestamp() WHERE account_id = $1 AND scheduling_gate = 'authentication_required' AND EXISTS (SELECT 1 FROM weread_accounts WHERE account_id = $1 AND NOT disabled AND NOT setup_required AND access_expires_at > clock_timestamp())",
     )
     .bind(account_id.as_uuid())
     .execute(&mut **transaction)

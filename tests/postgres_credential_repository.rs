@@ -821,6 +821,87 @@ async fn disabling_account_does_not_change_bound_source_scheduling(pool: PgPool)
 }
 
 #[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn replacing_expired_credentials_resumes_only_authentication_gated_sources(pool: PgPool) {
+    let repository = PostgresCredentialRepository::new(pool.clone());
+    let leases = PostgresAccountLeaseRepository::new(pool.clone());
+    let account_id = account_id();
+    repository
+        .insert(
+            account_id,
+            "Expired",
+            b"expired-ciphertext",
+            Utc::now() - chrono::Duration::seconds(1),
+        )
+        .await
+        .unwrap();
+    let auth_source = seed_bound_source(&pool, account_id, "authentication_required").await;
+    let risk_source = seed_bound_source(&pool, account_id, "risk_controlled").await;
+    let lease = leases
+        .acquire(
+            account_id,
+            "credential-renewal-test",
+            chrono::Duration::minutes(5),
+        )
+        .await
+        .unwrap()
+        .expect("test should own the account lease");
+
+    repository
+        .replace(CredentialReplacement {
+            account_id,
+            display_name: "Renewed".to_owned(),
+            expected_version: 1,
+            ciphertext: b"renewed-ciphertext".to_vec(),
+            access_expires_at: Utc::now() + chrono::Duration::hours(1),
+            lease_owner: "credential-renewal-test".to_owned(),
+            lease_token: lease.token(),
+        })
+        .await
+        .expect("replacement credentials should be saved");
+
+    let auth_gate: String = sqlx::query_scalar("SELECT scheduling_gate FROM sources WHERE id = $1")
+        .bind(auth_source)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(auth_gate, "ready");
+    let risk_gate: String = sqlx::query_scalar("SELECT scheduling_gate FROM sources WHERE id = $1")
+        .bind(risk_source)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(risk_gate, "risk_controlled");
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
+async fn reenabling_expired_account_does_not_resume_authentication_gates(pool: PgPool) {
+    let repository = PostgresCredentialRepository::new(pool.clone());
+    let account_id = account_id();
+    repository
+        .insert(
+            account_id,
+            "Expired Disabled",
+            b"expired-ciphertext",
+            Utc::now() - chrono::Duration::seconds(1),
+        )
+        .await
+        .unwrap();
+    repository.set_disabled(account_id, true).await.unwrap();
+    let source = seed_bound_source(&pool, account_id, "authentication_required").await;
+
+    repository
+        .set_disabled(account_id, false)
+        .await
+        .expect("account preference should be updated");
+    let gate: String = sqlx::query_scalar("SELECT scheduling_gate FROM sources WHERE id = $1")
+        .bind(source)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(gate, "authentication_required");
+}
+
+#[sqlx::test(migrator = "werrss::persistence::postgres::MIGRATOR")]
 async fn reenabling_account_resumes_only_authentication_gated_bound_sources(pool: PgPool) {
     let repository = PostgresCredentialRepository::new(pool.clone());
     let account_id = account_id();

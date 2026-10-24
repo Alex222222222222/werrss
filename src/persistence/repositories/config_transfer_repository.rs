@@ -380,7 +380,8 @@ async fn apply_transaction(
     if let Some(accounts) = &raw.weread_accounts {
         for account in accounts {
             let existing_row = sqlx::query(
-                "SELECT account_id, disabled, setup_required \
+                "SELECT account_id, disabled, setup_required, \
+                 COALESCE(access_expires_at > clock_timestamp(), FALSE) AS credentials_usable \
                  FROM weread_accounts \
                  WHERE account_id = $1 \
                  FOR UPDATE",
@@ -393,6 +394,8 @@ async fn apply_transaction(
             if let Some(row) = existing_row {
                 let existing_disabled: bool = row.try_get("disabled").map_err(storage_error)?;
                 let setup_required: bool = row.try_get("setup_required").map_err(storage_error)?;
+                let credentials_usable: bool =
+                    row.try_get("credentials_usable").map_err(storage_error)?;
 
                 sqlx::query(
                     "UPDATE weread_accounts \
@@ -406,7 +409,7 @@ async fn apply_transaction(
                 .await
                 .map_err(storage_error)?;
 
-                if !setup_required && existing_disabled && account.enabled {
+                if !setup_required && existing_disabled && account.enabled && credentials_usable {
                     resume_authentication_gated_sources(tx, account.account_id).await?;
                 }
 
@@ -435,8 +438,9 @@ async fn apply_transaction(
 
     if let Some(sources) = &raw.sources {
         let account_rows = sqlx::query(
-            "SELECT account_id, NOT disabled AND NOT setup_required \
-             AND access_expires_at > clock_timestamp() AS usable FROM weread_accounts",
+            "SELECT account_id, COALESCE( \
+                 NOT disabled AND NOT setup_required AND access_expires_at > clock_timestamp(), FALSE \
+             ) AS usable FROM weread_accounts",
         )
         .fetch_all(&mut **tx)
         .await
@@ -633,7 +637,7 @@ async fn resume_authentication_gated_sources(
              schedule_reserved_until = NULL, \
              next_fetch_at = clock_timestamp(), \
              updated_at = clock_timestamp() \
-         WHERE account_id = $1 AND scheduling_gate = 'authentication_required'",
+         WHERE account_id = $1 AND scheduling_gate = 'authentication_required' AND EXISTS (SELECT 1 FROM weread_accounts WHERE account_id = $1 AND NOT disabled AND NOT setup_required AND access_expires_at > clock_timestamp())",
     )
     .bind(account_id)
     .execute(&mut **tx)
@@ -648,9 +652,6 @@ fn imported_source_gate(existing_gate: Option<&str>, account_usable: Option<bool
         return "risk_controlled";
     }
     if account_usable == Some(false) {
-        return "authentication_required";
-    }
-    if existing_gate == Some("authentication_required") && account_usable != Some(true) {
         return "authentication_required";
     }
     "ready"
@@ -684,7 +685,7 @@ mod tests {
         );
         assert_eq!(
             imported_source_gate(Some("authentication_required"), None),
-            "authentication_required"
+            "ready"
         );
         assert_eq!(
             imported_source_gate(Some("risk_controlled"), Some(false)),
